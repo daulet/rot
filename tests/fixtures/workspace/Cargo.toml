@@ -1,0 +1,31 @@
+[package]
+name = "rot-fixture"
+version = "0.0.0"
+edition = "2024"
+build = "build/custom.rs"
+
+[workspace]
+
+[features]
+default = ["prod_feature"]
+prod_feature = []
+testability = []
+excluded = []
+strong_dependency_feature = ["fixture-helper/marker"]
+weak_dependency_feature = ["fixture-helper?/marker"]
+
+[dependencies]
+fixture-helper = { path = "../dependency", optional = true }
+
+[[test]]
+name = "external"
+path = "integration/check.rs"
+
+[[example]]
+name = "demo"
+path = "demo/demo.rs"
+
+[[bench]]
+name = "speed"
+path = "perf/bench.rs"
+harness = false

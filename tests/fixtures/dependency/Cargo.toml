@@ -1,0 +1,9 @@
+[package]
+name = "fixture-helper"
+version = "0.0.0"
+edition = "2024"
+
+[features]
+marker = []
+
+[workspace]
