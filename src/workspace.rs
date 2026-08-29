@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId, TargetKind};
+use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use ignore::WalkBuilder;
 
 use crate::{
@@ -25,6 +25,17 @@ pub struct PackageInfo {
     pub root: PathBuf,
     pub edition: String,
     pub features: PackageFeatures,
+    pub targets: Vec<PackageTargetInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackageTargetInfo {
+    pub name: String,
+    pub kinds: Vec<String>,
+    pub crate_types: Vec<String>,
+    pub source: PathBuf,
+    pub required_features: Vec<String>,
+    pub test_reachable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +55,9 @@ pub struct Inventory {
     pub cfg_false: HashSet<String>,
     pub cfg_closed_world: HashSet<String>,
     pub profile: ProfileReport,
+    pub compiler_compatible: bool,
+    pub compiler_unavailable_reasons: Vec<String>,
+    pub compiler_metadata: Option<Metadata>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -80,6 +94,19 @@ impl Inventory {
     pub fn should_report(&self, path: &Path) -> bool {
         requested_contains(&self.requested, path)
     }
+
+    pub fn selected_package_ids(&self) -> HashSet<String> {
+        self.packages
+            .iter()
+            .filter(|package| {
+                self.requested.iter().any(|input| {
+                    input.starts_with(&package.root)
+                        || input.is_dir() && package.root.starts_with(input)
+                })
+            })
+            .map(|package| package.id.to_string())
+            .collect()
+    }
 }
 
 pub fn inventory(cli: &Cli) -> Result<Inventory> {
@@ -97,7 +124,16 @@ pub fn inventory(cli: &Cli) -> Result<Inventory> {
         .collect::<Result<Vec<_>>>()?;
     let root = common_root(&requested);
     let mut diagnostics = Vec::new();
-    let metadata = load_metadata(&requested, &mut diagnostics)?;
+    let mut compiler_metadata_errors = Vec::new();
+    let LoadedMetadata {
+        source: metadata,
+        compiler: compiler_metadata,
+    } = load_metadata(
+        &requested,
+        cli,
+        &mut diagnostics,
+        &mut compiler_metadata_errors,
+    )?;
     if metadata.is_none()
         && (cli.all_features
             || cli.no_default_features
@@ -113,13 +149,24 @@ pub fn inventory(cli: &Cli) -> Result<Inventory> {
         enabled_features,
         synthetic,
     } = build_packages(metadata.as_ref(), cli, &requested, &mut diagnostics)?;
+    let synthetic = synthetic || !cli.unset_cfg.is_empty();
+    let mut compiler_unavailable_reasons = compiler_metadata_errors;
+    if !cli.unset_cfg.is_empty() {
+        compiler_unavailable_reasons.push(
+            "--unset-cfg cannot be represented faithfully by a Cargo compiler invocation"
+                .to_owned(),
+        );
+    }
+    compiler_unavailable_reasons.sort();
+    compiler_unavailable_reasons.dedup();
+    let compiler_compatible = compiler_unavailable_reasons.is_empty();
     for input in requested.iter().filter(|path| {
         path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
     }) {
         if !cargo_aware && !targets.iter().any(|target| target.path == *input) {
             targets.push(TargetSeed {
                 path: input.clone(),
-                contexts: Contexts::seed(TargetRole::Production, Reachability::BOTH, true),
+                contexts: Contexts::seed(TargetRole::Production, Reachability::BOTH),
             });
         }
     }
@@ -131,13 +178,19 @@ pub fn inventory(cli: &Cli) -> Result<Inventory> {
         }
     }
 
+    let compiler_target = compiler_metadata
+        .as_ref()
+        .map(|metadata| {
+            crate::compiler::effective_target(cli, metadata.workspace_root.as_std_path())
+        })
+        .transpose()?;
     let RustcCfg {
         known_true: cfg_true,
         known_false: cfg_false,
         closed_world_names: cfg_closed_world,
         target,
         version: rustc,
-    } = rustc_cfg(cli)?;
+    } = rustc_cfg(cli, compiler_metadata.is_some(), compiler_target.as_deref())?;
     let feature_mode = if cli.all_features {
         "all".to_owned()
     } else if cli.no_default_features {
@@ -168,6 +221,8 @@ pub fn inventory(cli: &Cli) -> Result<Inventory> {
             attributes
         },
         synthetic,
+        compiler_compatible,
+        compiler_unavailable_reasons: compiler_unavailable_reasons.clone(),
     };
 
     Ok(Inventory {
@@ -180,15 +235,26 @@ pub fn inventory(cli: &Cli) -> Result<Inventory> {
         cfg_false,
         cfg_closed_world,
         profile,
+        compiler_compatible,
+        compiler_unavailable_reasons,
+        compiler_metadata,
         diagnostics,
     })
 }
 
+struct LoadedMetadata {
+    source: Option<Metadata>,
+    compiler: Option<Metadata>,
+}
+
 fn load_metadata(
     requested: &[PathBuf],
+    cli: &Cli,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<Option<Metadata>> {
+    compiler_errors: &mut Vec<String>,
+) -> Result<LoadedMetadata> {
     let mut selected: Option<Metadata> = None;
+    let mut compiler_metadata: Option<Metadata> = None;
     for input in requested {
         if selected
             .as_ref()
@@ -201,9 +267,30 @@ fn load_metadata(
         } else {
             input.parent().unwrap_or(input)
         };
-        let mut command = MetadataCommand::new();
-        command.current_dir(current_dir).no_deps();
-        match command.exec() {
+        let loaded = if cli.compiler {
+            match crate::compiler::validate_environment(current_dir) {
+                Ok(()) => match crate::compiler::pinned_metadata(cli, current_dir, false) {
+                    Ok(metadata) => {
+                        compiler_metadata = Some(metadata.clone());
+                        Ok(metadata)
+                    }
+                    Err(error) => {
+                        compiler_errors
+                            .push(format!("pinned Cargo metadata preflight failed: {error:#}"));
+                        crate::compiler::pinned_metadata(cli, current_dir, true)
+                            .or_else(|_| ambient_metadata(cli, current_dir, true))
+                    }
+                },
+                Err(error) => {
+                    compiler_errors
+                        .push(format!("compiler environment preflight failed: {error:#}"));
+                    ambient_metadata(cli, current_dir, true)
+                }
+            }
+        } else {
+            ambient_metadata(cli, current_dir, false)
+        };
+        match loaded {
             Ok(metadata) => {
                 if let Some(existing) = &selected
                     && existing.workspace_root != metadata.workspace_root
@@ -222,7 +309,8 @@ fn load_metadata(
                         severity: DiagnosticSeverity::Warning,
                         path: None,
                         message: format!(
-                            "Cargo metadata unavailable; using standalone discovery: {error}"
+                            "{} Cargo metadata unavailable; using standalone discovery: {error}",
+                            if cli.compiler { "pinned" } else { "ambient" }
                         ),
                     });
                 }
@@ -241,7 +329,41 @@ fn load_metadata(
             );
         }
     }
-    Ok(selected)
+    compiler_errors.sort();
+    compiler_errors.dedup();
+    Ok(LoadedMetadata {
+        source: selected,
+        compiler: compiler_metadata,
+    })
+}
+
+fn ambient_metadata(cli: &Cli, current_dir: &Path, compiler_fallback: bool) -> Result<Metadata> {
+    let mut command = MetadataCommand::new();
+    command.current_dir(current_dir).no_deps();
+    if compiler_fallback {
+        for variable in [
+            "RUSTC",
+            "CARGO_BUILD_RUSTC",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            command.env_remove(variable);
+        }
+        let mut options = vec![
+            "--config".to_owned(),
+            "build.rustc=\"rustc\"".to_owned(),
+            "--config".to_owned(),
+            "build.rustc-workspace-wrapper=\"\"".to_owned(),
+        ];
+        if cli.locked {
+            options.push("--locked".to_owned());
+        }
+        if cli.offline {
+            options.push("--offline".to_owned());
+        }
+        command.other_options(options);
+    }
+    command.exec().map_err(anyhow::Error::from)
 }
 
 fn find_manifest(start: &Path) -> Option<PathBuf> {
@@ -289,6 +411,7 @@ fn build_packages(
     let mut enabled_features = BTreeMap::new();
     let mut synthetic = false;
     for package in &workspace_packages {
+        let target_settings = TargetSettings::load(package.manifest_path.as_std_path())?;
         let (features, broken) = resolve_features(package, cli, &selectors, &exclusions);
         for message in broken {
             synthetic = true;
@@ -297,9 +420,6 @@ fn build_packages(
                 path: Some(package.manifest_path.to_string()),
                 message,
             });
-        }
-        if !features.excluded.is_empty() {
-            synthetic = true;
         }
         enabled_features.insert(
             package.name.to_string(),
@@ -312,6 +432,18 @@ fn build_packages(
             root: manifest.parent().unwrap_or(manifest).to_path_buf(),
             edition: package.edition.to_string(),
             features,
+            targets: package
+                .targets
+                .iter()
+                .map(|target| PackageTargetInfo {
+                    name: target.name.clone(),
+                    kinds: target.kind.iter().map(ToString::to_string).collect(),
+                    crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
+                    source: target.src_path.as_std_path().to_path_buf(),
+                    required_features: target.required_features.clone(),
+                    test_reachable: target.test || target_settings.bench_enabled(target),
+                })
+                .collect(),
         });
     }
 
@@ -329,19 +461,19 @@ fn build_packages(
         }) {
             continue;
         }
-        for target in &package.targets {
-            let path = target.src_path.as_std_path().to_path_buf();
+        for target in &packages[package_index].targets {
+            let path = target.source.clone();
             let enabled = target
                 .required_features
                 .iter()
                 .all(|feature| packages[package_index].features.enabled.contains(feature));
-            let (role, mut reachability, library_api) = target_context(target);
+            let (role, mut reachability) = target_context(target);
             if !enabled {
                 reachability = Reachability::NEVER;
             }
             targets.push(TargetSeed {
                 path,
-                contexts: Contexts::seed(role, reachability, library_api),
+                contexts: Contexts::seed(role, reachability),
             });
         }
     }
@@ -386,45 +518,115 @@ fn standalone_seeds(requested: &[PathBuf]) -> Vec<TargetSeed> {
         })
         .map(|path| TargetSeed {
             path: path.clone(),
-            contexts: Contexts::seed(TargetRole::Production, Reachability::BOTH, true),
+            contexts: Contexts::seed(TargetRole::Production, Reachability::BOTH),
         })
         .collect()
 }
 
-fn target_context(target: &cargo_metadata::Target) -> (TargetRole, Reachability, bool) {
-    if target.kind.contains(&TargetKind::Test) {
-        return (TargetRole::Test, Reachability::TEST, false);
+struct TargetSettings {
+    manifest_dir: PathBuf,
+    document: toml::Value,
+}
+
+impl TargetSettings {
+    fn load(manifest: &Path) -> Result<Self> {
+        let text = fs::read_to_string(manifest)
+            .with_context(|| format!("cannot read Cargo manifest {}", manifest.display()))?;
+        let document = toml::from_str(&text)
+            .with_context(|| format!("cannot parse Cargo manifest {}", manifest.display()))?;
+        Ok(Self {
+            manifest_dir: manifest.parent().unwrap_or(manifest).to_path_buf(),
+            document,
+        })
     }
-    if target.kind.contains(&TargetKind::Bench) {
-        return (TargetRole::Bench, Reachability::TEST, false);
+
+    fn bench_enabled(&self, target: &cargo_metadata::Target) -> bool {
+        let default = target.kind.iter().any(|kind| {
+            matches!(
+                kind.to_string().as_str(),
+                "lib" | "proc-macro" | "bin" | "bench"
+            )
+        });
+        self.target_table(target)
+            .and_then(|table| table.get("bench"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(default)
     }
-    if target.kind.contains(&TargetKind::Example) {
-        return (TargetRole::Example, Reachability::PRODUCTION, false);
+
+    fn target_table<'a>(
+        &'a self,
+        target: &cargo_metadata::Target,
+    ) -> Option<&'a toml::map::Map<String, toml::Value>> {
+        let key = target
+            .kind
+            .iter()
+            .find_map(|kind| match kind.to_string().as_str() {
+                "lib" | "proc-macro" => Some("lib"),
+                "bin" => Some("bin"),
+                "example" => Some("example"),
+                "test" => Some("test"),
+                "bench" => Some("bench"),
+                _ => None,
+            })?;
+        let value = self.document.get(key)?;
+        if key == "lib" {
+            return value.as_table();
+        }
+        value.as_array()?.iter().find_map(|entry| {
+            let table = entry.as_table()?;
+            let name_matches = table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|name| name == target.name);
+            let path_matches = table
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .map(|path| self.manifest_dir.join(path))
+                .is_some_and(|path| {
+                    canonical_path(&path) == canonical_path(target.src_path.as_std_path())
+                });
+            (name_matches || path_matches).then_some(table)
+        })
     }
-    if target.kind.contains(&TargetKind::CustomBuild) {
-        return (TargetRole::Build, Reachability::PRODUCTION, false);
+}
+
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn target_context(target: &PackageTargetInfo) -> (TargetRole, Reachability) {
+    if target.kinds.iter().any(|kind| kind == "test") {
+        return (TargetRole::Test, Reachability::TEST);
+    }
+    if target.kinds.iter().any(|kind| kind == "bench") {
+        return (TargetRole::Bench, Reachability::TEST);
+    }
+    if target.kinds.iter().any(|kind| kind == "example") {
+        return (
+            TargetRole::Example,
+            Reachability {
+                production: Activation::Always,
+                test: if target.test_reachable {
+                    Activation::Always
+                } else {
+                    Activation::Never
+                },
+            },
+        );
+    }
+    if target.kinds.iter().any(|kind| kind == "custom-build") {
+        return (TargetRole::Build, Reachability::PRODUCTION);
     }
 
     let reachability = Reachability {
         production: Activation::Always,
-        test: if target.test {
+        test: if target.test_reachable {
             Activation::Always
         } else {
             Activation::Never
         },
     };
-    let library_api = target.kind.iter().any(|kind| {
-        matches!(
-            kind,
-            TargetKind::Lib
-                | TargetKind::RLib
-                | TargetKind::DyLib
-                | TargetKind::CDyLib
-                | TargetKind::StaticLib
-                | TargetKind::ProcMacro
-        )
-    });
-    (TargetRole::Production, reachability, library_api)
+    (TargetRole::Production, reachability)
 }
 
 #[derive(Clone, Debug)]
@@ -586,7 +788,11 @@ fn discover_sources(requested: &[PathBuf], cli: &Cli) -> Result<BTreeSet<PathBuf
     Ok(sources)
 }
 
-fn rustc_cfg(cli: &Cli) -> Result<RustcCfg> {
+fn rustc_cfg(
+    cli: &Cli,
+    pinned_compiler_profile: bool,
+    compiler_target: Option<&str>,
+) -> Result<RustcCfg> {
     let forced_true = cli
         .cfg
         .iter()
@@ -601,9 +807,10 @@ fn rustc_cfg(cli: &Cli) -> Result<RustcCfg> {
         bail!("cfg predicate {conflict:?} is both enabled and disabled explicitly");
     }
 
-    let mut command = rustc_command();
+    let mut command = rustc_command(cli.compiler, pinned_compiler_profile);
     command.args(["--print", "cfg"]);
-    if let Some(target) = &cli.target {
+    let requested_target = compiler_target.or(cli.target.as_deref());
+    if let Some(target) = requested_target {
         command.args(["--target", target]);
     }
     let output = command
@@ -633,7 +840,7 @@ fn rustc_cfg(cli: &Cli) -> Result<RustcCfg> {
     }
     known_true.extend(forced_true);
 
-    let mut version_command = rustc_command();
+    let mut version_command = rustc_command(cli.compiler, pinned_compiler_profile);
     let version_output = version_command
         .arg("-vV")
         .output()
@@ -656,7 +863,7 @@ fn rustc_cfg(cli: &Cli) -> Result<RustcCfg> {
         .find_map(|line| line.strip_prefix("host: "))
         .unwrap_or("unknown-host")
         .to_owned();
-    let target = cli.target.clone().unwrap_or(host);
+    let target = requested_target.map(str::to_owned).unwrap_or(host);
     Ok(RustcCfg {
         known_true,
         known_false: forced_false,
@@ -666,8 +873,14 @@ fn rustc_cfg(cli: &Cli) -> Result<RustcCfg> {
     })
 }
 
-fn rustc_command() -> Command {
-    std::env::var_os("RUSTC").map_or_else(|| Command::new("rustc"), Command::new)
+fn rustc_command(compiler_mode: bool, pinned_compiler_profile: bool) -> Command {
+    if pinned_compiler_profile {
+        crate::compiler::pinned_rustc_command()
+    } else if compiler_mode {
+        Command::new("rustc")
+    } else {
+        std::env::var_os("RUSTC").map_or_else(|| Command::new("rustc"), Command::new)
+    }
 }
 
 fn sorted(values: &HashSet<String>) -> Vec<String> {

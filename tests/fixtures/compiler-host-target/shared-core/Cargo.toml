@@ -1,0 +1,13 @@
+[package]
+name = "shared-core"
+version = "0.0.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+test = false
+bench = false
+
+[features]
+host-mode = []
+target-mode = []

@@ -66,6 +66,26 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub test_attribute: Vec<String>,
 
+    /// Run pinned Cargo/rustc semantics; executes project build scripts and proc macros
+    #[arg(long)]
+    pub compiler: bool,
+
+    /// Path to the pinned rot rustc wrapper
+    #[arg(long, value_name = "PATH", requires = "compiler")]
+    pub compiler_driver: Option<PathBuf>,
+
+    /// Require Cargo.lock to remain unchanged in compiler mode
+    #[arg(long, requires = "compiler")]
+    pub locked: bool,
+
+    /// Forbid network access in compiler mode
+    #[arg(long, requires = "compiler")]
+    pub offline: bool,
+
+    /// Parent for a temporary isolated compiler target/build directory
+    #[arg(long, value_name = "DIR", requires = "compiler")]
+    pub compiler_target_dir: Option<PathBuf>,
+
     /// Include hidden files and directories (except .git)
     #[arg(long)]
     pub hidden: bool,

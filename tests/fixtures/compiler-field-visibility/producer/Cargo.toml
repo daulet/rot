@@ -1,0 +1,4 @@
+[package]
+name = "field_visibility_producer"
+version = "0.0.0"
+edition = "2024"

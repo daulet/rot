@@ -1,6 +1,7 @@
 mod analyze;
 mod cfg;
 mod cli;
+mod compiler;
 mod model;
 mod report;
 mod source;

@@ -1,0 +1,12 @@
+[package]
+name = "rot-rustc-driver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace]
+
+[dependencies]
+rot-compiler-protocol = { path = "../../crates/rot-compiler-protocol" }
+serde_json = "1.0.151"

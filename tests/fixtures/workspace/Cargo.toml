@@ -17,6 +17,16 @@ weak_dependency_feature = ["fixture-helper?/marker"]
 [dependencies]
 fixture-helper = { path = "../dependency", optional = true }
 
+[lib]
+test = false
+bench = true
+
+[[bin]]
+name = "rot-fixture-bin"
+path = "src/main.rs"
+test = false
+bench = false
+
 [[test]]
 name = "external"
 path = "integration/check.rs"
@@ -24,6 +34,7 @@ path = "integration/check.rs"
 [[example]]
 name = "demo"
 path = "demo/demo.rs"
+test = true
 
 [[bench]]
 name = "speed"

@@ -1,0 +1,4 @@
+[package]
+name = "decl_macro_producer"
+version = "0.0.0"
+edition = "2024"

@@ -1,0 +1,11 @@
+[package]
+name = "rot-macro-consumer"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+members = ["attribute-macro"]
+resolver = "3"
+
+[dependencies]
+rot-attribute-fixture = { path = "attribute-macro" }

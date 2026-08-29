@@ -1,0 +1,7 @@
+[package]
+name = "inherent_assoc_consumer"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+inherent_assoc_producer = { path = "../producer" }

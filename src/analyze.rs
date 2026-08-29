@@ -12,8 +12,8 @@ use crate::{
     cfg::CfgProfile,
     cli::Cli,
     model::{
-        Activation, BucketReport, Contexts, Diagnostic, DiagnosticSeverity, FileReport, LineCounts,
-        OutputRole, Report, SurfaceReport,
+        BucketReport, ComplexityMetrics, Contexts, Diagnostic, DiagnosticSeverity, FileReport,
+        LineCounts, OutputRole, Report,
     },
     source::{ContentKind, LocalFile, analyze_file, reachability_states},
     workspace::{Inventory, inventory},
@@ -92,7 +92,26 @@ pub fn analyze(cli: &Cli) -> Result<Report> {
         .map(|(index, path)| (path.clone(), index))
         .collect::<HashMap<_, _>>();
     let contexts = classify_module_graph(&inventory, &files, &path_indices);
-    build_report(inventory, files, paths, contexts)
+    let compiler = cli
+        .compiler
+        .then(|| crate::compiler::collect(cli, &inventory));
+    if let Some(outcome) = &compiler {
+        if !outcome.profile_incompatibilities.is_empty() {
+            inventory.compiler_compatible = false;
+            inventory
+                .compiler_unavailable_reasons
+                .extend(outcome.profile_incompatibilities.iter().cloned());
+            inventory.compiler_unavailable_reasons.sort();
+            inventory.compiler_unavailable_reasons.dedup();
+            inventory.profile.compiler_compatible = false;
+            inventory.profile.compiler_unavailable_reasons =
+                inventory.compiler_unavailable_reasons.clone();
+        }
+        inventory.diagnostics.extend(outcome.diagnostics.clone());
+    }
+    let mut report = build_report(inventory, files, paths, contexts)?;
+    report.compiler = compiler.map(|outcome| outcome.report);
+    Ok(report)
 }
 
 fn classify_module_graph(
@@ -126,7 +145,6 @@ fn classify_module_graph(
             if contexts[index].merge(Contexts::seed(
                 crate::model::TargetRole::Production,
                 crate::model::Reachability::BOTH,
-                true,
             )) {
                 queue.push_back(index);
             }
@@ -141,7 +159,6 @@ fn classify_module_graph(
                 && context.merge(Contexts::seed(
                     crate::model::TargetRole::Production,
                     crate::model::Reachability::BOTH,
-                    true,
                 ))
             {
                 queue.push_back(index);
@@ -166,7 +183,7 @@ fn propagate(
             let Some(&child_index) = path_indices.get(&target) else {
                 continue;
             };
-            let incoming = parent_context.through(edge.gate, edge.public);
+            let incoming = parent_context.through(edge.gate);
             if contexts[child_index].merge(incoming) {
                 queue.push_back(child_index);
             }
@@ -182,8 +199,7 @@ fn build_report(
 ) -> Result<Report> {
     let mut project_buckets = empty_buckets();
     let mut project_total = LineCounts::default();
-    let mut project_complexity = 0;
-    let mut project_surface = SurfaceReport::default();
+    let mut project_metrics = ComplexityMetrics::default();
     let mut file_reports = Vec::with_capacity(files.len());
     let mut bytes = 0;
 
@@ -199,55 +215,48 @@ fn build_report(
             .map(|package| package.name.clone());
         let mut buckets = empty_buckets();
         let mut total = LineCounts::default();
-        let mut complexity = 0;
-        let mut surface = SurfaceReport::default();
+        let mut metrics = ComplexityMetrics::default();
 
         for line in &file.lines {
             let role = context.classify(line.reachability());
             add_line(&mut buckets[role as usize].lines, line.kind, line.doc);
             add_line(&mut total, line.kind, line.doc);
 
-            if line.kind == ContentKind::Code {
-                let exported = context
-                    .library_api
-                    .and(line.exported_relative)
-                    .or(context.library_crate.and(line.exported_absolute))
-                    .and(line.reachability());
-                if exported.production == Activation::Always {
-                    surface.signature_lines += 1;
-                }
-            }
-            for (reachability, count) in reachability_states().zip(line.complexity) {
+            for (reachability, count) in reachability_states().zip(line.lexical_complexity) {
                 if count == 0 {
                     continue;
                 }
                 let event_role = context.classify(reachability);
-                buckets[event_role as usize].complexity += u64::from(count);
-                complexity += u64::from(count);
+                let contribution = ComplexityMetrics {
+                    lexical_complexity: u64::from(count),
+                    ..ComplexityMetrics::default()
+                };
+                buckets[event_role as usize].metrics.add(contribution);
+                metrics.add(contribution);
             }
         }
 
-        for (reachability, count) in reachability_states().zip(file.declared_items) {
+        for &fact in &file.authored_facts {
+            let role = context.classify(fact.reachability());
+            let contribution = fact.metrics();
+            buckets[role as usize].metrics.add(contribution);
+            metrics.add(contribution);
+        }
+
+        for (reachability, count) in reachability_states().zip(file.declared_public) {
             if count == 0 {
                 continue;
             }
             let role = context.classify(reachability);
             buckets[role as usize].declared_public += u64::from(count);
         }
-        surface.production_declared_public =
-            buckets[OutputRole::Production as usize].declared_public;
-        surface.exported_items = confirmed_items(context.library_api, file.exported_relative_items)
-            + confirmed_items(context.library_crate, file.exported_absolute_items);
-        surface.unresolved_public_uses =
-            confirmed_items(context.library_api, file.unresolved_public_uses);
-        surface.unresolved_glob_reexports =
-            confirmed_items(context.library_api, file.unresolved_globs);
-        surface.opaque_macro_calls = confirmed_items(context.library_api, file.opaque_macro_calls);
-        surface.unresolved_inherent_public_items =
-            confirmed_items(context.library_api, file.unresolved_inherent_public_items);
-
         for bucket in &mut buckets {
-            if bucket.lines.physical > 0 || bucket.complexity > 0 || bucket.declared_public > 0 {
+            if bucket.lines.physical > 0
+                || bucket.metrics.lexical_complexity > 0
+                || bucket.metrics.cyclomatic_authored > 0
+                || bucket.metrics.cognitive_authored > 0
+                || bucket.declared_public > 0
+            {
                 bucket.files = 1;
             }
         }
@@ -277,19 +286,11 @@ fn build_report(
         for (project, file_bucket) in project_buckets.iter_mut().zip(&buckets) {
             project.files += file_bucket.files;
             project.lines.add(file_bucket.lines);
-            project.complexity += file_bucket.complexity;
+            project.metrics.add(file_bucket.metrics);
             project.declared_public += file_bucket.declared_public;
         }
         project_total.add(total);
-        project_complexity += complexity;
-        project_surface.exported_items += surface.exported_items;
-        project_surface.signature_lines += surface.signature_lines;
-        project_surface.production_declared_public += surface.production_declared_public;
-        project_surface.unresolved_public_uses += surface.unresolved_public_uses;
-        project_surface.unresolved_glob_reexports += surface.unresolved_glob_reexports;
-        project_surface.opaque_macro_calls += surface.opaque_macro_calls;
-        project_surface.unresolved_inherent_public_items +=
-            surface.unresolved_inherent_public_items;
+        project_metrics.add(metrics);
         bytes += file.bytes;
 
         file_reports.push(FileReport {
@@ -299,13 +300,12 @@ fn build_report(
             syntax_errors: file.syntax_errors.len() as u64,
             buckets: buckets.into_iter().filter(nonempty_bucket).collect(),
             total,
-            complexity,
-            surface,
+            metrics,
         });
     }
 
     Ok(Report {
-        schema_version: 1,
+        schema_version: 2,
         root: inventory.root.to_string_lossy().into_owned(),
         profile: inventory.profile,
         file_count: file_reports.len() as u64,
@@ -316,18 +316,10 @@ fn build_report(
             .filter(nonempty_bucket)
             .collect(),
         total: project_total,
-        complexity: project_complexity,
-        surface: project_surface,
+        metrics: project_metrics,
+        compiler: None,
         diagnostics: inventory.diagnostics,
     })
-}
-
-fn confirmed_items(context: crate::model::Reachability, counts: [u32; 9]) -> u64 {
-    reachability_states()
-        .zip(counts)
-        .filter(|(local, _)| context.and(*local).production == Activation::Always)
-        .map(|(_, count)| u64::from(count))
-        .sum()
 }
 
 fn empty_buckets() -> [BucketReport; crate::model::OUTPUT_ROLE_COUNT] {
@@ -340,7 +332,9 @@ fn empty_buckets() -> [BucketReport; crate::model::OUTPUT_ROLE_COUNT] {
 fn nonempty_bucket(bucket: &BucketReport) -> bool {
     bucket.files > 0
         || bucket.lines.physical > 0
-        || bucket.complexity > 0
+        || bucket.metrics.lexical_complexity > 0
+        || bucket.metrics.cyclomatic_authored > 0
+        || bucket.metrics.cognitive_authored > 0
         || bucket.declared_public > 0
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "host-target-app"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+shared-core = { path = "../shared-core", default-features = false, features = ["target-mode"] }
+
+[build-dependencies]
+shared-core = { path = "../shared-core", default-features = false, features = ["host-mode"] }
