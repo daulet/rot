@@ -21,11 +21,10 @@ fn fixture(name: &str) -> PathBuf {
     repository().join("tests/fixtures").join(name)
 }
 
-fn run_compiler(path: &Path, extra: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rot"))
+fn run_audit(path: &Path, extra: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rot-audit"))
         .args([
-            "--compiler",
-            "--compiler-driver",
+            "--driver",
             driver().to_str().unwrap(),
             "--locked",
             "--offline",
@@ -34,27 +33,37 @@ fn run_compiler(path: &Path, extra: &[&str]) -> Output {
         .arg(path)
         .args(["--format", "json"])
         .output()
-        .expect("run rot compiler mode")
+        .expect("run rot-audit")
 }
 
-fn report(output: &Output) -> Value {
+fn parse_report(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "parse rot-audit JSON: {error}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn complete_report(output: &Output) -> Value {
     assert!(
         output.status.success(),
-        "rot failed: {}",
+        "rot-audit failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("parse rot JSON")
+    let report = parse_report(output);
+    assert_eq!(report["status"], "complete", "{report:#}");
+    report
 }
 
-fn product_status<'a>(report: &'a Value, product: &str) -> &'a str {
-    report["compiler"]["products"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|value| value["product"] == product)
-        .unwrap()["status"]
-        .as_str()
-        .unwrap()
+fn incomplete_report(output: &Output) -> Value {
+    assert!(
+        !output.status.success(),
+        "incomplete rot-audit unexpectedly succeeded"
+    );
+    let report = parse_report(output);
+    assert_ne!(report["status"], "complete", "{report:#}");
+    report
 }
 
 fn pinned_host() -> String {
@@ -71,17 +80,29 @@ fn pinned_host() -> String {
         .to_owned()
 }
 
+fn required_paths(report: &Value) -> BTreeSet<&str> {
+    report["required_visibility"]["definitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|definition| definition["definition_path"].as_str().unwrap())
+        .collect()
+}
+
+fn findings(report: &Value) -> &[Value] {
+    report["closed_world"]["findings"].as_array().unwrap()
+}
+
 #[test]
 fn custom_cfg_refuses_ambient_rustflags_before_driver_execution() {
     for (variable, value) in [
         ("RUSTFLAGS", "-Cdebuginfo=0"),
         ("CARGO_TARGET_FAKE_TARGET_RUSTFLAGS", ""),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rot"))
+        let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
             .env(variable, value)
             .args([
-                "--compiler",
-                "--compiler-driver",
+                "--driver",
                 "/definitely/not/a/rot-driver",
                 "--cfg",
                 "rot_requested",
@@ -89,9 +110,10 @@ fn custom_cfg_refuses_ambient_rustflags_before_driver_execution() {
             .arg(fixture("workspace"))
             .args(["--format", "json"])
             .output()
-            .expect("run rot compiler mode");
-        let report = report(&output);
+            .expect("run rot-audit");
+        let report = incomplete_report(&output);
 
+        assert_eq!(report["status"], "unavailable");
         assert!(
             report["diagnostics"]
                 .as_array()
@@ -102,9 +124,7 @@ fn custom_cfg_refuses_ambient_rustflags_before_driver_execution() {
                         message.contains("cannot be composed")
                             && message.contains("rustflag environment")
                     })
-                }),
-            "{variable}: {}",
-            report["diagnostics"]
+                })
         );
         assert!(
             !report["diagnostics"]
@@ -115,70 +135,61 @@ fn custom_cfg_refuses_ambient_rustflags_before_driver_execution() {
                     diagnostic["message"].as_str().is_some_and(|message| {
                         message.contains("driver") && message.contains("does not exist")
                     })
-                })
+                }),
+            "{variable}: {}",
+            report["diagnostics"]
         );
     }
 }
 
 #[test]
-fn rejected_rustc_override_preserves_the_cargo_aware_source_report() {
-    for rustc in ["", "/definitely/not-rustc"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rot"))
-            .env("RUSTC", rustc)
-            .args(["--compiler", "--format", "json"])
-            .arg(fixture("workspace"))
-            .output()
-            .expect("run rot compiler mode");
-        let report = report(&output);
+fn rejected_rustc_override_is_a_structured_unavailable_audit() {
+    // A resolvable override lets metadata establish the report root/profile;
+    // the audit must then reject the override as structured unavailable evidence.
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
+        .env("RUSTC", "rustc")
+        .args(["--driver", "/definitely/not/a/rot-driver"])
+        .arg(fixture("workspace"))
+        .args(["--format", "json"])
+        .output()
+        .expect("run rot-audit");
+    let report = incomplete_report(&output);
 
-        assert!(report["file_count"].as_u64().unwrap() > 0);
-        assert!(report["buckets"].as_array().unwrap().iter().any(|bucket| {
-            bucket["role"] == "production" && bucket["code"].as_u64().unwrap() > 0
-        }));
-        assert_eq!(product_status(&report, "hir_bodies"), "unavailable");
-        assert!(
-            report["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| diagnostic["message"]
+    assert_eq!(report["status"], "unavailable");
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["message"]
                     .as_str()
-                    .is_some_and(|message| message.contains("rejects RUSTC")))
-        );
-    }
+                    .is_some_and(|message| message.contains("rejects RUSTC"))
+            })
+    );
+    assert!(
+        !report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not exist")))
+    );
 }
 
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
-fn keep_going_retains_good_facts_and_marks_the_workspace_partial() {
-    let report = report(&run_compiler(&fixture("partial-workspace"), &[]));
+fn keep_going_retains_good_facts_but_fails_the_partial_audit() {
+    let output = run_audit(&fixture("partial-workspace"), &[]);
+    let report = incomplete_report(&output);
 
-    assert_eq!(product_status(&report, "hir_bodies"), "partial");
-    assert_eq!(product_status(&report, "effective_api"), "partial");
-    assert_eq!(product_status(&report, "required_visibility"), "partial");
-    assert_eq!(product_status(&report, "closed_world_liveness"), "partial");
-    assert_eq!(
-        product_status(&report, "macro_expansion_cyclomatic_delta"),
-        "partial"
-    );
-    assert!(report["compiler"].get("effective_api").is_none());
-    assert!(report["compiler"].get("required_visibility").is_none());
-    assert!(report["compiler"].get("closed_world").is_none());
-    let expansion = report["compiler"]["macro_expansion_complexity"]
-        .as_object()
-        .expect("invocation-local macro facts remain inspectable");
-    assert!(expansion.get("totals").is_none());
-    assert!(expansion["invocations"].as_array().unwrap().iter().all(
-        |invocation| invocation["status"] == "complete" || invocation.get("metrics").is_none()
-    ));
-    assert!(
-        expansion["invocations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|invocation| invocation["status"] == "complete"
-                && invocation["metrics"].is_object())
-    );
+    assert_eq!(report["status"], "partial");
+    assert!(report["reason"].as_str().is_some_and(|reason| {
+        reason.contains("complete visibility facts") || reason.contains("selected Cargo")
+    }));
+    assert!(report.get("required_visibility").is_none());
+    assert!(report.get("closed_world").is_none());
     assert!(
         report["diagnostics"]
             .as_array()
@@ -191,21 +202,99 @@ fn keep_going_retains_good_facts_and_marks_the_workspace_partial() {
             })
     );
     assert!(
-        report["compiler"]["invocations"]
+        report["invocations"]
             .as_array()
             .unwrap()
             .iter()
             .any(|invocation| {
-                invocation["crate_name"] == "rot_good_fixture"
-                    && invocation["products"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|product| {
-                            product["product"] == "hir_bodies" && product["status"] == "complete"
-                        })
+                invocation["crate_name"] == "rot_good_fixture" && invocation["status"] == "complete"
             })
     );
+}
+
+#[test]
+#[ignore = "requires the pinned nightly rustc-dev helper"]
+fn visibility_audit_correlates_all_cargo_target_roles() {
+    let report = complete_report(&run_audit(&fixture("workspace"), &[]));
+
+    assert_eq!(
+        report["expected_invocations"],
+        report["correlated_invocations"]
+    );
+    assert!(
+        report["invocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|invocation| invocation["status"] == "complete")
+    );
+    let roles = report["invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|invocation| invocation["target"]["role"].as_str())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "production",
+        "unit_test",
+        "test",
+        "bench",
+        "example",
+        "build",
+    ] {
+        assert!(
+            roles.contains(expected),
+            "missing role {expected}: {roles:?}"
+        );
+    }
+
+    assert_eq!(
+        report["required_visibility"]["scope"],
+        "selected-workspace compiled-target closed world"
+    );
+    assert_eq!(
+        report["required_visibility"]["evidence_exclusions"],
+        report["closed_world"]["evidence_exclusions"]
+    );
+    let finding = |path: &str| {
+        findings(&report)
+            .iter()
+            .find(|finding| finding["definition_path"] == path)
+            .unwrap_or_else(|| panic!("missing closed-world finding for {path}"))
+    };
+    assert_eq!(
+        finding("reachable_public_helper")["kind"],
+        "unnecessary_public"
+    );
+    assert_eq!(finding("dead_public_for_graph")["kind"], "dead_public");
+    assert!(!required_paths(&report).contains("generated_decision"));
+    assert!(
+        findings(&report)
+            .iter()
+            .all(|finding| finding["definition_path"] != "generated_decision")
+    );
+    assert!(findings(&report).iter().all(|finding| {
+        finding["reason"].is_string()
+            && finding["representative_invocation"].is_string()
+            && finding["representative_id"]["stable_crate_id"].is_string()
+    }));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
+        .args([
+            "--driver",
+            driver().to_str().unwrap(),
+            "--locked",
+            "--offline",
+        ])
+        .arg(fixture("workspace"))
+        .output()
+        .expect("run rot-audit table output");
+    assert!(output.status.success());
+    let table = String::from_utf8(output.stdout).unwrap();
+    assert!(table.contains("reachable_public_helper"));
+    assert!(table.contains("dead_public_for_graph"));
+    assert!(table.contains("unnecessary_public"));
+    assert!(table.contains("dead_public"));
 }
 
 #[test]
@@ -213,14 +302,14 @@ fn keep_going_retains_good_facts_and_marks_the_workspace_partial() {
 fn isolated_runs_are_deterministic_and_leave_no_artifacts() {
     let parent = tempfile::tempdir().unwrap();
     let parent_path = parent.path().to_string_lossy().into_owned();
-    let arguments = ["--compiler-target-dir", parent_path.as_str()];
+    let arguments = ["--scratch-dir", parent_path.as_str()];
 
-    let first = report(&run_compiler(&fixture("workspace"), &arguments));
+    let first = complete_report(&run_audit(&fixture("workspace"), &arguments));
     assert!(fs::read_dir(parent.path()).unwrap().next().is_none());
-    let second = report(&run_compiler(&fixture("workspace"), &arguments));
+    let second = complete_report(&run_audit(&fixture("workspace"), &arguments));
     assert!(fs::read_dir(parent.path()).unwrap().next().is_none());
 
-    assert_eq!(first["compiler"], second["compiler"]);
+    assert_eq!(first, second);
 }
 
 #[test]
@@ -228,10 +317,9 @@ fn isolated_runs_are_deterministic_and_leave_no_artifacts() {
 fn explicit_target_cfg_does_not_require_target_flags_on_host_build_scripts() {
     let host = pinned_host();
     let arguments = ["--target", host.as_str(), "--cfg", "rot_requested"];
-    let report = report(&run_compiler(&fixture("workspace"), &arguments));
+    let report = complete_report(&run_audit(&fixture("workspace"), &arguments));
 
-    assert_eq!(product_status(&report, "hir_bodies"), "complete");
-    for invocation in report["compiler"]["invocations"].as_array().unwrap() {
+    for invocation in report["invocations"].as_array().unwrap() {
         let role = invocation["target"]["role"].as_str().unwrap();
         let cfg = invocation["cfg"].as_array().unwrap();
         if role == "build" {
@@ -255,145 +343,9 @@ fn explicit_target_cfg_does_not_require_target_flags_on_host_build_scripts() {
 
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
-fn effective_api_contains_only_complete_production_library_facts() {
-    let report = report(&run_compiler(&fixture("workspace"), &[]));
-
-    assert_eq!(product_status(&report, "effective_api"), "complete");
-    let api = report["compiler"]["effective_api"]
-        .as_object()
-        .expect("complete effective API object");
-    let summary = &api["summary"];
-    assert_eq!(summary["production_library_invocations"], 1);
-    assert_eq!(summary["effective_definitions"], 45);
-    assert_eq!(summary["public_bindings"], 30);
-    assert_eq!(
-        summary["bindings_by_namespace"],
-        serde_json::json!({"macro": 1, "type": 14, "value": 15})
-    );
-    assert_eq!(
-        summary["bindings_by_exposure"],
-        serde_json::json!({
-            "direct": 20,
-            "glob_reexport": 4,
-            "macro_export": 1,
-            "single_reexport": 5,
-        })
-    );
-
-    let definitions = api["definitions"].as_array().unwrap();
-    assert!(definitions.iter().all(|definition| {
-        definition["effective_public_at"].is_string()
-            && definition["id"]["stable_crate_id"].is_string()
-            && definition["id"]["local_hash"].is_string()
-    }));
-    assert!(!definitions.iter().any(|definition| {
-        definition["definition_path"]
-            .as_str()
-            .is_some_and(|path| path.contains("unit_test_helper"))
-    }));
-    for (path, kind) in [
-        ("public_mod::Choice", "enum"),
-        ("public_mod::Choice::Unit", "variant"),
-        ("public_mod::Choice::Unit", "constructor"),
-        ("public_mod::Choice::Tuple", "constructor"),
-        ("public_mod::Choice::Record::visible", "field"),
-        ("public_mod::Contract", "trait"),
-        ("public_mod::Contract::Item", "associated_type"),
-        ("public_mod::Contract::VALUE", "associated_constant"),
-        ("public_mod::Contract::call", "associated_function"),
-        ("public_mod::PublicType::field", "associated_function"),
-    ] {
-        assert!(
-            definitions.iter().any(|definition| {
-                definition["definition_path"] == path && definition["kind"] == kind
-            }),
-            "missing effective API definition {path} ({kind})"
-        );
-    }
-    let macro_generated = definitions
-        .iter()
-        .find(|definition| definition["definition_path"] == "macro_generated_decision")
-        .expect("local macro-generated API definition");
-    assert_eq!(macro_generated["expansion_origin"], "local_macro");
-    assert!(macro_generated.get("span").is_none());
-    assert_eq!(
-        macro_generated["attribution_callsite"]["path"],
-        "src/lib.rs"
-    );
-    let generated_file = definitions
-        .iter()
-        .find(|definition| definition["definition_path"] == "generated_decision")
-        .expect("build-script generated API definition");
-    assert_eq!(generated_file["span"]["generated"], true);
-    assert!(
-        generated_file["span"]["path"]
-            .as_str()
-            .is_some_and(|path| path.starts_with("<generated>/"))
-    );
-
-    let bindings = api["public_bindings"].as_array().unwrap();
-    assert!(bindings.iter().any(|binding| {
-        binding["name"] == "Reexported" && binding["exposure"] == "single_reexport"
-    }));
-    assert!(!bindings.iter().any(|binding| {
-        binding["name"] == "declared_but_not_exported"
-            || binding["parent_definition_path"]
-                .as_str()
-                .is_some_and(|path| path.contains("hidden_reexports"))
-    }));
-    assert!(
-        bindings
-            .iter()
-            .all(|binding| binding.get("segments").is_none())
-    );
-    assert_eq!(
-        bindings
-            .iter()
-            .filter(|binding| binding["exposure"] == "glob_reexport")
-            .count(),
-        4
-    );
-    assert_eq!(
-        bindings
-            .iter()
-            .filter(|binding| {
-                matches!(
-                    binding["parent_definition_path"].as_str(),
-                    Some("cycle_a" | "cycle_b")
-                ) && matches!(binding["name"].as_str(), Some("A" | "B"))
-            })
-            .count(),
-        8,
-        "cyclic reexports must remain a finite set of type/value bindings"
-    );
-    assert!(bindings.iter().any(|binding| {
-        binding["name"] == "exported_fixture_macro"
-            && binding["namespace"] == "macro"
-            && binding["exposure"] == "macro_export"
-    }));
-
-    for source in report["compiler"]["invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|invocation| invocation["sources"].as_array().unwrap())
-        .filter(|source| source["generated"] == true)
-    {
-        let path = source["path"].as_str().unwrap();
-        assert!(path.starts_with("<generated>/"), "unstable path: {path}");
-        assert!(!path.contains("rot-compiler"), "temporary path: {path}");
-    }
-}
-
-#[test]
-#[ignore = "requires the pinned nightly rustc-dev helper"]
 fn cross_crate_patterns_preserve_required_field_visibility() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
-
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-    assert_eq!(product_status(&report, "closed_world_liveness"), "complete");
-
-    let required_fields = report["compiler"]["required_visibility"]["definitions"]
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    let required_fields = report["required_visibility"]["definitions"]
         .as_array()
         .unwrap()
         .iter()
@@ -416,16 +368,12 @@ fn cross_crate_patterns_preserve_required_field_visibility() {
         ])
     );
     assert!(!required_fields.contains("Named::rest"));
-
-    let findings = report["compiler"]["closed_world"]["findings"]
-        .as_array()
-        .unwrap();
     assert!(
-        findings
+        findings(&report)
             .iter()
             .any(|finding| finding["definition_path"] == "Named::rest")
     );
-    assert!(findings.iter().all(|finding| {
+    assert!(findings(&report).iter().all(|finding| {
         !required_fields.contains(finding["definition_path"].as_str().unwrap_or_default())
     }));
 }
@@ -433,22 +381,12 @@ fn cross_crate_patterns_preserve_required_field_visibility() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn cross_crate_pathless_self_constructor_preserves_field_visibility() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    let required = required_paths(&report);
 
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-    assert_eq!(product_status(&report, "closed_world_liveness"), "complete");
-
-    let required_definitions = report["compiler"]["required_visibility"]["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| definition["definition_path"].as_str().unwrap())
-        .collect::<BTreeSet<_>>();
-    assert!(required_definitions.contains("SelfConstructed::0"));
+    assert!(required.contains("SelfConstructed::0"));
     assert!(
-        report["compiler"]["closed_world"]["findings"]
-            .as_array()
-            .unwrap()
+        findings(&report)
             .iter()
             .all(|finding| finding["definition_path"] != "SelfConstructed::0")
     );
@@ -457,22 +395,12 @@ fn cross_crate_pathless_self_constructor_preserves_field_visibility() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn cross_crate_type_system_const_preserves_visibility() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    let required = required_paths(&report);
 
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-    assert_eq!(product_status(&report, "closed_world_liveness"), "complete");
-
-    let required_definitions = report["compiler"]["required_visibility"]["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| definition["definition_path"].as_str().unwrap())
-        .collect::<BTreeSet<_>>();
-    assert!(required_definitions.contains("SIGNATURE_WIDTH"));
+    assert!(required.contains("SIGNATURE_WIDTH"));
     assert!(
-        report["compiler"]["closed_world"]["findings"]
-            .as_array()
-            .unwrap()
+        findings(&report)
             .iter()
             .all(|finding| finding["definition_path"] != "SIGNATURE_WIDTH")
     );
@@ -481,16 +409,12 @@ fn cross_crate_type_system_const_preserves_visibility() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn global_asm_symbol_target_is_production_live() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
-
-    assert_eq!(product_status(&report, "closed_world_liveness"), "complete");
-
-    let finding = report["compiler"]["closed_world"]["findings"]
-        .as_array()
-        .unwrap()
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    let finding = findings(&report)
         .iter()
         .find(|finding| finding["definition_path"] == "global_asm_target")
         .expect("global asm target visibility finding");
+
     assert_eq!(finding["kind"], "unnecessary_public");
     assert_eq!(finding["production_live"], true);
 }
@@ -498,9 +422,9 @@ fn global_asm_symbol_target_is_production_live() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn closed_world_scope_discloses_uncompiled_doctests() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    let closed_world = &report["closed_world"];
 
-    let closed_world = &report["compiler"]["closed_world"];
     assert_eq!(
         closed_world["scope"],
         "selected-workspace compiled-target closed world"
@@ -526,40 +450,23 @@ fn closed_world_scope_discloses_uncompiled_doctests() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn cross_crate_foreign_item_preserves_containing_module_visibility() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    let required = required_paths(&report);
 
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-
-    let required_definitions = report["compiler"]["required_visibility"]["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| definition["definition_path"].as_str().unwrap())
-        .collect::<BTreeSet<_>>();
-    assert!(required_definitions.contains("foreign_api::imported"));
-    assert!(required_definitions.contains("foreign_api"));
+    assert!(required.contains("foreign_api::imported"));
+    assert!(required.contains("foreign_api"));
 }
 
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn direct_decl_macro_requires_namespace_but_macro_export_does_not() {
-    let report = report(&run_compiler(&fixture("compiler-decl-macro"), &[]));
+    let report = complete_report(&run_audit(&fixture("compiler-decl-macro"), &[]));
+    let required = required_paths(&report);
 
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-
-    let required_definitions = report["compiler"]["required_visibility"]["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| definition["definition_path"].as_str().unwrap())
-        .collect::<BTreeSet<_>>();
-    assert!(required_definitions.contains("namespaced_macros"));
-    assert!(!required_definitions.contains("legacy_macro_home"));
-
+    assert!(required.contains("namespaced_macros"));
+    assert!(!required.contains("legacy_macro_home"));
     assert!(
-        report["compiler"]["closed_world"]["findings"]
-            .as_array()
-            .unwrap()
+        findings(&report)
             .iter()
             .any(|finding| finding["definition_path"] == "legacy_macro_home")
     );
@@ -568,43 +475,22 @@ fn direct_decl_macro_requires_namespace_but_macro_export_does_not() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn nested_public_extern_crate_preserves_containing_namespace_visibility() {
-    let report = report(&run_compiler(&fixture("compiler-field-visibility"), &[]));
-
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-
-    let required_definitions = report["compiler"]["required_visibility"]["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| definition["definition_path"].as_str().unwrap())
-        .collect::<BTreeSet<_>>();
-    assert!(required_definitions.contains("extern_facade"));
+    let report = complete_report(&run_audit(&fixture("compiler-field-visibility"), &[]));
+    assert!(required_paths(&report).contains("extern_facade"));
 }
 
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn cross_crate_inherent_associated_type_preserves_alias_and_rhs_visibility() {
-    let report = report(&run_compiler(
+    let report = complete_report(&run_audit(
         &fixture("compiler-inherent-associated-type"),
         &[],
     ));
+    let required = required_paths(&report);
 
-    assert_eq!(product_status(&report, "required_visibility"), "complete");
-    assert_eq!(product_status(&report, "closed_world_liveness"), "complete");
-
-    let required_definitions = report["compiler"]["required_visibility"]["definitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| definition["definition_path"].as_str().unwrap())
-        .collect::<BTreeSet<_>>();
-    assert!(required_definitions.contains("S::Assoc"));
-    assert!(required_definitions.contains("Value"));
-
-    let findings = report["compiler"]["closed_world"]["findings"]
-        .as_array()
-        .unwrap();
-    assert!(findings.iter().all(|finding| {
+    assert!(required.contains("S::Assoc"));
+    assert!(required.contains("Value"));
+    assert!(findings(&report).iter().all(|finding| {
         !matches!(
             finding["definition_path"].as_str(),
             Some("S::Assoc" | "Value")
@@ -615,12 +501,8 @@ fn cross_crate_inherent_associated_type_preserves_alias_and_rhs_visibility() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn host_and_target_build_script_cfg_stay_with_their_cargo_units() {
-    let report = report(&run_compiler(&fixture("compiler-host-target"), &[]));
-
-    assert_eq!(product_status(&report, "hir_bodies"), "complete");
-    assert_eq!(product_status(&report, "effective_api"), "complete");
-
-    let shared = report["compiler"]["invocations"]
+    let report = complete_report(&run_audit(&fixture("compiler-host-target"), &[]));
+    let shared = report["invocations"]
         .as_array()
         .unwrap()
         .iter()
@@ -660,141 +542,6 @@ fn host_and_target_build_script_cfg_stay_with_their_cargo_units() {
         "{}",
         report["diagnostics"]
     );
-
-    let definitions = report["compiler"]["effective_api"]["definitions"]
-        .as_array()
-        .unwrap();
-    assert_eq!(
-        report["compiler"]["effective_api"]["summary"]["production_library_invocations"],
-        2
-    );
-    assert!(definitions.iter().any(|definition| {
-        definition["crate_name"] == "shared_core"
-            && definition["definition_path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("target_mode_value"))
-    }));
-    assert!(!definitions.iter().any(|definition| {
-        definition["crate_name"] == "shared_core"
-            && definition["definition_path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("host_mode_value"))
-    }));
-}
-
-#[test]
-#[ignore = "requires the pinned nightly rustc-dev helper"]
-fn macro_expansion_complexity_is_a_separate_weighted_delta() {
-    let report = report(&run_compiler(&fixture("workspace"), &[]));
-
-    assert_eq!(
-        product_status(&report, "macro_expansion_cyclomatic_delta"),
-        "complete"
-    );
-    let expansion = &report["compiler"]["macro_expansion_complexity"];
-    assert_eq!(expansion["metric"], "macro_expansion_cyclomatic_delta");
-    assert!(
-        expansion["baseline"]
-            .as_str()
-            .unwrap()
-            .contains("source-authored")
-    );
-    let production = expansion["invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|invocation| invocation["target"]["role"] == "production")
-        .expect("production compiler invocation");
-    assert_eq!(production["status"], "complete");
-    let totals = &production["metrics"]["totals"];
-    assert!(totals["macro_body_bases"].as_u64().unwrap() >= 1);
-    assert!(totals["decision_delta"].as_u64().unwrap() >= 1);
-    assert_eq!(
-        totals["cyclomatic_delta"].as_u64().unwrap(),
-        totals["macro_body_bases"].as_u64().unwrap() + totals["decision_delta"].as_u64().unwrap()
-    );
-    assert!(
-        production["metrics"]["decisions_by_kind"]["conditional"]
-            .as_u64()
-            .unwrap()
-            >= 1
-    );
-}
-
-#[test]
-#[ignore = "requires the pinned nightly rustc-dev helper"]
-fn procedural_attribute_deltas_keep_normal_and_test_invocations_distinct() {
-    let report = report(&run_compiler(&fixture("compiler-macros"), &[]));
-
-    assert_eq!(
-        product_status(&report, "macro_expansion_cyclomatic_delta"),
-        "complete"
-    );
-    let consumer = report["compiler"]["macro_expansion_complexity"]["invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|invocation| invocation["crate_name"] == "rot_macro_consumer")
-        .collect::<Vec<_>>();
-    let invocation = |role: &str| {
-        consumer
-            .iter()
-            .copied()
-            .find(|invocation| invocation["target"]["role"] == role)
-            .unwrap_or_else(|| panic!("missing {role} consumer invocation: {consumer:#?}"))
-    };
-    let production = invocation("production");
-    let unit_test = invocation("unit_test");
-
-    assert_ne!(production["key"], unit_test["key"]);
-    assert_eq!(production["status"], "complete");
-    assert_eq!(unit_test["status"], "complete");
-    assert!(
-        production["metrics"]["by_origin"]["external_macro"]["cyclomatic_delta"]
-            .as_u64()
-            .unwrap()
-            >= 2
-    );
-    assert!(
-        production["metrics"]["by_macro_kind"]["attribute"]["cyclomatic_delta"]
-            .as_u64()
-            .unwrap()
-            >= 2
-    );
-    assert!(
-        unit_test["metrics"]["totals"]["cyclomatic_delta"]
-            .as_u64()
-            .unwrap()
-            > production["metrics"]["totals"]["cyclomatic_delta"]
-                .as_u64()
-                .unwrap()
-    );
-
-    let output = Command::new(env!("CARGO_BIN_EXE_rot"))
-        .args([
-            "--compiler",
-            "--compiler-driver",
-            driver().to_str().unwrap(),
-            "--locked",
-            "--offline",
-        ])
-        .arg(fixture("compiler-macros"))
-        .output()
-        .expect("run rot compiler table output");
-    assert!(
-        output.status.success(),
-        "rot failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let table = String::from_utf8(output.stdout).unwrap();
-    assert!(table.contains("macro delta Complete"));
-    assert!(table.contains("selected-workspace compiled-target closed world"));
-    assert!(
-        table.contains("excludes doctests, Cargo targets skipped by the active feature profile")
-    );
-    assert!(table.contains("Macro expansion delta: invocation-local sum +"));
-    assert!(table.contains("body bases +"));
-    assert!(table.contains("decision weight;"));
 }
 
 #[cfg(unix)]
@@ -817,11 +564,10 @@ fn an_outer_wrapper_that_skips_the_driver_is_retried_once() {
     permissions.set_mode(0o755);
     fs::set_permissions(&wrapper, permissions).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rot"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
         .env("RUSTC_WRAPPER", &wrapper)
         .args([
-            "--compiler",
-            "--compiler-driver",
+            "--driver",
             driver().to_str().unwrap(),
             "--locked",
             "--offline",
@@ -829,15 +575,9 @@ fn an_outer_wrapper_that_skips_the_driver_is_retried_once() {
         .arg(fixture("workspace"))
         .args(["--format", "json"])
         .output()
-        .expect("run rot compiler mode");
-    let report = report(&output);
+        .expect("run rot-audit");
+    let report = complete_report(&output);
 
-    assert_eq!(
-        product_status(&report, "hir_bodies"),
-        "complete",
-        "{}",
-        report["diagnostics"]
-    );
     assert!(
         report["diagnostics"]
             .as_array()
@@ -872,11 +612,10 @@ fn an_outer_wrapper_is_retried_for_an_invoked_failing_target() {
     permissions.set_mode(0o755);
     fs::set_permissions(&wrapper, permissions).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rot"))
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
         .env("RUSTC_WRAPPER", &wrapper)
         .args([
-            "--compiler",
-            "--compiler-driver",
+            "--driver",
             driver().to_str().unwrap(),
             "--locked",
             "--offline",
@@ -884,20 +623,22 @@ fn an_outer_wrapper_is_retried_for_an_invoked_failing_target() {
         .arg(fixture("partial-workspace/bad"))
         .args(["--format", "json"])
         .output()
-        .expect("run rot compiler mode");
-    let report = report(&output);
+        .expect("run rot-audit");
+    let report = incomplete_report(&output);
 
     assert!(
         report["diagnostics"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("retried once")))
+            .any(|diagnostic| {
+                diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("retried once"))
+            })
     );
     assert!(
-        report["compiler"]["invocations"]
+        report["invocations"]
             .as_array()
             .unwrap()
             .iter()

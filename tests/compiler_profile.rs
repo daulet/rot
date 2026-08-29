@@ -1,86 +1,107 @@
-use std::{path::PathBuf, process::Command};
+use std::{collections::BTreeSet, path::PathBuf, process::Command};
 
 use serde_json::Value;
 
-#[test]
-fn dependency_enabled_exclusion_is_rejected_before_driver_execution() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compiler-features");
-    let output = Command::new(env!("CARGO_BIN_EXE_rot"))
+fn repository() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn fixture() -> PathBuf {
+    repository().join("tests/fixtures/compiler-features")
+}
+
+fn driver() -> PathBuf {
+    let path = repository().join("compiler/rot-rustc-driver/target/debug/rot-rustc-driver");
+    assert!(path.is_file(), "build {path:?} before running this test");
+    path
+}
+
+fn run_profile(arguments: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
         .args([
-            "--compiler",
-            "--compiler-driver",
-            "/definitely/not/a/rot-driver",
+            "--driver",
+            driver().to_str().unwrap(),
             "--locked",
             "--offline",
-            "--exclude-feature",
-            "b/foo",
         ])
-        .arg(fixture)
+        .args(arguments)
+        .arg(fixture())
         .args(["--format", "json"])
         .output()
-        .expect("run rot");
+        .expect("run rot-audit");
     assert!(
         output.status.success(),
-        "rot failed: {}",
+        "rot-audit failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report: Value = serde_json::from_slice(&output.stdout).expect("parse rot JSON");
-    assert_eq!(report["profile"]["compiler_compatible"], false);
-    assert!(
-        report["profile"]["compiler_unavailable_reasons"]
-            .as_array()
-            .expect("compiler reasons array")
-            .iter()
-            .any(|reason| reason
-                .as_str()
-                .is_some_and(|reason| reason.contains("Cargo's resolved dependency graph")))
-    );
-    let diagnostics = report["diagnostics"].as_array().expect("diagnostics array");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic["message"].as_str().is_some_and(|message| {
-            message.contains("package b")
-                && message.contains("Cargo's resolved dependency graph")
-                && message.contains("feature \"foo\"")
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse rot-audit JSON");
+    assert_eq!(report["status"], "complete", "{report:#}");
+    report
+}
+
+fn production_features<'a>(report: &'a Value, crate_name: &str) -> BTreeSet<&'a str> {
+    report["invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|invocation| {
+            invocation["crate_name"] == crate_name
+                && invocation["target"]["role"] == "production"
         })
-    }));
-    assert!(!diagnostics.iter().any(|diagnostic| {
-        diagnostic["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("driver") && message.contains("does not exist"))
-    }));
+        .unwrap_or_else(|| panic!("missing production invocation for {crate_name}: {report:#}"))
+        ["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|feature| feature.as_str().unwrap())
+        .collect()
 }
 
 #[test]
-fn disabled_exclusion_remains_compiler_compatible() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compiler-features");
-    let output = Command::new(env!("CARGO_BIN_EXE_rot"))
-        .args([
-            "--compiler",
-            "--compiler-driver",
-            "/definitely/not/a/rot-driver",
-            "--locked",
-            "--offline",
-            "--exclude-feature",
-            "b/bar",
-        ])
-        .arg(fixture)
-        .args(["--format", "json"])
+fn audit_cli_rejects_synthetic_feature_exclusion() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
+        .args(["--exclude-feature", "b/foo"])
+        .arg(fixture())
         .output()
-        .expect("run rot");
-    assert!(output.status.success());
-    let report: Value = serde_json::from_slice(&output.stdout).expect("parse rot JSON");
-    assert_eq!(report["profile"]["compiler_compatible"], true);
+        .expect("run rot-audit");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+    assert!(stderr.contains("--exclude-feature"), "{stderr}");
+}
+
+#[test]
+#[ignore = "requires the pinned nightly rustc-dev helper"]
+fn cargo_feature_profiles_use_actual_resolved_features() {
+    let default = run_profile(&[]);
+    assert_eq!(default["profile"]["feature_mode"], "default");
+    assert_eq!(production_features(&default, "b"), BTreeSet::from(["foo"]));
+
+    let selected = run_profile(&["--features", "b/bar"]);
+    assert_eq!(selected["profile"]["feature_mode"], "default_plus_selected");
+    assert_eq!(
+        production_features(&selected, "b"),
+        BTreeSet::from(["bar", "foo"])
+    );
+
+    let all = run_profile(&["--all-features"]);
+    assert_eq!(all["profile"]["feature_mode"], "all");
+    assert_eq!(
+        production_features(&all, "b"),
+        BTreeSet::from(["bar", "foo"])
+    );
+
+    let no_default = run_profile(&["--no-default-features"]);
+    assert_eq!(no_default["profile"]["feature_mode"], "none");
+    assert_eq!(
+        production_features(&no_default, "b"),
+        BTreeSet::from(["foo"]),
+        "dependency-required features remain enabled without package defaults"
+    );
     assert!(
-        report["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |diagnostic| diagnostic["message"].as_str().is_some_and(|message| message
-                    .contains("driver")
-                    && message.contains("does not exist"))
-            )
+        [&default, &selected, &all, &no_default]
+            .into_iter()
+            .all(|report| report["profile"].get("synthetic").is_none())
     );
 }

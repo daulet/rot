@@ -13,6 +13,10 @@ The default report answers three different questions without mixing them:
 
 ## Build and run
 
+Rot is currently built from a repository checkout rather than published as a
+crate. The visibility audit co-ships a private protocol crate and pinned
+rustc-driver workspace, so publishing only the root package would be incomplete.
+
 ```console
 cargo build --release
 ./target/release/rot path/to/workspace
@@ -116,69 +120,66 @@ macro-generated declarations. A grouped `pub use {A, B}` is one declaration.
 
 This is a physical syntax count, not API surface. Fast mode makes no claim about
 effective visibility, re-exported names, exported signature lines, dead exports,
-or unnecessary visibility. Those require the compiler-backed mode.
+or unnecessary visibility. Use the optional `rot-audit` companion when you need
+compiler-proven visibility information.
 
-## Compiler-backed mode
+## Visibility audit
 
-`--compiler` runs a second, concrete Cargo analysis and adds versioned semantic
-products to the source report. It never replaces source LOC, authored
-complexity, inactive-code, or synthetic-profile results. Build the deliberately
-separate helper with the exact pin it was written for:
+`rot` is always the fast source analyzer. It does not load the compiler driver,
+run build scripts, or add compiler fields to its report. The optional
+`rot-audit` binary is a separate, deliberately slow visibility audit for
+refactoring work.
+
+Build the audit binary and its rustc-private helper explicitly:
 
 ```console
 rustup toolchain install nightly-2026-08-27 \
   --component rustc-dev --component rust-src --component llvm-tools-preview
 cargo +nightly-2026-08-27 build \
   --manifest-path compiler/rot-rustc-driver/Cargo.toml --release
-cargo build --release
+cargo build --release --features audit --bin rot-audit
 
-./target/release/rot path/to/workspace --compiler --locked --offline \
-  --compiler-driver compiler/rot-rustc-driver/target/release/rot-rustc-driver
+./target/release/rot-audit path/to/workspace --locked --offline \
+  --driver compiler/rot-rustc-driver/target/release/rot-rustc-driver
 ```
 
-The protocol-v3 helper handshake requires rustc `1.100.0-nightly`, commit
-`bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed`. `rot` otherwise reports every
-compiler product as unavailable and still returns the complete source report.
-The same fallback applies to missing helpers, protocol mismatches, Cargo/rustc
-failures, incompatible wrappers, `--unset-cfg`, and contradictory feature
-exclusions. Availability is recorded per Cargo invocation and per semantic
-product; unavailable never means zero.
+The protocol-v4 handshake requires rustc `1.100.0-nightly`, commit
+`bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed`. `rot-audit` exits unsuccessfully
+when the driver is missing, the protocol or toolchain does not match, Cargo or
+rustc fails, an invocation cannot be correlated, or the visibility graph is
+otherwise incomplete. Missing evidence is never presented as zero findings.
 
-Compiler mode runs `cargo check --workspace --all-targets --keep-going` in
-isolated target and build directories. It can download dependencies unless
-`--offline` is passed, and it executes project-controlled build scripts and
-procedural macros. This is why the mode is explicit. `--locked` and `--offline`
-have their ordinary Cargo meanings. `--compiler-target-dir` chooses only the
-parent for temporary isolated artifacts; the run directory is removed when the
-report is complete.
+The audit runs `cargo check --workspace --all-targets --keep-going` in isolated
+target and build directories. It can download dependencies unless `--offline`
+is passed, and it executes project-controlled build scripts and procedural
+macros. `--locked` and `--offline` have their ordinary Cargo meanings;
+`--scratch-dir` chooses the parent for temporary isolated artifacts.
 
-The compiler records Cargo's exact unit graph plus actual features, cfg,
-host/target, test, codegen, and build-script `OUT_DIR` identity. Each sidecar is
-joined to one expected Cargo unit, and real generated `.rs` files that own HIR
-facts are rescanned separately under `compiler.generated_files`; they never
-inflate project physical LOC.
+Feature controls use actual Cargo semantics:
 
-Compiler mode currently adds four semantic views:
+```console
+rot-audit . --features serde,cli
+rot-audit . --no-default-features --features minimal
+rot-audit . --all-features
+rot-audit . --target aarch64-unknown-linux-gnu
+rot-audit . --cfg loom
+```
 
-- `effective_api` is the finite set of effectively public definitions and
-  public namespace bindings for selected production libraries and proc macros.
-- `required_visibility` lists definitions that must remain public for the
-  selected workspace to compile. It is a compiler requirement, not a promise
-  that an external consumer needs the item.
-- `closed_world` reports dead and unnecessarily public candidates under the
-  explicit `selected-workspace compiled-target closed world` scope. Production
-  and non-production reachability remain separate, and `test_compiled_only`
-  marks findings that exist only in a test compilation.
-- `macro_expansion_complexity` reports the compiler-confirmed
-  `macro_expansion_cyclomatic_delta`. It stays separate from source-authored
-  cyclomatic complexity until an exact body/profile baseline can be proved.
-  The human total is labeled as an invocation-local sum; JSON retains every
-  invocation separately.
+Unlike fast `rot`, the audit does not accept `--exclude-feature` or
+`--unset-cfg`: Cargo feature unification cannot force an enabled transitive
+feature off, and a compiler audit only accepts realizable build profiles.
 
-All four products have explicit `complete`, `partial`, or `unavailable` status;
-missing compiler evidence is never reported as zero. See
-[Compiler-backed Rust analysis](docs/rustc-backed-analysis.md) for the metric
-ownership, graph, and representation contracts.
+The audit has one fail-closed semantic status with two views:
+
+- `required_visibility` lists declarations that genuinely must remain public
+  for a selected cross-crate interface or use.
+- `closed_world` lists `dead_public` and `unnecessary_public` candidates.
+  “Unnecessary public” means unrestricted `pub` can be narrowed; it does not by
+  itself choose between private, `pub(super)`, and `pub(crate)`.
+
+Normal output prints every dead or narrowable declaration with its source
+location, definition path, finding kind, and reason. JSON retains the complete
+required-public list, findings, invocation identities, and evidence status.
 
 Required visibility is intentionally conservative where expanded HIR erases
 the spelling a downstream crate used. Directly exported namespaced `pub macro`
@@ -189,14 +190,19 @@ retain the private module where its definition happens to appear.
 The compiled-target scope excludes doctests and Cargo targets skipped because
 their `required-features` are inactive. Both exclusions are carried in JSON as
 `evidence_exclusions`; a finding such as `dead_public` is never a claim about
-uses from those uncompiled roles. Doctest collection remains a separate
-rustdoc-backed product.
+uses from those uncompiled roles. Doctest evidence would require a separate
+rustdoc-backed pass and is not currently collected.
+
+See [Compiler-backed visibility audit](docs/rustc-backed-analysis.md) for the
+graph, completeness, and evidence contracts.
 
 ## JSON
 
 `--format json` emits a deterministic report with `schema_version: 2`. It
 includes the exact target/feature profile, project and per-file buckets,
-declared visibility, optional compiler products, and recoverable diagnostics.
+declared visibility, and recoverable diagnostics. The fast schema never
+contains a `compiler` field. `rot-audit --format json` emits a separate
+`schema_version: 1` visibility-audit report.
 Per-file data is always present in JSON; `--files` only expands the
 human-readable source table.
 
@@ -218,4 +224,4 @@ Broken pipes are treated as successful exits so piping into tools such as
 - The report describes the selected source/configuration profile, not a proof
   that the crate successfully compiles for that profile.
 
-Run `rot --help` for the complete CLI surface.
+Run `rot --help` or `rot-audit --help` for the corresponding CLI surface.

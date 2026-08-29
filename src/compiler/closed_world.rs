@@ -5,15 +5,14 @@ use std::{
 };
 
 use rot_compiler_protocol::{
-    BodyKind, CompilerDefId, Definition, DefinitionKind, NominalVisibility, ReferenceKind,
-    RootKind, SourceSpan,
+    CompilerDefId, Definition, DefinitionKind, NominalVisibility, ReferenceKind, RootKind,
+    SourceSpan,
 };
 
 use crate::model::{
     ClosedWorldFindingReport, ClosedWorldReport, ClosedWorldSummaryReport,
     CompilerDefinitionIdReport, CompilerSourceSpanReport, CompilerTargetReport,
-    ProductAvailabilityReport, RequiredVisibilityDefinitionReport, RequiredVisibilityReport,
-    SemanticStatus,
+    RequiredVisibilityDefinitionReport, RequiredVisibilityReport, SemanticStatus,
 };
 
 use super::{generated_source_label, sidecar::Invocation};
@@ -40,8 +39,8 @@ pub(super) struct GraphInvocation<'a> {
 }
 
 pub(super) struct Aggregation {
-    pub liveness_product: ProductAvailabilityReport,
-    pub required_visibility_product: ProductAvailabilityReport,
+    pub status: SemanticStatus,
+    pub reason: Option<String>,
     pub required_visibility: Option<RequiredVisibilityReport>,
     pub closed_world: Option<ClosedWorldReport>,
 }
@@ -80,16 +79,9 @@ struct VisibilityKey {
 enum NodeKey {
     Definition {
         package_id: String,
-        target: LogicalTarget,
+        target: Box<LogicalTarget>,
         definition_path: String,
         kind: DefinitionKind,
-        span: SpanIdentity,
-    },
-    Body {
-        package_id: String,
-        target: LogicalTarget,
-        definition_path: String,
-        kind: BodyKind,
         span: SpanIdentity,
     },
     InvocationLocal {
@@ -170,8 +162,6 @@ pub(super) fn aggregate(
         &graph.nodes,
         &graph.required_reasons,
     ));
-    let required_visibility_product = complete_product("required_visibility");
-
     let production_states = reachable(&graph.production_roots, &graph.runtime_edges);
     let nonproduction_states = reachable(&graph.nonproduction_roots, &graph.runtime_edges);
     let production = reached_nodes(&production_states);
@@ -255,8 +245,8 @@ pub(super) fn aggregate(
     };
 
     Aggregation {
-        liveness_product: complete_product("closed_world_liveness"),
-        required_visibility_product,
+        status: SemanticStatus::Complete,
+        reason: None,
         required_visibility,
         closed_world: Some(report),
     }
@@ -274,14 +264,6 @@ fn build_graph(invocations: &[&GraphInvocation<'_>]) -> Graph {
                 .definitions
                 .push((invocation_index, definition_index));
             raw_nodes.insert((invocation_index, definition.compiler_id), node);
-        }
-        for body in &input.invocation.bodies {
-            if raw_nodes.contains_key(&(invocation_index, body.compiler_id)) {
-                continue;
-            }
-            let key = body_key(invocation_index, input, body);
-            let node = intern_node(&mut nodes, &mut node_by_key, key);
-            raw_nodes.insert((invocation_index, body.compiler_id), node);
         }
     }
 
@@ -503,32 +485,9 @@ fn definition_key(
             },
             |span| NodeKey::Definition {
                 package_id: input.target.package_id.clone(),
-                target: logical_target(input.target),
+                target: Box::new(logical_target(input.target)),
                 definition_path: definition.definition_path.clone(),
                 kind: definition.kind,
-                span,
-            },
-        )
-}
-
-fn body_key(
-    invocation_index: usize,
-    input: &GraphInvocation<'_>,
-    body: &rot_compiler_protocol::Body,
-) -> NodeKey {
-    body.span
-        .as_ref()
-        .and_then(|span| span_identity(input.invocation, span))
-        .map_or(
-            NodeKey::InvocationLocal {
-                invocation: invocation_index,
-                compiler_id: body.compiler_id,
-            },
-            |span| NodeKey::Body {
-                package_id: input.target.package_id.clone(),
-                target: logical_target(input.target),
-                definition_path: body.definition_path.clone(),
-                kind: body.kind,
                 span,
             },
         )
@@ -677,7 +636,7 @@ fn candidates(
             .filter(|(invocation_index, definition_index)| {
                 let input = invocations[*invocation_index];
                 let definition = &input.invocation.definitions[*definition_index];
-                eligible_candidate(input.target, definition)
+                eligible_candidate(input, definition)
                     && !implicit_trait_member(*invocation_index, definition, input.invocation)
             })
             .min_by_key(|(invocation_index, _)| {
@@ -693,11 +652,11 @@ fn candidates(
     candidates
 }
 
-fn eligible_candidate(target: &CompilerTargetReport, definition: &Definition) -> bool {
-    candidate_target(target)
-        && definition.effective_public_at.is_some()
+fn eligible_candidate(input: &GraphInvocation<'_>, definition: &Definition) -> bool {
+    candidate_target(input.target)
+        && definition.externally_reachable
         && definition.visibility_editable
-        && definition.expansion_origin == rot_compiler_protocol::ExpansionOrigin::Authored
+        && editable_authored_source(input.invocation, definition)
         && matches!(definition.nominal_visibility, NominalVisibility::Public)
         && !matches!(
             definition.kind,
@@ -711,8 +670,17 @@ fn eligible_candidate(target: &CompilerTargetReport, definition: &Definition) ->
                 | DefinitionKind::ForeignModule
                 | DefinitionKind::OpaqueType
         )
-        && !(definition.kind == DefinitionKind::Field
-            && definition.expansion_origin != rot_compiler_protocol::ExpansionOrigin::Authored)
+}
+
+fn editable_authored_source(invocation: &Invocation, definition: &Definition) -> bool {
+    definition.expansion_origin == rot_compiler_protocol::ExpansionOrigin::Authored
+        && definition.span.as_ref().is_some_and(|span| {
+            invocation
+                .sources
+                .iter()
+                .find(|source| source.key == span.file)
+                .is_some_and(|source| !source.generated)
+        })
 }
 
 fn candidate_target(target: &CompilerTargetReport) -> bool {
@@ -827,9 +795,9 @@ fn required_visibility_report(
             let input = invocations[invocation_index];
             let definition = &input.invocation.definitions[definition_index];
             if !library_target(input.target)
-                || definition.effective_public_at.is_none()
+                || !definition.externally_reachable
                 || !definition.visibility_editable
-                || definition.expansion_origin != rot_compiler_protocol::ExpansionOrigin::Authored
+                || !editable_authored_source(input.invocation, definition)
                 || !matches!(definition.nominal_visibility, NominalVisibility::Public)
                 || matches!(
                     definition.kind,
@@ -899,6 +867,12 @@ fn finding_report(
 ) -> ClosedWorldFindingReport {
     ClosedWorldFindingReport {
         kind: kind.to_owned(),
+        reason: if kind == "dead_public" {
+            "unreachable from every compiled production and nonproduction root"
+        } else {
+            "reachable, but no selected cross-crate use requires unrestricted public visibility"
+        }
+        .to_owned(),
         package_id: input.target.package_id.clone(),
         crate_name: input.crate_name.to_owned(),
         representative_invocation: input.invocation.started.merge_key.0.clone(),
@@ -948,6 +922,8 @@ fn source_span(
         generated: source.generated,
         start_byte: u64::from(span.start),
         end_byte: u64::from(span.end),
+        line: u64::from(span.line),
+        column: u64::from(span.column),
     })
 }
 
@@ -987,26 +963,10 @@ fn definition_kind(kind: DefinitionKind) -> &'static str {
     }
 }
 
-fn complete_product(product: &str) -> ProductAvailabilityReport {
-    ProductAvailabilityReport {
-        product: product.to_owned(),
-        status: SemanticStatus::Complete,
-        reason: None,
-    }
-}
-
 fn incomplete(status: SemanticStatus, reason: &str) -> Aggregation {
     Aggregation {
-        liveness_product: ProductAvailabilityReport {
-            product: "closed_world_liveness".to_owned(),
-            status,
-            reason: Some(reason.to_owned()),
-        },
-        required_visibility_product: ProductAvailabilityReport {
-            product: "required_visibility".to_owned(),
-            status,
-            reason: Some(reason.to_owned()),
-        },
+        status,
+        reason: Some(reason.to_owned()),
         required_visibility: None,
         closed_world: None,
     }
@@ -1020,9 +980,9 @@ fn canonical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use rot_compiler_protocol::{
-        ArtifactIdentity, CompilationContext, CompilerIdentity, EffectiveVisibilityLevel,
-        ExpansionOrigin, FactId, InvocationFinished, InvocationId, InvocationMergeKey,
-        InvocationStarted, Reference, Root, SourceFile, SourceFileKey,
+        ArtifactIdentity, CompilationContext, CompilerIdentity, ExpansionOrigin, FactId,
+        InvocationFinished, InvocationId, InvocationMergeKey, InvocationStarted, Reference, Root,
+        SourceFile, SourceFileKey,
     };
 
     const ROOT: &str = "/workspace";
@@ -1113,7 +1073,7 @@ mod tests {
     fn host_build_consumers_require_selected_library_visibility() {
         let library = invocation(
             "library",
-            Vec::new(),
+            vec![source("/workspace/helper/src/lib.rs")],
             vec![definition(
                 20,
                 1,
@@ -1126,7 +1086,7 @@ mod tests {
         );
         let build = invocation(
             "build",
-            Vec::new(),
+            vec![source("/workspace/consumer/build.rs")],
             vec![definition(
                 30,
                 1,
@@ -1145,10 +1105,7 @@ mod tests {
         ];
 
         let aggregation = aggregate(Path::new(ROOT), SemanticStatus::Complete, &inputs);
-        assert_eq!(
-            aggregation.liveness_product.status,
-            SemanticStatus::Complete
-        );
+        assert_eq!(aggregation.status, SemanticStatus::Complete);
         assert!(aggregation.closed_world.is_some());
         let required = aggregation
             .required_visibility
@@ -1162,7 +1119,7 @@ mod tests {
     fn public_trait_propagates_visibility_to_signature_types() {
         let library = invocation(
             "library",
-            Vec::new(),
+            vec![source("/workspace/api/src/lib.rs")],
             vec![
                 definition(40, 1, "api::Contract", DefinitionKind::Trait, 0),
                 definition(40, 2, "api::Payload", DefinitionKind::Struct, 2),
@@ -1250,7 +1207,7 @@ mod tests {
     fn reexported_target_does_not_require_its_original_module_path() {
         let library = invocation(
             "library",
-            Vec::new(),
+            vec![source("/workspace/api/src/lib.rs")],
             vec![
                 definition(70, 1, "api::original", DefinitionKind::Module, 0),
                 definition(70, 2, "api::original::item", DefinitionKind::Function, 2),
@@ -1273,6 +1230,34 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(paths.contains("api::original::item"));
         assert!(!paths.contains("api::original"));
+    }
+
+    #[test]
+    fn generated_files_are_never_reported_as_edit_targets() {
+        let mut generated = source("/workspace/target/generated.rs");
+        generated.generated = true;
+        let library = invocation(
+            "library",
+            vec![generated],
+            vec![
+                definition(80, 1, "generated_required", DefinitionKind::Function, 0),
+                definition(80, 2, "generated_dead", DefinitionKind::Function, 2),
+            ],
+            vec![root(80, 1, RootKind::RequiredPublic)],
+            Vec::new(),
+        );
+        let target = target("api", "production", "target", &["lib"]);
+        let inputs = [graph_input(&target, &library)];
+
+        let aggregation = aggregate(Path::new(ROOT), SemanticStatus::Complete, &inputs);
+        assert!(
+            aggregation
+                .required_visibility
+                .unwrap()
+                .definitions
+                .is_empty()
+        );
+        assert!(aggregation.closed_world.unwrap().findings.is_empty());
     }
 
     fn graph_input<'a>(
@@ -1341,14 +1326,11 @@ mod tests {
             },
             profile: None,
             sources,
-            bodies: Vec::new(),
             products: Vec::new(),
             diagnostics: Vec::new(),
             definitions,
-            public_bindings: Vec::new(),
             roots,
             references,
-            decisions: Vec::new(),
             finished: InvocationFinished {
                 rustc_success: true,
                 analysis_reached: true,
@@ -1375,11 +1357,13 @@ mod tests {
             kind,
             visibility_editable: true,
             nominal_visibility: NominalVisibility::Public,
-            effective_public_at: Some(EffectiveVisibilityLevel::Direct),
+            externally_reachable: true,
             span: Some(SourceSpan {
                 file: SourceFileKey("source".to_owned()),
                 start,
                 end: start + 1,
+                line: 1,
+                column: start + 1,
             }),
             attribution_callsite: None,
             expansion_origin: ExpansionOrigin::Authored,

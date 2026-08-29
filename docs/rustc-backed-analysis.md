@@ -1,695 +1,242 @@
-# Compiler-backed Rust analysis
+# Compiler-backed visibility audit
 
-Status: source/HIR architecture implemented behind `--compiler`; selective
-THIR and normalized MIR products remain deferred
+`rot` and `rot-audit` answer different questions:
 
-This document describes how `rot` adds compiler-backed analysis without
-giving up its fast, source-backed mode. It covers the compiler representations
-we could consume, the measurements each representation enables, the cost of
-syntax and semantic analysis, configuration profiles, production/test
-ownership, and aggregation by physical files and directories.
+- `rot` measures authored Rust source quickly. It owns line counts,
+  production/test classification, authored complexity, and explicit unrestricted
+  `pub` counts.
+- `rot-audit` compiles one concrete Cargo profile and determines which authored
+  public declarations are required, narrowable, or unreachable within the
+  selected compiled targets.
 
-The central design decision is:
+The audit is an optional companion binary, not a mode of `rot`. Fast JSON never
+contains compiler output, and a compiler failure cannot turn an ordinary source
+measurement into a slow or partial operation.
 
-> Keep the current lossless source analysis as the authority for physical
-> lines, comments, blank lines, authored complexity, inactive source, and
-> synthetic profiles. Use a pinned rustc helper to add configuration-specific
-> semantic facts and expansion-only decisions.
+## Build and run
 
-HIR should be the primary compiler representation. THIR should be queried only
-for measurements that genuinely require typed executable bodies. MIR should be
-an optional CFG view, not the default complexity metric.
+The stable orchestration binary is gated by the `audit` Cargo feature. The
+rustc-private driver is a separate workspace pinned to the exact nightly it was
+written against:
 
-## Implemented architecture
+```console
+rustup toolchain install nightly-2026-08-27 \
+  --component rustc-dev --component rust-src --component llvm-tools-preview
 
-The implementation keeps the fast source pass intact and adds a separate,
-exactly pinned compiler pass. Cargo's unstable unit graph is the expected-unit
-ledger: target kind, compile mode, feature closure, platform, profile, and
-host/target context must match the collected rustc invocation. Build-script cfg
-is joined by the invocation's canonical `OUT_DIR`, not unioned by package.
+cargo +nightly-2026-08-27 build \
+  --manifest-path compiler/rot-rustc-driver/Cargo.toml --release
 
-Protocol v3 carries bounded, atomic per-invocation sidecars with stable compiler
-definition IDs, finite public bindings, typed roots/references, expansion
-provenance, editable-visibility evidence, and product-local availability. The
-stable main binary contains no rustc-private types.
+cargo build --release --features audit --bin rot-audit
 
-The landed HIR products are:
-
-- effective API definitions and finite namespace bindings for production
-  libraries and proc macros;
-- compiler-required public visibility and selected-workspace closed-world
-  liveness, with production and non-production roots evaluated per concrete
-  invocation configuration;
-- expansion-only macro body bases and normalized decision deltas.
-
-Runtime liveness deliberately preserves invocation identity so normal and test
-fragments cannot form an impossible path. Visibility-edit findings use a
-separate physical-span equivalence relation so one authored `pub` token included
-in several compilation contexts is changed only when every occurrence is safe.
-
-## Goals
-
-- Resolve the current syntax-only API uncertainties: re-exports, glob exports,
-  inherent items on externally nameable types, and items produced by macros.
-- Confirm concrete active bodies and measure expansion-only complexity with
-  explicit treatment of Rust desugarings and macro expansions.
-- Optionally expose a normalized control-flow-graph metric.
-- Preserve package, Cargo-target, source-span, module/item, and source-role
-  provenance so semantic facts can be related to the physical source report
-  without turning compiler spans into LOC.
-- Use Cargo's actual feature, target, build-script, proc-macro, and custom-cfg
-  behavior for realizable profiles.
-- Preserve useful output when a project does not compile or a requested profile
-  is intentionally synthetic.
-- Keep rustc-private API churn isolated from the report model and source engine.
-
-## Non-goals
-
-- Replacing the source lexer with HIR, THIR, or MIR. These representations do
-  not retain ordinary comments or blank lines.
-- Enumerating the power set of Cargo features. Each feature selection is a
-  different program, and the number of combinations is unbounded in practice.
-- Pretending that a synthetically excluded feature is a compilable Cargo
-  profile when another feature implies it.
-- Supporting arbitrary rustc versions with one compiler-driver binary.
-- Treating raw MIR block counts as a stable source-quality metric.
-- Proving that a public API is useful to downstream crates. Effective
-  visibility is compiler-resolvable; external usefulness requires observing
-  consumers or defining an additional policy.
-
-## Existing source-backed mode
-
-The existing mode remains useful even after a compiler mode exists.
-
-| Concern | Existing authority | Property |
-|---|---|---|
-| Physical, code, comment, doc, and blank lines | Lossless Rust syntax tokens | Reads every file once and retains comments and whitespace |
-| Lexical complexity | Rust tokens | SCC-compatible definition without SCC's lexer mistakes |
-| Authored cyclomatic and cognitive complexity | Lossless Rust AST | Preserves authored constructs, nesting, inactive code, and synthetic profiles |
-| `cfg` and feature ownership | Symbolic syntax evaluation | Can describe inactive and intentionally synthetic source |
-| Module/file reachability | Cargo metadata plus syntax module edges | Works without compiling dependencies or running project code |
-| Explicit unrestricted `pub` declarations | Syntax visibility | Physical declaration count only; no semantic API claim |
-
-Compiler analysis augments these facts. It must not silently change the
-meaning of `lexical_complexity`, `cyclomatic_authored`, or
-`cognitive_authored`; expanded and CFG products need distinct names.
-
-## Compiler representations
-
-### rustc AST
-
-rustc has an internal AST before and after expansion. It can provide the exact
-grammar accepted by the selected compiler, but it is not a good long-term
-analysis boundary for `rot`:
-
-- Before expansion it does not close the macro and name-resolution gaps that
-  motivate compiler mode.
-- After expansion, inactive `cfg` source is gone and authored syntax has begun
-  to change shape.
-- Ordinary comments have already been treated as whitespace; doc comments have
-  become attributes.
-- It is an unstable rustc-private API while duplicating much of what the
-  existing lossless syntax layer already does.
-
-We may use AST callbacks for diagnostics or experiments, but should not make
-the report contract depend on rustc AST structures.
-
-### HIR: primary semantic layer
-
-HIR is produced after parsing, macro expansion, name resolution, and built-in
-desugaring. It includes the crate's item hierarchy and executable bodies.
-
-HIR enables:
-
-- Resolved modules, definitions, imports, re-exports, and glob imports.
-- Effective visibility and externally reachable item analysis through compiler
-  privacy/visibility queries.
-- Correct ownership of inherent methods once the receiver type is resolved.
-- Items and implementations generated by declarative, derive, attribute, and
-  procedural macros.
-- Compiler-confirmed active bodies and decisions originating in macro
-  expansion.
-- Authored-versus-expanded attribution through source spans and expansion
-  metadata.
-- Stable semantic ownership keys based on crate and definition paths rather
-  than filenames alone.
-
-HIR is not identical to source syntax. For example, a source `for` loop is
-lowered into matches and a loop, and `?` is represented by a tagged match.
-The source AST therefore owns authored decisions. The adapter uses lowering
-and expansion provenance only for compiler-confirmed activation and
-expansion-only events; it must not emit a competing authored total.
-
-HIR is sufficient for the initial compiler-backed complexity and API slices.
-
-### THIR: selective typed-body enrichment
-
-THIR is constructed after type checking and represents executable bodies, not
-the crate's declaration hierarchy. It makes more implicit operations explicit:
-method calls and overloaded operators become calls, adjustments are applied,
-and patterns carry resolved type information.
-
-THIR can add:
-
-- Type-aware pattern and enum-variant analysis.
-- Call-site categories after method/operator resolution.
-- Typed complexity policies, if we decide that a decision's type matters.
-- A normalized executable-body view for functions, closures, constants, and
-  static initializers.
-
-THIR does not contain structs, traits, modules, or the public interface as a
-whole. It is also temporary inside rustc and more heavily lowered than HIR.
-Using it for every metric would add compiler coupling without improving the
-ordinary source cyclomatic score. Query it per body only when a metric states a
-type-dependent requirement.
-
-### MIR: optional control-flow graph
-
-MIR represents a body as basic blocks, statements, and terminators. It enables
-measurements that HIR and THIR do not directly expose:
-
-- Nodes, normal edges, exits, and branch fanout.
-- Graph-theoretic cyclomatic complexity.
-- Loop backedges and strongly connected regions.
-- Normal versus unwind/cleanup paths.
-- Diverging calls, assertions, yields, and coroutine behavior.
-
-Raw MIR is unsuitable as the headline complexity number. Its shape depends on
-the MIR phase, panic strategy, optimization settings, async/coroutine lowering,
-drop elaboration, bounds and overflow checks, and compiler-version changes.
-
-A normalized CFG mode must define all of the following:
-
-- Use one named MIR phase and record it in provenance.
-- Traverse only blocks reachable from the body entry.
-- Add one synthetic exit when applying `E - N + 2P` to multiple returns.
-- Exclude imaginary `FalseEdge` and `FalseUnwind` edges.
-- Exclude cleanup and unwind edges by default; report exceptional complexity
-  separately if requested.
-- Decide whether explicit `assert!`, implicit bounds checks, overflow checks,
-  `yield`, and coroutine state transitions count.
-- Attribute compiler-generated blocks back to source decisions where possible.
-
-This metric should be named `cfg_complexity`, not replace source cyclomatic
-complexity.
-
-### Cost and maintenance comparison
-
-| Layer | Rust grammar maintenance | Semantic precision | Runtime class | Main maintenance risk |
-|---|---|---|---|---|
-| Existing lossless syntax | Upgrade the parser dependency and review new syntax kinds | Source-faithful; macros and names unresolved | Source scan | New syntax lowering into an unclassified syntax node |
-| rustc AST | Compiler parses supported syntax | Low before expansion; moderate after expansion | Compiler frontend | Unstable API without closing the important semantic gaps |
-| HIR | Compiler parses and expands supported syntax | High for ownership, visibility, and source decisions | Approximately `cargo check` | HIR API and desugaring changes |
-| THIR | Compiler parses, expands, and type-checks | High for typed executable bodies | Type-checking plus per-body construction | Temporary API and additional lowering changes |
-| MIR | Compiler produces the CFG | Highest for one concrete lowered program | MIR construction and selected passes | Graph drift across phases, flags, and compiler versions |
-
-rustc removes the need to teach `rot` how to parse each new grammar feature. It
-does not remove the need to decide how a new semantic construct contributes to
-the metric.
-
-## Complexity products
-
-The source AST emits authored body and decision facts; the compiler adapter
-emits stable active-body and expansion-only events rather than a competing
-total:
-
-```text
-DecisionKind = conditional | loop | match | match_alternative | guard
-             | short_circuit | try | let_else
-DecisionOrigin = authored | builtin_desugaring | local_macro | external_macro
-Decision = { body, kind, origin, span, nesting }
+./target/release/rot-audit path/to/workspace --locked --offline \
+  --driver compiler/rot-rustc-driver/target/release/rot-rustc-driver
 ```
 
-The report layer can derive several products from the same events:
+Protocol v4 requires rustc `1.100.0-nightly` at commit
+`bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed`. The handshake checks the protocol,
+driver, linked-rustc, and toolchain identities before any project build starts.
 
-- `lexical_complexity`: the existing zero-based SCC-compatible token score.
-- `cyclomatic_authored`: base one per body plus authored decisions, with Rust
-  desugarings normalized and external macro bodies excluded.
-- `macro_expansion_cyclomatic_delta`: compiler-confirmed macro body bases and
-  decisions, kept separate until exact authored-body/profile correlation can
-  justify a combined expanded score.
-- `cognitive_authored`: an explicitly versioned nesting-weighted policy.
-- `cfg_complexity`: a normalized graph measurement from MIR.
+`--driver` is optional when `rot-rustc-driver` is next to the audit executable or
+exists in the repository's driver target directory. Passing it explicitly makes
+automation independent of those lookup rules.
 
-Keeping the event breakdown makes compiler upgrades reviewable. A changed
-total should identify which decision kind, origin, body, and span changed.
+## Execution boundary
 
-## API-surface products
+The audit runs the pinned equivalent of:
 
-HIR plus compiler visibility and resolution can add evidence-backed semantic
-categories that the source pass deliberately does not approximate:
-
-- Declared `pub` items.
-- Effectively externally reachable items.
-- Re-exported items and the public paths that expose them.
-- Glob re-exports after expansion.
-- Public inherent items whose receiver is externally reachable.
-- Public trait items and implementations.
-- Items generated by macros.
-- Exported signature spans and the resolved types appearing in them.
-
-Definition and exposure are different locations. A re-export should produce:
-
-- one definition fact attributed to the defining file; and
-- one public-path edge attributed to the `pub use` file.
-
-Directory totals must not duplicate the definition merely because it has
-multiple public paths. Public-path counts may be reported separately.
-
-Compiler visibility still does not prove Hawk-style "unnecessary public" or
-"dead export" conclusions for arbitrary external users. We can make those
-claims only under a declared closed-world scope. The implemented scope is
-`selected-workspace compiled-target closed world`: it excludes doctests and
-Cargo targets skipped because their `required-features` are inactive. Those
-limits are serialized as `evidence_exclusions`, so consumers can reject the
-whole finding set when either omitted role matters.
-
-The closed-world graph fails conservative when expansion removes a selected
-consumer's original namespace spelling. A directly exported namespaced
-`pub macro` therefore keeps its containing module public; `#[macro_export]`
-does not keep its definition module public because the exported path is at the
-crate root. Public inherent associated types are also required-public roots on
-the pinned compiler, and their interface edges retain the self type and RHS.
-This is deliberate until rustc exposes complete type-position qualified-path
-resolution outside body type-checking results.
-
-## Syntax and semantic cost
-
-### Source mode
-
-The source mode reads and parses workspace Rust files in parallel. It does not
-compile dependencies, run build scripts, or execute procedural macros. Its
-cost is primarily proportional to source bytes and is appropriate as the
-default interactive command.
-
-### HIR mode
-
-Producing useful HIR semantics requires Cargo/rustc to perform expansion and
-name resolution. Effective visibility and resolved body facts generally need
-analysis to progress far enough that the operational cost resembles
-`cargo check`, not a line scanner.
-
-Costs and side effects include:
-
-- Cargo dependency resolution and possibly dependency downloads.
-- Compilation or loading of dependencies and proc-macro crates.
-- Execution of build scripts and procedural macros.
-- Writes to a Cargo target directory.
-- Failure when the selected program does not compile far enough.
-- Compiler memory proportional to the crates being analyzed.
-
-Warm Cargo/incremental caches can reduce repeated cost, but compiler mode must
-never be marketed with source-scan latency.
-
-### THIR and MIR modes
-
-THIR requires type checking and is constructed per body. MIR construction adds
-lowering and, depending on the selected query, borrow checking and transform
-passes. Their incremental cost may be modest once a compiler session has
-already reached analysis, but their maintenance and semantic-normalization cost
-is materially higher than HIR.
-
-### Trust boundary
-
-Compiler mode executes project-controlled build scripts and proc macros. It is
-explicit rather than silently replacing the default command. The CLI offers
-Cargo-equivalent `--locked` and `--offline` controls and an isolated-artifact
-parent through `--compiler-target-dir`.
-
-## Compiler integration boundary
-
-rustc's internal crates are unstable and tied to an exact compiler build. Keep
-that dependency in a small helper:
-
-```text
-rot
-  source inventory, LOC, symbolic cfg, aggregation, reporting
-    |
-    | versioned event stream
-    v
-rot-rustc-driver
-  pinned nightly + rustc-dev (and llvm-tools where required), Cargo rustc
-  wrapper and HIR adapter; selective THIR/MIR work is deferred
+```console
+cargo check --workspace --all-targets --keep-going
 ```
 
-The main report model contains no rustc types, numeric HIR IDs, or debug
-renderings. The helper translates them into a small versioned protocol whose
-core facts include:
+It uses isolated Cargo target and build directories, then correlates every
+selected driver sidecar with Cargo's expected unit graph and artifact messages.
+`--scratch-dir` selects the parent of those temporary directories; the individual
+run directory is still temporary.
 
-```text
-CrateInvocation { package, target, mode, target_triple, feature_set }
-ActiveRange     { file, byte_range, body, origin }
-Decision        { body, kind, origin, span, nesting }
-PublicItem      { definition, visibility, definition_span, signature_spans }
-PublicPath      { definition, path, exposure_span }
-Diagnostic      { phase, severity, span, message }
+This operation executes project-controlled build scripts and procedural macros.
+It may download dependencies unless `--offline` is supplied. `--locked` and
+`--offline` have their normal Cargo meanings. The audit also rejects compiler or
+workspace-wrapper overrides that would make its observations ambiguous.
+
+## Concrete Cargo profiles
+
+Each invocation describes one real Cargo program configuration. The supported
+profile controls are:
+
+```console
+rot-audit . --features serde,cli
+rot-audit . --no-default-features --features minimal
+rot-audit . --all-features
+rot-audit . --target aarch64-unknown-linux-gnu
+rot-audit . --cfg loom
 ```
 
-Cargo's workspace rustc wrapper intercepts selected workspace compilations
-while ordinary dependency compilation proceeds normally. An exact Cargo unit
-graph supplies the expected invocation ledger. Each sidecar is matched by Cargo
-unit identity, artifact metadata, compilation context, and canonical output
-directory; target roles are never guessed from filenames.
+Features are resolved by Cargo, including dependency feature unification and
+transitive activation. The audit deliberately has no `--exclude-feature`: Cargo
+cannot force an already enabled transitive feature off. To compare profiles, run
+the audit separately with the desired `--features`, `--all-features`, or
+`--no-default-features` arguments and compare the findings.
 
-The current protocol-v3 helper pins `nightly-2026-08-27` at rustc commit
-`bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed` and exchanges bounded atomic JSONL
-sidecars with the stable main binary. Supporting the
-project-selected arbitrary toolchain would require building or shipping a
-matching helper per compiler and is not an initial goal. If a project requires
-newer syntax than the pin supports, report the mismatch and retain source-mode
-results.
+Likewise, the audit has no `--unset-cfg`. A positive custom `--cfg` is passed to
+the real compilation only when it can be composed safely with the workspace's
+rustflags. Synthetic all-except-feature and forced-false-cfg profiles remain
+source-analysis features of `rot`, not compiler evidence.
 
-## Configuration profiles
+Cargo targets whose `required-features` are not active are not compiled. That
+absence is disclosed in every completed visibility report rather than treated as
+proof that their uses do not exist.
 
-A compiler result describes one concrete compilation profile, not "the
-project" in the abstract. Its identity must include at least:
+## Visibility graph
 
-```text
-package
-Cargo target
-target triple
-resolved feature closure
-normal/test/bench mode
-relevant rustc cfg values
-panic and compiler settings that affect MIR
-rustc commit/version
-report schema version governing the metric definitions
-```
+The driver records the compiler-resolved facts needed for one audit product:
 
-### Cargo features
+- definitions and their nominal/effective visibility;
+- source spans and whether a declaration is authored or generated;
+- runtime and public-interface roots;
+- resolved references between definitions;
+- Cargo unit, feature, target, test, host/target, and build-script identity.
 
-For realizable profiles, pass ordinary Cargo controls:
+The aggregator keeps concrete invocation identity. A definition compiled once
+for production and again for a test harness is not allowed to form an impossible
+path by mixing edges from the two configurations. Authored declarations that
+share one physical visibility span are compared across every relevant
+invocation before a narrowing candidate is emitted.
 
-- default features;
-- `--no-default-features`;
-- an explicit `--features` set; or
-- `--all-features`.
+Production and nonproduction roots are traversed separately. Nonproduction
+includes unit/integration tests, benches, and examples selected by Cargo. The
+`test_compiled_only` field marks a declaration that exists only in a test-mode
+compilation.
 
-Cargo computes the actual closure. The compiler events must record that
-resolved set rather than only the requested flags.
+Compiler expansion is used for resolution, not as a maintainability metric.
+Generated definitions can participate in reachability, while only authored,
+source-editable visibility is reported as a refactoring candidate.
 
-The existing `--exclude-feature` can describe profiles Cargo cannot construct.
-For example, feature `a` may imply feature `b` while the user requests all
-features except `b`. The source engine can force the `b` predicate false and
-mark the report synthetic. Cargo and rustc cannot honestly compile that profile
-without rewriting the manifest or lying about cfg values.
+## Findings
 
-Compiler mode therefore follows this rule:
+The audit reports one atomic visibility result with two related views.
 
-- If the requested feature profile is realizable, compile it.
-- If an exclusion is already absent from Cargo's closure, compile normally.
-- If an exclusion contradicts the closure, retain source results, mark semantic
-  facts unavailable for that profile, and explain why.
-- Never rewrite user manifests to manufacture a compiler profile.
+### Required public
 
-`--all-features` can itself fail when a project intentionally defines mutually
-exclusive features. That is a compiler diagnostic, not a reason to fall back
-to an invented semantic result.
+`required_visibility` contains authored declarations that must remain
+unrestricted public for a selected cross-crate interface or resolved use. A
+required declaration is compiler evidence for this selected workspace and
+profile; it is not a claim that every possible external consumer needs it.
 
-### Targets and custom cfg
+The analysis is conservative where lowering erases the source spelling used by
+a consumer. For example, directly exported namespaced `pub macro` definitions
+retain their module path, public inherent associated types retain their
+interface dependencies, and a legacy `#[macro_export]` definition does not keep
+its otherwise private source module public.
 
-Each target triple is another concrete profile. Compiler mode automatically
-observes rustc built-ins and build-script-emitted cfg values for that
-invocation. A requested target may require its standard library or other target
-support to be installed.
+### Narrowable and dead public
 
-Adding a custom `--cfg` can be represented by rustc flags. Arbitrarily removing
-a built-in or build-script-emitted cfg generally cannot. Synthetic `--unset-cfg`
-profiles remain source-only unless the requested state has a faithful compiler
-option, such as a corresponding codegen setting.
+`closed_world.findings` contains:
 
-We should analyze explicit named profiles, not attempt every target and feature
-combination.
+- `unnecessary_public`: the declaration is reachable, but no selected
+  cross-crate use or public-interface requirement needs unrestricted `pub`.
+- `dead_public`: the declaration is not reachable from any compiled production
+  or nonproduction root.
 
-The capability boundary is:
+“Unnecessary public” does not mean “make private.” The evidence proves that
+unrestricted public visibility is unnecessary, but the appropriate replacement
+may be private, `pub(super)`, or `pub(crate)`.
 
-| Requested profile | Source mode | Compiler mode |
-|---|---|---|
-| Ordinary Cargo feature closure | Exact symbolic source view | Exact concrete compiler view |
-| Feature forced off despite being implied | Synthetic but explicit | Unavailable without manifest rewriting |
-| Unknown custom cfg | Preserved as conditional | Concrete if Cargo/build scripts supply it |
-| Arbitrary cfg forced false | Synthetic but explicit | Usually unavailable |
-| Inactive source | Visible and countable | Removed before HIR |
-| Source with parse errors | Partial source metrics and diagnostics | Unavailable past the compiler failure |
-
-Multiple profiles are separate report dimensions. Their physical LOC must not
-be summed, because the same file can participate in every profile.
-
-## Production, test, and other target roles
-
-Production versus test is not a permanent property of a file. It is the
-difference between compilation modes under the same target and feature
-profile.
-
-For each selected library or binary target, collect semantic events from:
-
-1. A normal compilation, where `cfg(test)` is false.
-2. Its unit-test compilation, where Cargo passes test mode and `cfg(test)` is
-   true.
-
-Let `P` be normal events and `T` be test-mode events, keyed by stable body,
-source span, decision kind, and origin:
+Human output prints each actionable finding directly. For example, the locked,
+default-feature Harness acceptance run reports:
 
 ```text
-production/shared = P
-test-only          = T - P
-production-only    = P - T
-shared             = P intersect T
+Visibility audit: complete (4/4 Cargo invocations correlated)
+Scope: selected-workspace compiled-target closed world
+Evidence excludes: doctests, Cargo targets skipped by the active feature profile
+Required public: 27
+Can narrow unrestricted pub: 4
+Dead public: 0
+
+Findings:
+src/config.rs:127:5  config::ModelProfile::reasoning_summary  unnecessary_public  [production+nonproduction]  reachable, but no selected cross-crate use requires unrestricted public visibility
 ```
 
-The default disjoint report continues to count shared code as production.
-Optional diagnostics can expose `production-only` and `shared` explicitly.
+The required-public set remains available in JSON; normal text emphasizes the
+declarations a refactoring pass can act on.
 
-Additional roles come from Cargo metadata and the actual compiler invocation:
+## Closed-world scope
 
-- Integration tests are separate test targets, regardless of their pathname.
-- Benchmarks, examples, and build scripts retain the existing distinct report
-  roles. Libraries, binaries, and proc-macro crates are normal production
-  targets while retaining their exact Cargo target kind in provenance.
-- A custom test target outside `tests/` is still a test.
-- A file named `tests.rs` is not necessarily test-only.
-- Doctests require a separate rustdoc-backed path and are deferred from the
-  first compiler mode.
-
-Compiler expansion recognizes custom attribute macros that generate tests, but
-their source attribution may be only the attribute callsite. The source mode's
-configurable test-attribute list remains useful when compiler mode is absent.
-
-## Physical lines, comments, and active source
-
-HIR, THIR, and MIR do not emit physical/comment/blank line counts. Ordinary
-comments disappear before these representations, and doc comments are lowered
-to attributes. The current lossless token pass remains authoritative.
-
-For every physical line, source analysis continues to record:
+Both visibility views state their scope exactly as:
 
 ```text
-has_code
-has_comment
-has_doc_comment
-symbolic production/test reachability
+selected-workspace compiled-target closed world
 ```
 
-Compiler facts are overlaid by filename and byte range. They may confirm which
-code tokens are active in a concrete profile, but compiler spans must not be
-summed to produce LOC: spans overlap, can be broad, and may represent generated
-code.
+They also carry these `evidence_exclusions`:
 
-The mutually exclusive line policy remains:
+- `doctests`
+- `Cargo targets skipped by the active feature profile`
 
-- any code token makes the line code;
-- otherwise a comment token makes it a comment;
-- otherwise it is blank;
-- docs are a subset of comments.
+`cargo check --all-targets` does not compile rustdoc doctests. A declaration used
+only by a doctest may therefore appear dead inside the explicitly disclosed
+compiled-target scope. Similarly, an inactive `required-features` target is not
+evidence for or against visibility in another feature profile.
 
-Comments inside a clearly gated source node can inherit that node's role.
-Standalone comments between differently gated items follow their enclosing
-module/file role rather than being guessed from the nearest item.
+A finding is never a global safe-delete claim. Re-run the audit for every
+supported feature/target profile and account for external downstream consumers
+before narrowing a published library API.
 
-## Files and directories
+## Fail-closed completeness
 
-HIR and THIR nodes carry spans. MIR statements and terminators carry source
-information. rustc's `SourceMap` resolves these positions into a source file,
-byte range, line, and column.
+Visibility results are emitted only when all selected semantic evidence is
+complete. The audit exits unsuccessfully when any of these conditions holds:
 
-The merger should maintain two independent hierarchies:
+- the pinned driver is missing or fails its handshake;
+- Cargo metadata or the unit graph cannot be obtained;
+- Cargo/rustc does not complete successfully;
+- an expected selected invocation is missing, duplicated, or ambiguously
+  correlated;
+- a sidecar is malformed, incomplete, or violates its integrity constraints;
+- build-script cfg, target, feature, or codegen evidence disagrees;
+- the reference graph cannot be closed safely.
+
+When a structured report can be formed, its top-level `status` is `complete`,
+`partial`, or `unavailable`, with a reason for non-complete evidence. Partial or
+unavailable is never interpreted as zero required, narrowable, or dead
+declarations, and the process still exits nonzero.
+
+## JSON contract
+
+`rot-audit --format json` emits a separate `schema_version: 1` report. Its main
+fields are:
 
 ```text
-physical: workspace-relative directories and files
-semantic: package -> Cargo target -> module -> item/body
+schema_version
+root
+profile
+status
+reason
+expected_invocations
+correlated_invocations
+invocations
+required_visibility
+closed_world
+diagnostics
 ```
 
-They are intentionally separate because Rust supports `#[path]`, literal
-`include!`, generated `OUT_DIR` source, custom Cargo target paths, and multiple
-module paths involving the same physical file.
+The top-level report retains invocation identity and observed target/profile
+facts so a result can be audited later. `required_visibility` and `closed_world`
+both repeat the scope and exclusions at the point where they qualify the data.
 
-### File identity and deduplication
+Fast `rot --format json` remains schema version 2 and contains only source
+metrics, profile information, file/role buckets, and diagnostics. It has no
+`compiler` field.
 
-- Normalize real source files against the Cargo workspace/package root.
-- Preserve a source hash and original/remapped identity where needed for
-  compiler sessions using `--remap-path-prefix`.
-- Count physical LOC once per file.
-- In the physical view, merge identical semantic events across normal, test,
-  and overlapping Cargo target invocations by source span, decision kind, and
-  origin while retaining their role activations.
-- Retain an optional compiled-instance view when one source file is deliberately
-  included or compiled multiple times; do not let it inflate physical totals.
-- Attribute API definitions to their definition file and public-path edges to
-  their re-export file.
+## Deliberate non-goals
 
-Directory aggregation is then a prefix-tree sum over unique physical files.
-Semantic module aggregation is a separate sum over definition ownership.
+- The audit does not replace source line or authored-complexity measurement.
+- It does not inventory an abstract stable library API.
+- It does not assign maintainability complexity to derive or procedural-macro
+  output.
+- It does not enumerate the power set of Cargo features or target triples.
+- It does not observe arbitrary external consumers of a published library.
+- It does not compile doctests.
 
-Each directory node can reuse the existing disjoint role buckets:
-
-```text
-DirectoryReport {
-    path,
-    unique_files,
-    production: { lines, complexity, API },
-    test:       { lines, complexity, API },
-    bench, example, build, conditional, inactive, orphan,
-}
-```
-
-Directory parents sum child files exactly once. Compiled-instance counts, if
-exposed, live in a separate semantic report and never alter these physical
-totals.
-
-### Macro and generated locations
-
-rustc distinguishes real and virtual source files and retains macro expansion
-metadata. Not every generated node has a precise physical location.
-
-Use an explicit origin policy:
-
-- `authored`: walk expansion spans back to their source callsite and charge the
-  decision to that physical file.
-- `expanded`: preserve macro-generated decisions and group nodes without a real
-  file under a virtual `<generated>/<kind>` hierarchy.
-- `all`: additionally retain dependency-definition locations where available.
-
-Derive and procedural macros can emit dummy, mixed-site, or coarse callsite
-spans. The report must surface unattributed generated facts rather than invent
-line precision. Included files under `OUT_DIR` should be labeled generated even
-when rustc gives them a real path.
-
-## Reporting and provenance
-
-Source and compiler products remain additive and independently available:
-
-```text
-lexical_complexity
-cyclomatic_authored
-cognitive_authored
-compiler.products[effective_api].status
-compiler.products[required_visibility].status
-compiler.products[closed_world_liveness].status
-compiler.products[macro_expansion_cyclomatic_delta].status
-compiler.macro_expansion_complexity  # invocation-local deltas
-```
-
-Each compiler product status is `complete`, `partial`, or `unavailable`.
-`cfg_complexity` remains a deferred MIR product rather than a placeholder zero.
-
-Every compiler-backed report records:
-
-- exact rustc version/commit and driver protocol version;
-- report schema version plus each product's named metric, scope, and
-  baseline/policy fields;
-- target triple and Cargo target;
-- requested and resolved features;
-- normal/test/other compilation mode;
-- authored/expanded macro policy;
-- compiler diagnostics and the phase reached;
-- whether build scripts and proc macros ran;
-- whether results are complete or source-only fallback.
-
-Raw or normalized MIR metrics should not be compared across compiler versions
-unless the report explicitly confirms a compatible report schema and
-metric-specific MIR phase/policy.
-
-## Maintainability
-
-rustc handles grammar recognition, but it does not maintain `rot`'s metric
-definition. New Rust behavior can appear in three ways:
-
-1. A new HIR/THIR/MIR variant makes the driver fail to compile after a toolchain
-   update. This is visible and desirable.
-2. New syntax lowers into existing nodes. The driver compiles but can silently
-   overcount or undercount unless provenance fixtures cover the construct.
-3. Existing syntax lowers to a different MIR graph. A raw graph score changes
-   without a source change.
-
-Keep compiler enum handling exhaustive where possible. Where rustc requires a
-wildcard for a non-exhaustive type, emit an explicit unclassified event or
-diagnostic instead of silently assigning zero complexity.
-
-The upgrade gate for the pinned compiler should include:
-
-- one fixture per decision kind and Rust desugaring;
-- normal/test diffs, including `cfg(test)` and `cfg(not(test))`;
-- default, disabled, enabled, and mutually exclusive features;
-- target cfg and build-script-emitted cfg;
-- declarative, derive, attribute, and procedural macros;
-- `#[path]`, literal `include!`, generated files, and remapped paths;
-- public uses, glob re-exports, inherent items, and macro-generated APIs;
-- event-level golden comparisons before total comparisons;
-- representative real-workspace smoke runs.
-
-## Delivery status
-
-1. **Source-authored complexity — complete**
-   - Emit AST body and decision facts for authored Rust.
-   - Add cyclomatic and cognitive products while preserving lexical complexity.
-
-2. **Source API ownership cut — complete**
-   - Retain declared visibility only in fast mode.
-   - Delete the approximate effective-export collector and unresolved counters.
-
-3. **Pinned HIR driver and Cargo boundary — complete**
-   - Pin one nightly and build a workspace rustc wrapper.
-   - Emit crate invocations, real source identities, body identities, and
-     per-product availability.
-   - Prove file attribution and normal/test correlation on existing fixtures.
-
-4. **Effective API surface — complete**
-   - Resolve public uses, globs, receiver reachability, and macro-produced
-     items.
-   - Retain definition and public-path locations separately.
-   - Emit no semantic zero when compiler status is incomplete.
-
-5. **Profiles, required visibility, and closed-world liveness — complete**
-   - Drive normal and test compilations for realizable feature/target profiles.
-   - Retain stable source spans and target-role provenance while keeping
-     compiler semantics separate from physical LOC totals.
-   - Make synthetic profiles explicitly source-only.
-
-6. **Expansion-only complexity — complete as an explicit delta**
-   - Add HIR decisions originating in declarative and procedural expansion.
-   - Keep them separate as `macro_expansion_cyclomatic_delta` until exact
-     authored-body/profile correlation exists.
-
-7. **Selective THIR enrichment — deferred**
-   - Add only measurements with an approved type-dependent definition.
-
-8. **Optional MIR CFG — deferred**
-   - Specify the normalized graph contract before implementation.
-   - Report raw graph facts for diagnosis and normalized complexity separately.
-
-## References
-
-- [rustc_driver and rustc_interface](https://rustc-dev-guide.rust-lang.org/rustc-driver/intro.html)
-- [`rustc_private` requirements and stability](https://doc.rust-lang.org/beta/unstable-book/language-features/rustc-private.html)
-- [HIR](https://rustc-dev-guide.rust-lang.org/hir.html)
-- [AST-to-HIR lowering](https://rustc-dev-guide.rust-lang.org/hir/lowering.html)
-- [THIR](https://rustc-dev-guide.rust-lang.org/thir.html)
-- [MIR construction](https://rustc-dev-guide.rust-lang.org/mir/construction.html)
-- [MIR queries and phases](https://rustc-dev-guide.rust-lang.org/mir/passes.html)
-- [rustc source maps](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_span/source_map/struct.SourceMap.html)
-- [rustc real and virtual filenames](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_span/enum.FileName.html)
-- [Cargo workspace rustc wrappers](https://doc.rust-lang.org/cargo/reference/config.html#buildrustc-workspace-wrapper)
-- [Cargo unit graph](https://doc.rust-lang.org/cargo/reference/unstable.html#unit-graph)
-- [Cargo features](https://doc.rust-lang.org/cargo/reference/features.html)
-- [Cargo targets and test mode](https://doc.rust-lang.org/cargo/reference/cargo-targets.html)
-- [Hawk closed-world visibility analysis](https://github.com/astral-sh/hawk)
+Use `rot` routinely for fast source metrics and revision comparisons. Use
+`rot-audit` explicitly when aggressive visibility refactoring justifies a real
+Cargo/rustc build.

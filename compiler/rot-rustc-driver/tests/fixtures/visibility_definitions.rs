@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code)]
 
 mod hidden {
     pub struct Named {
@@ -43,33 +43,13 @@ mod hidden {
     impl PrivateReceiver {
         pub fn nominally_public(&self) {}
     }
-
-    pub mod globbed {
-        pub struct Globbed;
-
-        pub fn globbed_function() {}
-    }
 }
 
 pub use hidden::Choice;
 pub use hidden::Contract;
 pub use hidden::Named as Renamed;
-pub use hidden::globbed::*;
-pub use std::fmt::Debug as ExternalDebug;
 
-pub mod cycle_a {
-    pub use crate::cycle_b::B;
-
-    pub struct A;
-}
-
-pub mod cycle_b {
-    pub use crate::cycle_a::A;
-
-    pub struct B;
-}
-
-macro_rules! emit_api {
+macro_rules! emit_visibility_definitions {
     () => {
         pub struct Generated;
 
@@ -81,18 +61,4 @@ macro_rules! emit_api {
     };
 }
 
-emit_api!();
-
-#[macro_export]
-macro_rules! exported_macro {
-    () => {};
-}
-
-pub const CONSTANT: usize = 1;
-pub static STATIC: usize = 2;
-
-pub async fn body_shapes(value: bool) -> usize {
-    let closure = || 3;
-    let inline = const { 4 };
-    usize::from(value) + closure() + inline
-}
+emit_visibility_definitions!();

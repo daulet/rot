@@ -311,8 +311,6 @@ pub struct ProfileReport {
     pub forced_unset_cfg: Vec<String>,
     pub additional_test_attributes: Vec<String>,
     pub synthetic: bool,
-    pub compiler_compatible: bool,
-    pub compiler_unavailable_reasons: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -330,6 +328,7 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticStatus {
@@ -338,14 +337,7 @@ pub enum SemanticStatus {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct ProductAvailabilityReport {
-    pub product: String,
-    pub status: SemanticStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Serialize)]
 pub struct CompilerTargetReport {
     pub package_id: String,
@@ -357,39 +349,14 @@ pub struct CompilerTargetReport {
     pub compilation_context: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct CompilerCodegenReport {
-    pub optimization: String,
-    pub panic: String,
-    pub debug_assertions: bool,
-    pub overflow_checks: bool,
-    pub codegen_units: usize,
-    pub target_cpu: String,
-    pub target_features: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CompilerArtifactReport {
-    pub extra_filename: Option<String>,
-    pub metadata: Option<String>,
-    pub emit: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CompilerSourceReport {
-    pub path: String,
-    pub source_hash_algorithm: String,
-    pub source_hash: String,
-    pub bytes: u64,
-    pub generated: bool,
-}
-
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompilerDefinitionIdReport {
     pub stable_crate_id: String,
     pub local_hash: String,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompilerSourceSpanReport {
     pub path: String,
@@ -397,66 +364,11 @@ pub struct CompilerSourceSpanReport {
     pub generated: bool,
     pub start_byte: u64,
     pub end_byte: u64,
+    pub line: u64,
+    pub column: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct EffectiveApiDefinitionReport {
-    pub package_id: String,
-    pub crate_name: String,
-    pub id: CompilerDefinitionIdReport,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent: Option<CompilerDefinitionIdReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub definition_path: String,
-    pub kind: String,
-    pub nominal_visibility: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub restricted_to: Option<CompilerDefinitionIdReport>,
-    pub effective_public_at: String,
-    pub expansion_origin: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span: Option<CompilerSourceSpanReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attribution_callsite: Option<CompilerSourceSpanReport>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct EffectiveApiBindingReport {
-    pub package_id: String,
-    pub crate_name: String,
-    pub parent: CompilerDefinitionIdReport,
-    pub target: CompilerDefinitionIdReport,
-    pub name: String,
-    pub namespace: String,
-    pub exposure: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exposing_import: Option<CompilerDefinitionIdReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_definition_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_definition_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span: Option<CompilerSourceSpanReport>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct EffectiveApiSummaryReport {
-    pub production_library_invocations: u64,
-    pub effective_definitions: u64,
-    pub public_bindings: u64,
-    pub definitions_by_kind: BTreeMap<String, u64>,
-    pub bindings_by_namespace: BTreeMap<String, u64>,
-    pub bindings_by_exposure: BTreeMap<String, u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct EffectiveApiReport {
-    pub summary: EffectiveApiSummaryReport,
-    pub definitions: Vec<EffectiveApiDefinitionReport>,
-    pub public_bindings: Vec<EffectiveApiBindingReport>,
-}
-
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RequiredVisibilityDefinitionReport {
     pub package_id: String,
@@ -472,6 +384,7 @@ pub struct RequiredVisibilityDefinitionReport {
     pub span: Option<CompilerSourceSpanReport>,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RequiredVisibilityReport {
     pub scope: String,
@@ -479,6 +392,7 @@ pub struct RequiredVisibilityReport {
     pub definitions: Vec<RequiredVisibilityDefinitionReport>,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ClosedWorldSummaryReport {
     pub definition_nodes: u64,
@@ -492,9 +406,11 @@ pub struct ClosedWorldSummaryReport {
     pub unnecessary_public: u64,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ClosedWorldFindingReport {
     pub kind: String,
+    pub reason: String,
     pub package_id: String,
     pub crate_name: String,
     pub representative_invocation: String,
@@ -510,6 +426,7 @@ pub struct ClosedWorldFindingReport {
     pub attribution_callsite: Option<CompilerSourceSpanReport>,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ClosedWorldReport {
     pub scope: String,
@@ -518,79 +435,27 @@ pub struct ClosedWorldReport {
     pub findings: Vec<ClosedWorldFindingReport>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct MacroExpansionDeltaBreakdownReport {
-    pub macro_body_bases: u64,
-    pub decisions: u64,
-    pub decision_delta: u64,
-    pub cyclomatic_delta: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct MacroExpansionInvocationMetricsReport {
-    pub totals: MacroExpansionDeltaBreakdownReport,
-    pub by_origin: BTreeMap<String, MacroExpansionDeltaBreakdownReport>,
-    pub by_macro_kind: BTreeMap<String, MacroExpansionDeltaBreakdownReport>,
-    pub decisions_by_kind: BTreeMap<String, u64>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MacroExpansionInvocationReport {
-    pub key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<CompilerTargetReport>,
-    pub crate_name: String,
-    pub status: SemanticStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<MacroExpansionInvocationMetricsReport>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MacroExpansionComplexityReport {
-    pub metric: String,
-    pub baseline: String,
-    pub invocations: Vec<MacroExpansionInvocationReport>,
-}
-
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Serialize)]
 pub struct CompilerInvocationReport {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CompilerTargetReport>,
     pub crate_name: String,
-    pub crate_types: Vec<String>,
     pub target_triple: String,
     pub compilation_context: String,
     pub test: bool,
     pub features: Vec<String>,
     pub cfg: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codegen: Option<CompilerCodegenReport>,
-    pub artifact: CompilerArtifactReport,
-    pub source_files: u64,
-    pub sources: Vec<CompilerSourceReport>,
-    pub bodies: u64,
     pub definitions: u64,
-    pub public_bindings: u64,
     pub roots: u64,
     pub references: u64,
-    pub macro_expansion_decisions: u64,
-    pub products: Vec<ProductAvailabilityReport>,
+    pub status: SemanticStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct GeneratedFileReport {
-    pub path: String,
-    pub source_hash: String,
-    pub bytes: u64,
-    #[serde(flatten)]
-    pub lines: LineCounts,
-    #[serde(flatten)]
-    pub metrics: ComplexityMetrics,
-}
-
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Serialize)]
 pub struct CompilerReport {
     pub protocol_version: u32,
@@ -601,16 +466,13 @@ pub struct CompilerReport {
     pub collected_invocations: u64,
     pub correlated_invocations: u64,
     pub invocations: Vec<CompilerInvocationReport>,
-    pub products: Vec<ProductAvailabilityReport>,
+    pub status: SemanticStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_api: Option<EffectiveApiReport>,
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_visibility: Option<RequiredVisibilityReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_world: Option<ClosedWorldReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub macro_expansion_complexity: Option<MacroExpansionComplexityReport>,
-    pub generated_files: Vec<GeneratedFileReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -625,7 +487,5 @@ pub struct Report {
     pub total: LineCounts,
     #[serde(flatten)]
     pub metrics: ComplexityMetrics,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compiler: Option<CompilerReport>,
     pub diagnostics: Vec<Diagnostic>,
 }

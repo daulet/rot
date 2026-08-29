@@ -1,22 +1,15 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
-    path::Path,
-    process::Command,
-};
+use std::{path::Path, process::Command};
 
 use anyhow::{Context, Result, bail};
-use cargo_metadata::{Metadata, PackageId};
+use cargo_metadata::Metadata;
 use serde::Deserialize;
 
-use crate::{cli::Cli, workspace::Inventory};
+use crate::{cli::AuditCli, workspace::Inventory};
 
 use super::environment;
 
 pub(super) struct CompilerProfile {
-    pub(super) resolved_features: BTreeMap<PackageId, BTreeSet<String>>,
     pub(super) expected_units: Vec<ExpectedUnit>,
-    pub(super) incompatibilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,30 +47,22 @@ struct RawUnitTarget {
 }
 
 impl CompilerProfile {
-    pub(super) fn resolved_features(&self, package: &PackageId) -> Option<&BTreeSet<String>> {
-        self.resolved_features.get(package)
-    }
-
-    pub(super) fn incompatibilities(&self) -> &[String] {
-        &self.incompatibilities
-    }
-
     pub(super) fn expected_units(&self) -> &[ExpectedUnit] {
         &self.expected_units
     }
 }
 
-pub(super) fn resolve(cli: &Cli, inventory: &Inventory) -> Result<CompilerProfile> {
+pub(super) fn resolve(cli: &AuditCli, inventory: &Inventory) -> Result<CompilerProfile> {
     environment::reject_compiler_overrides(&inventory.root)?;
-    let metadata = inventory
-        .compiler_metadata
-        .as_ref()
-        .context("pinned Cargo metadata preflight was unavailable")?;
-    let expected_units = load_unit_graph(cli, &inventory.root, &inventory.profile.target)?;
-    compiler_profile(metadata, inventory, expected_units)
+    let target = inventory
+        .audit_target
+        .as_deref()
+        .context("audit target was not resolved")?;
+    let expected_units = load_unit_graph(cli, &inventory.root, target)?;
+    Ok(CompilerProfile { expected_units })
 }
 
-fn load_unit_graph(cli: &Cli, workspace: &Path, target: &str) -> Result<Vec<ExpectedUnit>> {
+fn load_unit_graph(cli: &AuditCli, workspace: &Path, target: &str) -> Result<Vec<ExpectedUnit>> {
     let mut command = environment::pinned_command("cargo");
     command.current_dir(workspace).args([
         "check",
@@ -156,7 +141,7 @@ fn load_unit_graph(cli: &Cli, workspace: &Path, target: &str) -> Result<Vec<Expe
 }
 
 pub(crate) fn load_metadata(
-    cli: &Cli,
+    cli: &AuditCli,
     workspace: &Path,
     no_dependencies: bool,
 ) -> Result<Metadata> {
@@ -173,7 +158,7 @@ pub(crate) fn load_metadata(
     serde_json::from_slice(&output.stdout).context("pinned Cargo metadata was malformed")
 }
 
-fn metadata_command(cli: &Cli, workspace: &Path, no_dependencies: bool) -> Result<Command> {
+fn metadata_command(cli: &AuditCli, workspace: &Path, no_dependencies: bool) -> Result<Command> {
     let mut command = environment::pinned_command("cargo");
     command
         .current_dir(workspace)
@@ -188,7 +173,7 @@ fn metadata_command(cli: &Cli, workspace: &Path, no_dependencies: bool) -> Resul
     Ok(command)
 }
 
-fn append_profile_options(command: &mut Command, cli: &Cli) {
+fn append_profile_options(command: &mut Command, cli: &AuditCli) {
     if cli.locked {
         command.arg("--locked");
     }
@@ -207,75 +192,6 @@ fn append_profile_options(command: &mut Command, cli: &Cli) {
     }
 }
 
-fn compiler_profile(
-    metadata: &Metadata,
-    inventory: &Inventory,
-    expected_units: Vec<ExpectedUnit>,
-) -> Result<CompilerProfile> {
-    let resolve = metadata
-        .resolve
-        .as_ref()
-        .context("pinned Cargo metadata omitted its resolved dependency graph")?;
-    let resolved_nodes = resolve
-        .nodes
-        .iter()
-        .map(|node| (&node.id, node))
-        .collect::<HashMap<_, _>>();
-    let workspace_members = metadata
-        .workspace_members
-        .iter()
-        .filter_map(|id| metadata.packages.iter().find(|package| package.id == *id))
-        .map(|package| {
-            let manifest = package.manifest_path.as_std_path();
-            let root = manifest.parent().unwrap_or(manifest);
-            let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            ((package.name.as_str(), root), &package.id)
-        })
-        .collect::<HashMap<_, _>>();
-
-    let mut resolved_features = BTreeMap::new();
-    let mut incompatibilities = Vec::new();
-    for package in &inventory.packages {
-        let root = fs::canonicalize(&package.root).unwrap_or_else(|_| package.root.clone());
-        let id = workspace_members
-            .get(&(package.name.as_str(), root))
-            .with_context(|| {
-                format!(
-                    "pinned Cargo metadata omitted workspace package {} at {}",
-                    package.name,
-                    package.root.display()
-                )
-            })?;
-        let node = resolved_nodes.get(id).with_context(|| {
-            format!(
-                "pinned Cargo metadata omitted resolved features for workspace package {}",
-                package.name
-            )
-        })?;
-        let enabled = node
-            .features
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-        for excluded in &package.features.excluded {
-            if enabled.contains(excluded) {
-                incompatibilities.push(format!(
-                    "package {}: feature {excluded:?} is enabled by Cargo's resolved dependency graph and cannot be excluded in compiler mode",
-                    package.name
-                ));
-            }
-        }
-        resolved_features.insert(package.id.clone(), enabled);
-    }
-    incompatibilities.sort();
-    incompatibilities.dedup();
-    Ok(CompilerProfile {
-        resolved_features,
-        expected_units,
-        incompatibilities,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -286,9 +202,8 @@ mod tests {
 
     #[test]
     fn metadata_preflight_uses_compiler_profile_controls() {
-        let cli = Cli::parse_from([
-            "rot",
-            "--compiler",
+        let cli = AuditCli::parse_from([
+            "rot-audit",
             "--features",
             "member/selected",
             "--no-default-features",

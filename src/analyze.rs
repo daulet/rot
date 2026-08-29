@@ -10,7 +10,7 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 
 use crate::{
     cfg::CfgProfile,
-    cli::Cli,
+    cli::FastCli,
     model::{
         BucketReport, ComplexityMetrics, Contexts, Diagnostic, DiagnosticSeverity, FileReport,
         LineCounts, OutputRole, Report,
@@ -19,7 +19,7 @@ use crate::{
     workspace::{Inventory, inventory},
 };
 
-pub fn analyze(cli: &Cli) -> Result<Report> {
+pub fn analyze(cli: &FastCli) -> Result<Report> {
     let mut inventory = inventory(cli)?;
     let cfg_profile = CfgProfile::new(
         inventory.cfg_true.clone(),
@@ -92,26 +92,7 @@ pub fn analyze(cli: &Cli) -> Result<Report> {
         .map(|(index, path)| (path.clone(), index))
         .collect::<HashMap<_, _>>();
     let contexts = classify_module_graph(&inventory, &files, &path_indices);
-    let compiler = cli
-        .compiler
-        .then(|| crate::compiler::collect(cli, &inventory));
-    if let Some(outcome) = &compiler {
-        if !outcome.profile_incompatibilities.is_empty() {
-            inventory.compiler_compatible = false;
-            inventory
-                .compiler_unavailable_reasons
-                .extend(outcome.profile_incompatibilities.iter().cloned());
-            inventory.compiler_unavailable_reasons.sort();
-            inventory.compiler_unavailable_reasons.dedup();
-            inventory.profile.compiler_compatible = false;
-            inventory.profile.compiler_unavailable_reasons =
-                inventory.compiler_unavailable_reasons.clone();
-        }
-        inventory.diagnostics.extend(outcome.diagnostics.clone());
-    }
-    let mut report = build_report(inventory, files, paths, contexts)?;
-    report.compiler = compiler.map(|outcome| outcome.report);
-    Ok(report)
+    build_report(inventory, files, paths, contexts)
 }
 
 fn classify_module_graph(
@@ -317,7 +298,6 @@ fn build_report(
             .collect(),
         total: project_total,
         metrics: project_metrics,
-        compiler: None,
         diagnostics: inventory.diagnostics,
     })
 }

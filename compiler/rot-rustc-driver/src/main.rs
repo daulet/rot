@@ -21,21 +21,19 @@ use std::{
 };
 
 use rot_compiler_protocol::{
-    ArtifactIdentity, Availability, BUILD_DIR_ENV, Body, BodyKind, CfgValue, CodegenProfile,
-    CompilationContext, CompilerDefId, CompilerIdentity, DRIVER_VERSION, Decision, DecisionKind,
-    Definition, DefinitionKind, Diagnostic, DiagnosticPhase, DiagnosticSeverity,
-    EffectiveVisibilityLevel, Event, ExpansionOrigin, Exposure, FactId, HANDSHAKE_ARG, Handshake,
+    ArtifactIdentity, Availability, BUILD_DIR_ENV, CfgValue, CodegenProfile, CompilationContext,
+    CompilerDefId, CompilerIdentity, DRIVER_VERSION, Definition, DefinitionKind, Diagnostic,
+    DiagnosticPhase, DiagnosticSeverity, Event, ExpansionOrigin, FactId, HANDSHAKE_ARG, Handshake,
     InvocationFinished, InvocationId, InvocationMergeKey, InvocationStarted, MAX_SIDECAR_BYTES,
-    MacroKind, Namespace, NominalVisibility, OptimizationLevel, PINNED_RUSTC_COMMIT,
-    PINNED_RUSTC_COMMIT_DATE, PINNED_RUSTC_RELEASE, PINNED_RUSTC_VERSION, PROTOCOL_VERSION,
-    PanicStrategy, Product, ProductStatus, Profile, PublicBinding, RUN_ID_ENV, Record, Reference,
-    ReferenceKind, Root, RootKind, RunId, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile,
-    SourceFileKey, SourceSpan, TARGET_DIR_ENV,
+    NominalVisibility, OptimizationLevel, PINNED_RUSTC_COMMIT, PINNED_RUSTC_COMMIT_DATE,
+    PINNED_RUSTC_RELEASE, PINNED_RUSTC_VERSION, PROTOCOL_VERSION, PanicStrategy, Product,
+    ProductStatus, Profile, RUN_ID_ENV, Record, Reference, ReferenceKind, Root, RootKind, RunId,
+    SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile, SourceFileKey, SourceSpan,
+    TARGET_DIR_ENV,
 };
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::{
-    Arm, BinOpKind, Block, CoroutineKind, Expr, ExprKind, LetStmt, LoopSource, MatchSource, Node,
-    Pat, PatExpr, PatExprKind, PatKind, QPath, StructTailExpr,
+    Expr, ExprKind, Node, Pat, PatExpr, PatExprKind, PatKind, QPath, StructTailExpr,
     def::{CtorOf, DefKind, Res},
     intravisit::{self, Visitor},
 };
@@ -44,14 +42,13 @@ use rustc_lint_defs::{Level as LintLevel, builtin::DEAD_CODE};
 use rustc_middle::{
     metadata::Reexport,
     middle::codegen_fn_attrs::CodegenFnAttrFlags,
-    middle::privacy::Level as VisibilityLevel,
     ty::{self, TyCtxt, Visibility},
 };
 use rustc_session::config::{self, OptLevel};
 use rustc_span::{
     FileName, Pos, Span,
     def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId},
-    hygiene::{ExpnKind, MacroKind as RustcMacroKind},
+    hygiene::ExpnKind,
 };
 use rustc_structures::CrateType;
 use rustc_target::spec::PanicStrategy as RustcPanicStrategy;
@@ -369,15 +366,7 @@ struct Collection {
     roots: Vec<GeneratedRoot>,
     records: RecordBuffer,
     analysis_reached: bool,
-    products: Products,
-}
-
-#[derive(Default)]
-struct Products {
-    hir_bodies: ProductProgress,
-    effective_api: ProductProgress,
-    references: ProductProgress,
-    expansion_decisions: ProductProgress,
+    visibility_audit: ProductProgress,
 }
 
 #[derive(Default)]
@@ -465,81 +454,42 @@ impl Collection {
             roots,
             records,
             analysis_reached: false,
-            products: Products::default(),
+            visibility_audit: ProductProgress::default(),
         })
     }
 
     fn collect<'tcx>(&mut self, tcx: TyCtxt<'tcx>) {
         self.analysis_reached = true;
-        self.products.hir_bodies.start();
-        self.products.effective_api.start();
-        self.products.expansion_decisions.start();
+        self.visibility_audit.start();
         if self.records.truncated {
-            self.products.hir_bodies.reject();
-            self.products.effective_api.reject();
-            self.products.references.reject();
-            self.products.expansion_decisions.reject();
+            self.visibility_audit.reject();
         }
         if !self.records.push(Event::Profile(profile(tcx))) {
-            self.products.hir_bodies.reject();
-            self.products.effective_api.reject();
-            self.products.references.reject();
-            self.products.expansion_decisions.reject();
+            self.visibility_audit.reject();
         }
 
         let facts = collect_facts(tcx, &self.roots);
-        self.products.references.start();
-        for owned in facts.sources.into_values() {
-            if !self.records.push(Event::SourceFile(owned.source)) {
-                if owned.owners.hir_bodies {
-                    self.products.hir_bodies.reject();
-                }
-                if owned.owners.effective_api {
-                    self.products.effective_api.reject();
-                }
-                if owned.owners.references {
-                    self.products.references.reject();
-                }
-                if owned.owners.expansion_decisions {
-                    self.products.expansion_decisions.reject();
-                }
-            }
-        }
-        for body in facts.bodies {
-            let expansion_body = is_macro_origin(body.expansion_origin);
-            if !self.records.push(Event::Body(body)) {
-                self.products.hir_bodies.reject();
-                if expansion_body {
-                    self.products.expansion_decisions.reject();
-                }
+        for source in facts.sources.into_values() {
+            if !self.records.push(Event::SourceFile(source)) {
+                self.visibility_audit.reject();
             }
         }
         for definition in facts.definitions {
             if !self.records.push(Event::Definition(definition)) {
-                self.products.effective_api.reject();
-            }
-        }
-        for binding in facts.bindings {
-            if !self.records.push(Event::PublicBinding(binding)) {
-                self.products.effective_api.reject();
+                self.visibility_audit.reject();
             }
         }
         if self.records.truncated {
-            self.products.references.reject();
+            self.visibility_audit.reject();
         }
         for root in facts.roots {
             if !self.records.push(Event::Root(root)) {
-                self.products.references.reject();
+                self.visibility_audit.reject();
             }
         }
         for reference in facts.references {
             if !self.records.push(Event::Reference(reference)) {
-                self.products.references.reject();
-            }
-        }
-        for decision in facts.decisions {
-            if !self.records.push(Event::Decision(decision)) {
-                self.products.expansion_decisions.reject();
+                self.visibility_audit.reject();
             }
         }
     }
@@ -558,27 +508,9 @@ impl Collection {
         }
         self.records
             .push_mandatory(Event::ProductStatus(ProductStatus {
-                product: Product::HirBodies,
-                availability: self.products.hir_bodies.availability(),
-                message: product_message(&self.products.hir_bodies),
-            }));
-        self.records
-            .push_mandatory(Event::ProductStatus(ProductStatus {
-                product: Product::EffectiveApi,
-                availability: self.products.effective_api.availability(),
-                message: product_message(&self.products.effective_api),
-            }));
-        self.records
-            .push_mandatory(Event::ProductStatus(ProductStatus {
-                product: Product::References,
-                availability: self.products.references.availability(),
-                message: product_message(&self.products.references),
-            }));
-        self.records
-            .push_mandatory(Event::ProductStatus(ProductStatus {
-                product: Product::ExpansionDecisions,
-                availability: self.products.expansion_decisions.availability(),
-                message: product_message(&self.products.expansion_decisions),
+                product: Product::VisibilityAudit,
+                availability: self.visibility_audit.availability(),
+                message: product_message(&self.visibility_audit),
             }));
         self.records
             .push_mandatory(Event::InvocationFinished(InvocationFinished {
@@ -603,49 +535,51 @@ fn product_message(progress: &ProductProgress) -> Option<String> {
 
 #[derive(Default)]
 struct CollectedFacts {
-    sources: BTreeMap<SourceFileKey, OwnedSource>,
-    bodies: Vec<Body>,
+    sources: BTreeMap<SourceFileKey, SourceFile>,
     definitions: Vec<Definition>,
-    bindings: Vec<PublicBinding>,
+    bindings: Vec<VisibilityBinding>,
     roots: Vec<Root>,
     references: Vec<Reference>,
-    decisions: Vec<Decision>,
 }
 
-struct OwnedSource {
-    source: SourceFile,
-    owners: SourceOwners,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum BindingNamespace {
+    Type,
+    Value,
+    Macro,
 }
 
-#[derive(Clone, Copy, Default)]
-struct SourceOwners {
-    hir_bodies: bool,
-    effective_api: bool,
-    references: bool,
-    expansion_decisions: bool,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum BindingExposure {
+    Direct,
+    SingleReexport,
+    GlobReexport,
+    ExternCrate,
+    MacroUse,
+    MacroExport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct VisibilityBinding {
+    target: CompilerDefId,
+    namespace: BindingNamespace,
+    exposure: BindingExposure,
+    exposing_import: Option<CompilerDefId>,
 }
 
 impl CollectedFacts {
-    fn remember_span(&mut self, located: &LocatedSpan, owners: SourceOwners) {
-        let entry = self
-            .sources
+    fn remember_span(&mut self, located: &LocatedSpan) {
+        self.sources
             .entry(located.source.key.clone())
-            .or_insert_with(|| OwnedSource {
-                source: located.source.clone(),
-                owners: SourceOwners::default(),
-            });
-        entry.owners.hir_bodies |= owners.hir_bodies;
-        entry.owners.effective_api |= owners.effective_api;
-        entry.owners.references |= owners.references;
-        entry.owners.expansion_decisions |= owners.expansion_decisions;
+            .or_insert_with(|| located.source.clone());
     }
 
-    fn remember_attribution(&mut self, attribution: &SpanAttribution, owners: SourceOwners) {
+    fn remember_attribution(&mut self, attribution: &SpanAttribution) {
         if let Some(span) = &attribution.span {
-            self.remember_span(span, owners);
+            self.remember_span(span);
         }
         if let Some(callsite) = &attribution.callsite {
-            self.remember_span(callsite, owners);
+            self.remember_span(callsite);
         }
     }
 
@@ -658,13 +592,7 @@ impl CollectedFacts {
         span: Option<LocatedSpan>,
     ) {
         if let Some(span) = &span {
-            self.remember_span(
-                span,
-                SourceOwners {
-                    references: true,
-                    ..SourceOwners::default()
-                },
-            );
+            self.remember_span(span);
         }
         self.references.push(Reference {
             id: FactId(String::new()),
@@ -697,14 +625,7 @@ struct LocatedSpan {
 struct SpanAttribution {
     span: Option<LocatedSpan>,
     callsite: Option<LocatedSpan>,
-    provenance: ExpansionProvenance,
-}
-
-#[derive(Clone, Copy)]
-struct ExpansionProvenance {
     origin: ExpansionOrigin,
-    macro_kind: Option<MacroKind>,
-    macro_definition: Option<CompilerDefId>,
 }
 
 fn collect_facts(tcx: TyCtxt<'_>, generated_roots: &[GeneratedRoot]) -> CollectedFacts {
@@ -722,13 +643,7 @@ fn collect_facts(tcx: TyCtxt<'_>, generated_roots: &[GeneratedRoot]) -> Collecte
         let kind = definition_kind(tcx.def_kind(local_def_id), local_def_id)
             .expect("emitted definitions have a supported kind");
         let attribution = span_attribution(tcx, tcx.def_span(local_def_id), generated_roots);
-        facts.remember_attribution(
-            &attribution,
-            SourceOwners {
-                effective_api: true,
-                ..SourceOwners::default()
-            },
-        );
+        facts.remember_attribution(&attribution);
         facts.definitions.push(Definition {
             id: FactId(String::new()),
             compiler_id: compiler_id(tcx, local_def_id.to_def_id()),
@@ -740,69 +655,17 @@ fn collect_facts(tcx: TyCtxt<'_>, generated_roots: &[GeneratedRoot]) -> Collecte
             kind,
             visibility_editable: visibility_editable(tcx, local_def_id),
             nominal_visibility: nominal_visibility(tcx, local_def_id.to_def_id()),
-            effective_public_at: effective_visibility(tcx, local_def_id),
+            externally_reachable: externally_reachable(tcx, local_def_id),
             span: attribution.span.as_ref().map(|span| span.span.clone()),
             attribution_callsite: attribution
                 .callsite
                 .as_ref()
                 .map(|callsite| callsite.span.clone()),
-            expansion_origin: attribution.provenance.origin,
+            expansion_origin: attribution.origin,
         });
     }
 
-    for local_def_id in tcx.hir_body_owners() {
-        let kind = body_kind(tcx, local_def_id);
-        let decision_owner = kind
-            .is_some()
-            .then_some(local_def_id)
-            .or_else(|| async_fn_owner(tcx, local_def_id));
-        let Some(decision_owner) = decision_owner else {
-            continue;
-        };
-        collect_expansion_decisions(
-            tcx,
-            local_def_id,
-            compiler_id(tcx, decision_owner.to_def_id()),
-            generated_roots,
-            &mut facts,
-        );
-
-        let Some(kind) = kind else {
-            continue;
-        };
-        let definition_span = tcx.def_span(local_def_id);
-        let expansion_attribution = macro_span_attribution(tcx, definition_span, generated_roots);
-        let expansion_body = is_macro_origin(expansion_attribution.provenance.origin);
-        let attribution = if expansion_body {
-            expansion_attribution
-        } else {
-            span_attribution(tcx, definition_span, generated_roots)
-        };
-        facts.remember_attribution(
-            &attribution,
-            SourceOwners {
-                hir_bodies: true,
-                expansion_decisions: expansion_body,
-                ..SourceOwners::default()
-            },
-        );
-        facts.bodies.push(Body {
-            id: FactId(String::new()),
-            compiler_id: compiler_id(tcx, local_def_id.to_def_id()),
-            definition_path: tcx.def_path_str(local_def_id),
-            kind,
-            span: attribution.span.as_ref().map(|span| span.span.clone()),
-            attribution_callsite: attribution
-                .callsite
-                .as_ref()
-                .map(|callsite| callsite.span.clone()),
-            expansion_origin: attribution.provenance.origin,
-            macro_kind: attribution.provenance.macro_kind,
-            macro_definition: attribution.provenance.macro_definition,
-        });
-    }
-
-    collect_public_bindings(tcx, generated_roots, &local_definitions, &mut facts);
+    collect_visibility_bindings(tcx, &local_definitions, &mut facts);
     collect_references(
         tcx,
         generated_roots,
@@ -812,207 +675,6 @@ fn collect_facts(tcx: TyCtxt<'_>, generated_roots: &[GeneratedRoot]) -> Collecte
     );
     sort_and_identify_facts(&mut facts);
     facts
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DecisionGroup {
-    body: CompilerDefId,
-    attribution_callsite: Option<SourceSpan>,
-    expansion_origin: ExpansionOrigin,
-    macro_kind: MacroKind,
-    macro_definition: Option<CompilerDefId>,
-}
-
-fn collect_expansion_decisions<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    local_def_id: LocalDefId,
-    body: CompilerDefId,
-    generated_roots: &[GeneratedRoot],
-    facts: &mut CollectedFacts,
-) {
-    let mut visitor = ExpansionDecisionVisitor {
-        tcx,
-        generated_roots,
-        body,
-        facts,
-        nesting: 0,
-    };
-    visitor.visit_body(tcx.hir_body_owned_by(local_def_id));
-}
-
-struct ExpansionDecisionVisitor<'facts, 'roots, 'tcx> {
-    tcx: TyCtxt<'tcx>,
-    generated_roots: &'roots [GeneratedRoot],
-    body: CompilerDefId,
-    facts: &'facts mut CollectedFacts,
-    nesting: u32,
-}
-
-impl<'tcx> ExpansionDecisionVisitor<'_, '_, 'tcx> {
-    fn record(&mut self, kind: DecisionKind, span: Span) {
-        let attribution = macro_span_attribution(self.tcx, span, self.generated_roots);
-        if !is_macro_origin(attribution.provenance.origin) {
-            return;
-        }
-        let Some(macro_kind) = attribution.provenance.macro_kind else {
-            return;
-        };
-        self.facts.remember_attribution(
-            &attribution,
-            SourceOwners {
-                expansion_decisions: true,
-                ..SourceOwners::default()
-            },
-        );
-        let attribution_callsite = attribution
-            .callsite
-            .as_ref()
-            .map(|callsite| callsite.span.clone());
-        self.facts.decisions.push(Decision {
-            id: FactId(String::new()),
-            body: self.body,
-            kind,
-            generated_span: attribution.span.as_ref().map(|span| span.span.clone()),
-            attribution_callsite,
-            expansion_origin: attribution.provenance.origin,
-            macro_kind,
-            macro_definition: attribution.provenance.macro_definition,
-            ordinal: 0,
-            nesting: self.nesting,
-        });
-    }
-
-    fn enter_nesting(&mut self) {
-        self.nesting = self
-            .nesting
-            .checked_add(1)
-            .expect("HIR nesting cannot exhaust u32");
-    }
-
-    fn leave_nesting(&mut self) {
-        self.nesting = self
-            .nesting
-            .checked_sub(1)
-            .expect("HIR decision traversal must balance nesting");
-    }
-
-    fn visit_branch(&mut self, expression: &'tcx Expr<'tcx>) {
-        self.enter_nesting();
-        self.visit_expr(expression);
-        self.leave_nesting();
-    }
-
-    fn visit_loop_block(&mut self, block: &'tcx Block<'tcx>) {
-        self.enter_nesting();
-        self.visit_block(block);
-        self.leave_nesting();
-    }
-
-    fn visit_while_loop(&mut self, block: &'tcx Block<'tcx>) {
-        if block.stmts.is_empty()
-            && let Some(expression) = block.expr
-            && let ExprKind::If(condition, body, _) = expression.kind
-        {
-            self.visit_expr(condition);
-            self.visit_branch(body);
-        } else {
-            self.visit_loop_block(block);
-        }
-    }
-
-    fn visit_match_arm(&mut self, arm: &'tcx Arm<'tcx>, alternative: bool) {
-        if alternative {
-            self.record(DecisionKind::MatchAlternative, arm.span);
-        }
-        self.visit_pat(arm.pat);
-        self.enter_nesting();
-        if let Some(guard) = arm.guard {
-            self.record(DecisionKind::Guard, guard.span);
-            self.visit_expr(guard);
-        }
-        self.visit_expr(arm.body);
-        self.leave_nesting();
-    }
-
-    fn visit_builtin_match(&mut self, scrutinee: &'tcx Expr<'tcx>, arms: &'tcx [Arm<'tcx>]) {
-        self.visit_expr(scrutinee);
-        for arm in arms {
-            self.visit_pat(arm.pat);
-            if let Some(guard) = arm.guard {
-                self.visit_expr(guard);
-            }
-            self.visit_expr(arm.body);
-        }
-    }
-}
-
-impl<'tcx> Visitor<'tcx> for ExpansionDecisionVisitor<'_, '_, 'tcx> {
-    fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
-        match expression.kind {
-            ExprKind::If(condition, then, otherwise) => {
-                self.record(DecisionKind::Conditional, expression.span);
-                self.visit_expr(condition);
-                self.visit_branch(then);
-                if let Some(otherwise) = otherwise {
-                    if matches!(otherwise.kind, ExprKind::If(..)) {
-                        self.visit_expr(otherwise);
-                    } else {
-                        self.visit_branch(otherwise);
-                    }
-                }
-            }
-            ExprKind::Loop(block, _, source, header_span) => {
-                let builtin_helper =
-                    source == LoopSource::Loop && header_span.desugaring_kind().is_some();
-                if builtin_helper {
-                    self.visit_block(block);
-                } else {
-                    self.record(DecisionKind::Loop, header_span);
-                    match source {
-                        LoopSource::While => self.visit_while_loop(block),
-                        LoopSource::Loop | LoopSource::ForLoop => self.visit_loop_block(block),
-                    }
-                }
-            }
-            ExprKind::Match(scrutinee, arms, source) => match source {
-                MatchSource::Normal | MatchSource::Postfix => {
-                    self.record(DecisionKind::Match, expression.span);
-                    self.visit_expr(scrutinee);
-                    for (index, arm) in arms.iter().enumerate() {
-                        self.visit_match_arm(arm, index > 0);
-                    }
-                }
-                MatchSource::TryDesugar(_) => {
-                    self.record(DecisionKind::Try, expression.span);
-                    self.visit_builtin_match(scrutinee, arms);
-                }
-                MatchSource::ForLoopDesugar
-                | MatchSource::AwaitDesugar
-                | MatchSource::FormatArgs => self.visit_builtin_match(scrutinee, arms),
-            },
-            ExprKind::Binary(operation, _, _)
-                if matches!(operation.node, BinOpKind::And | BinOpKind::Or) =>
-            {
-                self.record(DecisionKind::ShortCircuit, expression.span);
-                intravisit::walk_expr(self, expression);
-            }
-            _ => intravisit::walk_expr(self, expression),
-        }
-    }
-
-    fn visit_local(&mut self, local: &'tcx LetStmt<'tcx>) {
-        let Some(else_block) = local.els else {
-            intravisit::walk_local(self, local);
-            return;
-        };
-        self.record(DecisionKind::LetElse, local.span);
-        if let Some(initializer) = local.init {
-            self.visit_expr(initializer);
-        }
-        self.enter_nesting();
-        self.visit_block(else_block);
-        self.leave_nesting();
-    }
 }
 
 #[derive(Clone)]
@@ -1264,12 +926,7 @@ fn collect_references(
     facts: &mut CollectedFacts,
 ) {
     for local_def_id in tcx.hir_body_owners() {
-        let conceptual_owner = body_kind(tcx, local_def_id)
-            .is_some()
-            .then_some(local_def_id)
-            .or_else(|| async_fn_owner(tcx, local_def_id))
-            .unwrap_or(local_def_id);
-        let Some(source) = nearest_emitted_definition(tcx, conceptual_owner, emitted_definitions)
+        let Some(source) = nearest_emitted_definition(tcx, local_def_id, emitted_definitions)
         else {
             continue;
         };
@@ -1462,7 +1119,7 @@ fn collect_reference_roots(
                 && tcx
                     .opt_item_name(local_def_id.to_def_id())
                     .is_some_and(|name| name.as_str() == "main")
-                && expansion_provenance(tcx, tcx.def_span(*local_def_id)).origin
+                && expansion_origin(tcx.def_span(*local_def_id))
                     == ExpansionOrigin::BuiltinDesugaring
         }) {
             push_root(
@@ -1539,7 +1196,8 @@ fn collect_reference_roots(
         .bindings
         .iter()
         .filter(|binding| {
-            binding.namespace == Namespace::Macro && binding.exposure == Exposure::Direct
+            binding.namespace == BindingNamespace::Macro
+                && binding.exposure == BindingExposure::Direct
         })
         .filter_map(|binding| local_by_id.get(&binding.target).copied())
         .filter(|local_def_id| matches!(tcx.def_kind(*local_def_id), DefKind::Macro(..)))
@@ -1570,7 +1228,7 @@ fn collect_reference_roots(
                 Some(DefKind::Impl { of_trait: false })
             )
             && tcx.visibility(local_def_id.to_def_id()).is_public()
-            && effective_visibility(tcx, *local_def_id).is_some()
+            && externally_reachable(tcx, *local_def_id)
     }) {
         push_root(
             tcx,
@@ -1610,7 +1268,7 @@ fn collect_reference_roots(
             ) && matches!(
                 tcx.def_kind(tcx.local_parent(*local_def_id)),
                 DefKind::Impl { of_trait: true }
-            ) && effective_visibility(tcx, tcx.local_parent(*local_def_id)).is_some()
+            ) && externally_reachable(tcx, tcx.local_parent(*local_def_id))
         })
         .map(|local_def_id| compiler_id(tcx, local_def_id.to_def_id()))
         .collect::<BTreeSet<_>>();
@@ -1674,10 +1332,10 @@ fn collect_reference_roots(
                 .is_some_and(|import| public_import_ids.contains(&import))
                 && matches!(
                     binding.exposure,
-                    Exposure::SingleReexport
-                        | Exposure::ExternCrate
-                        | Exposure::MacroUse
-                        | Exposure::MacroExport
+                    BindingExposure::SingleReexport
+                        | BindingExposure::ExternCrate
+                        | BindingExposure::MacroUse
+                        | BindingExposure::MacroExport
                 )
         })
         .filter_map(|binding| local_by_id.get(&binding.target).copied())
@@ -1751,32 +1409,6 @@ fn push_root(
 }
 
 fn sort_and_identify_facts(facts: &mut CollectedFacts) {
-    facts.bodies.sort_by(|left, right| {
-        (
-            left.compiler_id,
-            left.kind,
-            &left.definition_path,
-            &left.span,
-            &left.attribution_callsite,
-            left.expansion_origin,
-            left.macro_kind,
-            left.macro_definition,
-        )
-            .cmp(&(
-                right.compiler_id,
-                right.kind,
-                &right.definition_path,
-                &right.span,
-                &right.attribution_callsite,
-                right.expansion_origin,
-                right.macro_kind,
-                right.macro_definition,
-            ))
-    });
-    for (index, body) in facts.bodies.iter_mut().enumerate() {
-        body.id = FactId(format!("body-{index}"));
-    }
-
     facts.definitions.sort_by(|left, right| {
         (
             left.compiler_id,
@@ -1801,39 +1433,6 @@ fn sort_and_identify_facts(facts: &mut CollectedFacts) {
     });
     for (index, definition) in facts.definitions.iter_mut().enumerate() {
         definition.id = FactId(format!("definition-{index}"));
-    }
-
-    facts.bindings.sort_by(|left, right| {
-        (
-            left.parent,
-            left.target,
-            &left.name,
-            left.namespace,
-            left.exposure,
-            left.exposing_import,
-            &left.span,
-        )
-            .cmp(&(
-                right.parent,
-                right.target,
-                &right.name,
-                right.namespace,
-                right.exposure,
-                right.exposing_import,
-                &right.span,
-            ))
-    });
-    facts.bindings.dedup_by(|left, right| {
-        left.parent == right.parent
-            && left.target == right.target
-            && left.name == right.name
-            && left.namespace == right.namespace
-            && left.exposure == right.exposure
-            && left.exposing_import == right.exposing_import
-            && left.span == right.span
-    });
-    for (index, binding) in facts.bindings.iter_mut().enumerate() {
-        binding.id = FactId(format!("binding-{index}"));
     }
 
     facts.roots.sort_by(|left, right| {
@@ -1874,62 +1473,17 @@ fn sort_and_identify_facts(facts: &mut CollectedFacts) {
     for (index, reference) in facts.references.iter_mut().enumerate() {
         reference.id = FactId(format!("reference-{index}"));
     }
-
-    facts.decisions.sort_by(|left, right| {
-        (
-            left.body,
-            &left.attribution_callsite,
-            left.expansion_origin,
-            left.macro_kind,
-            left.macro_definition,
-            &left.generated_span,
-            left.kind,
-            left.nesting,
-        )
-            .cmp(&(
-                right.body,
-                &right.attribution_callsite,
-                right.expansion_origin,
-                right.macro_kind,
-                right.macro_definition,
-                &right.generated_span,
-                right.kind,
-                right.nesting,
-            ))
-    });
-    let mut previous_group = None;
-    let mut next_ordinal = 0_u32;
-    for (index, decision) in facts.decisions.iter_mut().enumerate() {
-        let group = DecisionGroup {
-            body: decision.body,
-            attribution_callsite: decision.attribution_callsite.clone(),
-            expansion_origin: decision.expansion_origin,
-            macro_kind: decision.macro_kind,
-            macro_definition: decision.macro_definition,
-        };
-        if previous_group.as_ref() != Some(&group) {
-            previous_group = Some(group);
-            next_ordinal = 0;
-        }
-        decision.ordinal = next_ordinal;
-        next_ordinal = next_ordinal
-            .checked_add(1)
-            .expect("one macro invocation cannot exhaust decision ordinals");
-        decision.id = FactId(format!("decision-{index}"));
-    }
 }
 
-fn collect_public_bindings(
+fn collect_visibility_bindings(
     tcx: TyCtxt<'_>,
-    generated_roots: &[GeneratedRoot],
     local_definitions: &[LocalDefId],
     facts: &mut CollectedFacts,
 ) {
     for module in local_definitions.iter().copied().filter(|definition| {
         tcx.def_kind(*definition) == DefKind::Mod
-            && (*definition == CRATE_DEF_ID || effective_visibility(tcx, *definition).is_some())
+            && (*definition == CRATE_DEF_ID || externally_reachable(tcx, *definition))
     }) {
-        let parent = compiler_id(tcx, module.to_def_id());
         for child in tcx.module_children_local(module) {
             if !child.vis.is_public() {
                 continue;
@@ -1939,35 +1493,19 @@ fn collect_public_bindings(
             };
             if target
                 .as_local()
-                .is_some_and(|target| effective_visibility(tcx, target).is_none())
+                .is_some_and(|target| !externally_reachable(tcx, target))
             {
                 continue;
             }
-            let Some(namespace) = namespace(kind) else {
+            let Some(namespace) = binding_namespace(kind) else {
                 continue;
             };
-            let (exposure, exposing_import) = exposure(tcx, child.reexport_chain.first());
-            let attribution = span_attribution(tcx, child.ident.span, generated_roots);
-            let located_span = attribution.span.as_ref().or(attribution.callsite.as_ref());
-            if let Some(located_span) = located_span {
-                facts.remember_span(
-                    located_span,
-                    SourceOwners {
-                        effective_api: true,
-                        ..SourceOwners::default()
-                    },
-                );
-            }
-            let span = located_span.map(|span| span.span.clone());
-            facts.bindings.push(PublicBinding {
-                id: FactId(String::new()),
-                parent,
+            let (exposure, exposing_import) = binding_exposure(tcx, child.reexport_chain.first());
+            facts.bindings.push(VisibilityBinding {
                 target: compiler_id(tcx, target),
-                name: child.ident.name.to_string(),
                 namespace,
                 exposure,
                 exposing_import,
-                span,
             });
         }
     }
@@ -2065,31 +1603,21 @@ fn visibility_editable(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
     }
 }
 
-fn effective_visibility(
-    tcx: TyCtxt<'_>,
-    local_def_id: LocalDefId,
-) -> Option<EffectiveVisibilityLevel> {
+fn externally_reachable(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
     tcx.effective_visibilities(())
         .public_at_level(local_def_id)
-        .map(|level| match level {
-            VisibilityLevel::Direct => EffectiveVisibilityLevel::Direct,
-            VisibilityLevel::Reexported => EffectiveVisibilityLevel::Reexported,
-            VisibilityLevel::Reachable => EffectiveVisibilityLevel::Reachable,
-            VisibilityLevel::ReachableThroughImplTrait => {
-                EffectiveVisibilityLevel::ReachableThroughImplTrait
-            }
-        })
+        .is_some()
 }
 
-fn namespace(kind: DefKind) -> Option<Namespace> {
+fn binding_namespace(kind: DefKind) -> Option<BindingNamespace> {
     match kind {
-        DefKind::Macro(..) => Some(Namespace::Macro),
+        DefKind::Macro(..) => Some(BindingNamespace::Macro),
         DefKind::Fn
         | DefKind::Const { .. }
         | DefKind::Static { .. }
         | DefKind::Ctor(..)
         | DefKind::AssocFn
-        | DefKind::AssocConst { .. } => Some(Namespace::Value),
+        | DefKind::AssocConst { .. } => Some(BindingNamespace::Value),
         DefKind::Mod
         | DefKind::Struct
         | DefKind::Union
@@ -2102,7 +1630,7 @@ fn namespace(kind: DefKind) -> Option<Namespace> {
         | DefKind::AssocTy
         | DefKind::ExternCrate
         | DefKind::ForeignMod
-        | DefKind::OpaqueTy => Some(Namespace::Type),
+        | DefKind::OpaqueTy => Some(BindingNamespace::Type),
         DefKind::TyParam
         | DefKind::ConstParam
         | DefKind::Use
@@ -2117,18 +1645,26 @@ fn namespace(kind: DefKind) -> Option<Namespace> {
     }
 }
 
-fn exposure(tcx: TyCtxt<'_>, reexport: Option<&Reexport>) -> (Exposure, Option<CompilerDefId>) {
+fn binding_exposure(
+    tcx: TyCtxt<'_>,
+    reexport: Option<&Reexport>,
+) -> (BindingExposure, Option<CompilerDefId>) {
     match reexport {
-        None => (Exposure::Direct, None),
-        Some(Reexport::Single(import)) => {
-            (Exposure::SingleReexport, Some(compiler_id(tcx, *import)))
-        }
-        Some(Reexport::Glob(import)) => (Exposure::GlobReexport, Some(compiler_id(tcx, *import))),
-        Some(Reexport::ExternCrate(import)) => {
-            (Exposure::ExternCrate, Some(compiler_id(tcx, *import)))
-        }
-        Some(Reexport::MacroUse) => (Exposure::MacroUse, None),
-        Some(Reexport::MacroExport) => (Exposure::MacroExport, None),
+        None => (BindingExposure::Direct, None),
+        Some(Reexport::Single(import)) => (
+            BindingExposure::SingleReexport,
+            Some(compiler_id(tcx, *import)),
+        ),
+        Some(Reexport::Glob(import)) => (
+            BindingExposure::GlobReexport,
+            Some(compiler_id(tcx, *import)),
+        ),
+        Some(Reexport::ExternCrate(import)) => (
+            BindingExposure::ExternCrate,
+            Some(compiler_id(tcx, *import)),
+        ),
+        Some(Reexport::MacroUse) => (BindingExposure::MacroUse, None),
+        Some(Reexport::MacroExport) => (BindingExposure::MacroExport, None),
     }
 }
 
@@ -2197,77 +1733,17 @@ fn profile(tcx: TyCtxt<'_>) -> Profile {
     }
 }
 
-fn body_kind(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> Option<BodyKind> {
-    match tcx.def_kind(local_def_id) {
-        DefKind::Fn => Some(BodyKind::Function),
-        DefKind::AssocFn => Some(BodyKind::AssociatedFunction),
-        DefKind::Const { .. } => Some(BodyKind::Constant),
-        DefKind::AssocConst { .. } => Some(BodyKind::AssociatedConstant),
-        DefKind::Static { .. } => Some(BodyKind::Static),
-        DefKind::Closure
-            if !tcx
-                .coroutine_kind(local_def_id)
-                .is_some_and(CoroutineKind::is_fn_like) =>
-        {
-            Some(BodyKind::Closure)
-        }
-        DefKind::AnonConst
-            if tcx.anon_const_kind(local_def_id) == ty::AnonConstKind::NonTypeSystemInline =>
-        {
-            Some(BodyKind::InlineConstant)
-        }
-        DefKind::Mod
-        | DefKind::Struct
-        | DefKind::Union
-        | DefKind::Enum
-        | DefKind::Variant
-        | DefKind::Trait
-        | DefKind::TyAlias
-        | DefKind::ForeignTy
-        | DefKind::TraitAlias
-        | DefKind::AssocTy
-        | DefKind::TyParam
-        | DefKind::ConstParam
-        | DefKind::Ctor(..)
-        | DefKind::Macro(..)
-        | DefKind::ExternCrate
-        | DefKind::Use
-        | DefKind::ForeignMod
-        | DefKind::OpaqueTy
-        | DefKind::Field
-        | DefKind::LifetimeParam
-        | DefKind::AnonConst
-        | DefKind::GlobalAsm
-        | DefKind::Impl { .. }
-        | DefKind::Closure
-        | DefKind::SyntheticCoroutineBody
-        | DefKind::TestBinderConstraints => None,
-    }
-}
-
-fn async_fn_owner(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> Option<LocalDefId> {
-    if tcx.def_kind(local_def_id) != DefKind::Closure
-        || !tcx
-            .coroutine_kind(local_def_id)
-            .is_some_and(CoroutineKind::is_fn_like)
-    {
-        return None;
-    }
-    let parent = tcx.opt_local_parent(local_def_id)?;
-    matches!(tcx.def_kind(parent), DefKind::Fn | DefKind::AssocFn).then_some(parent)
-}
-
 fn span_attribution(
     tcx: TyCtxt<'_>,
     span: Span,
     generated_roots: &[GeneratedRoot],
 ) -> SpanAttribution {
-    let provenance = expansion_provenance(tcx, span);
+    let origin = expansion_origin(span);
     let raw = source_span(tcx, span, generated_roots);
-    let callsite = (provenance.origin != ExpansionOrigin::Authored)
+    let callsite = (origin != ExpansionOrigin::Authored)
         .then(|| source_span(tcx, span.source_callsite(), generated_roots))
         .flatten();
-    let raw_is_trustworthy = provenance.origin == ExpansionOrigin::Authored
+    let raw_is_trustworthy = origin == ExpansionOrigin::Authored
         || raw.as_ref().is_some_and(|raw| {
             raw.source.generated
                 || callsite
@@ -2278,40 +1754,13 @@ fn span_attribution(
     SpanAttribution {
         span: raw_is_trustworthy.then_some(raw).flatten(),
         callsite,
-        provenance,
-    }
-}
-
-fn macro_span_attribution(
-    tcx: TyCtxt<'_>,
-    span: Span,
-    generated_roots: &[GeneratedRoot],
-) -> SpanAttribution {
-    let provenance = expansion_provenance(tcx, span);
-    let callsite = is_macro_origin(provenance.origin)
-        .then(|| source_span(tcx, span.source_callsite(), generated_roots))
-        .flatten();
-    SpanAttribution {
-        span: source_span(tcx, span, generated_roots),
-        callsite,
-        provenance,
-    }
-}
-
-fn is_macro_origin(origin: ExpansionOrigin) -> bool {
-    matches!(
         origin,
-        ExpansionOrigin::LocalMacro | ExpansionOrigin::ExternalMacro
-    )
+    }
 }
 
-fn expansion_provenance(tcx: TyCtxt<'_>, span: Span) -> ExpansionProvenance {
+fn expansion_origin(span: Span) -> ExpansionOrigin {
     if span.ctxt().is_root() {
-        return ExpansionProvenance {
-            origin: ExpansionOrigin::Authored,
-            macro_kind: None,
-            macro_definition: None,
-        };
+        return ExpansionOrigin::Authored;
     }
 
     let mut current = span;
@@ -2319,24 +1768,13 @@ fn expansion_provenance(tcx: TyCtxt<'_>, span: Span) -> ExpansionProvenance {
     while !current.ctxt().is_root() {
         let expansion = current.ctxt().outer_expn_data();
         match expansion.kind {
-            ExpnKind::Macro(kind, _) => {
-                let macro_definition = expansion
-                    .macro_def_id
-                    .map(|definition| compiler_id(tcx, definition));
+            ExpnKind::Macro(..) => {
                 let origin = if expansion.macro_def_id.is_some_and(DefId::is_local) {
                     ExpansionOrigin::LocalMacro
                 } else {
                     ExpansionOrigin::ExternalMacro
                 };
-                return ExpansionProvenance {
-                    origin,
-                    macro_kind: Some(match kind {
-                        RustcMacroKind::Bang => MacroKind::Bang,
-                        RustcMacroKind::Attr => MacroKind::Attribute,
-                        RustcMacroKind::Derive => MacroKind::Derive,
-                    }),
-                    macro_definition,
-                };
+                return origin;
             }
             ExpnKind::AstPass(..) | ExpnKind::Desugaring(..) => builtin_desugaring = true,
             ExpnKind::Root => {}
@@ -2345,17 +1783,9 @@ fn expansion_provenance(tcx: TyCtxt<'_>, span: Span) -> ExpansionProvenance {
     }
 
     if builtin_desugaring {
-        ExpansionProvenance {
-            origin: ExpansionOrigin::BuiltinDesugaring,
-            macro_kind: None,
-            macro_definition: None,
-        }
+        ExpansionOrigin::BuiltinDesugaring
     } else {
-        ExpansionProvenance {
-            origin: ExpansionOrigin::Authored,
-            macro_kind: None,
-            macro_definition: None,
-        }
+        ExpansionOrigin::Authored
     }
 }
 
@@ -2408,10 +1838,13 @@ fn source_span(
         source_hash,
         byte_len: file.unnormalized_source_len,
     };
+    let location = source_map.lookup_char_pos(span.lo());
     let source_span = SourceSpan {
         file: key,
         start: file.original_relative_byte_pos(span.lo()).to_u32(),
         end: file.original_relative_byte_pos(span.hi()).to_u32(),
+        line: location.line.try_into().ok()?,
+        column: location.col.to_usize().checked_add(1)?.try_into().ok()?,
     };
     Some(LocatedSpan {
         source,
@@ -2790,28 +2223,19 @@ mod tests {
     }
 
     #[test]
-    fn product_progress_is_local_to_rejected_facts() {
-        let mut hir = ProductProgress::default();
-        let mut api = ProductProgress::default();
-        let mut references = ProductProgress::default();
+    fn visibility_audit_progress_is_atomic() {
+        let mut audit = ProductProgress::default();
 
-        assert_eq!(hir.availability(), Availability::Unavailable);
-        hir.start();
-        api.start();
-        hir.reject();
+        assert_eq!(audit.availability(), Availability::Unavailable);
+        audit.start();
+        assert_eq!(audit.availability(), Availability::Complete);
+        audit.reject();
 
-        assert_eq!(hir.availability(), Availability::Partial);
-        assert_eq!(api.availability(), Availability::Complete);
+        assert_eq!(audit.availability(), Availability::Partial);
         assert_eq!(
-            product_message(&hir).as_deref(),
+            product_message(&audit).as_deref(),
             Some("compiler facts were truncated by the sidecar limit")
         );
-        assert_eq!(product_message(&api), None);
-
-        references.reject();
-        assert_eq!(references.availability(), Availability::Unavailable);
-        references.start();
-        assert_eq!(references.availability(), Availability::Partial);
     }
 
     #[test]

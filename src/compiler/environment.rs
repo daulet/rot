@@ -13,7 +13,7 @@ use rot_compiler_protocol::{
 };
 use tempfile::{Builder, TempDir};
 
-use crate::cli::Cli;
+use crate::cli::AuditCli;
 
 pub const TOOLCHAIN: &str = "nightly-2026-08-27";
 
@@ -31,9 +31,9 @@ pub struct ArtifactDirs {
 }
 
 impl CompilerEnvironment {
-    pub fn discover(cli: &Cli, workspace: &Path) -> Result<Self> {
+    pub fn discover(cli: &AuditCli, workspace: &Path) -> Result<Self> {
         reject_compiler_overrides(workspace)?;
-        let artifacts = ArtifactDirs::new(cli.compiler_target_dir.as_deref())?;
+        let artifacts = ArtifactDirs::new(cli.scratch_dir.as_deref())?;
         let verbose = pinned_output(workspace, "rustc", ["-Vv"])?;
         if !verbose.status.success() {
             bail!(
@@ -87,7 +87,7 @@ impl CompilerEnvironment {
         &self,
         workspace: &Path,
         driver: &Path,
-        cli: &Cli,
+        cli: &AuditCli,
         target: &str,
         selected_manifest_dirs: &OsStr,
     ) -> Result<Command> {
@@ -153,7 +153,7 @@ impl CompilerEnvironment {
     }
 }
 
-pub(super) fn effective_target(cli: &Cli, workspace: &Path) -> Result<String> {
+pub(super) fn effective_target(cli: &AuditCli, workspace: &Path) -> Result<String> {
     if let Some(target) = &cli.target {
         return Ok(target.clone());
     }
@@ -183,7 +183,7 @@ fn configured_target(value: serde_json::Value) -> Result<String> {
             .map(str::to_owned)
             .context("Cargo build.target contains an empty or non-string target"),
         serde_json::Value::Array(targets) => bail!(
-            "compiler mode requires one effective Cargo build.target, found {}",
+            "visibility audit requires one effective Cargo build.target, found {}",
             targets.len()
         ),
         _ => bail!("Cargo build.target is neither a target string nor an array"),
@@ -232,7 +232,7 @@ impl ArtifactDirs {
 pub(super) fn reject_compiler_overrides(workspace: &Path) -> Result<()> {
     for variable in ["RUSTC", "CARGO_BUILD_RUSTC"] {
         if env::var_os(variable).is_some() {
-            bail!("compiler mode rejects {variable}; it must use the exact pinned rustc");
+            bail!("visibility audit rejects {variable}; it must use the exact pinned rustc");
         }
     }
     for variable in [
@@ -240,12 +240,12 @@ pub(super) fn reject_compiler_overrides(workspace: &Path) -> Result<()> {
         "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
     ] {
         if env::var_os(variable).is_some_and(|value| !value.is_empty()) {
-            bail!("compiler mode cannot compose the existing workspace wrapper in {variable}");
+            bail!("visibility audit cannot compose the existing workspace wrapper in {variable}");
         }
     }
     for key in ["build.rustc", "build.rustc-workspace-wrapper"] {
         if let Some(value) = cargo_config(workspace, key)? {
-            bail!("compiler mode rejects Cargo {key}={value:?}");
+            bail!("visibility audit rejects Cargo {key}={value:?}");
         }
     }
     Ok(())

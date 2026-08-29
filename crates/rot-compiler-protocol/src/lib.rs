@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
-pub const DRIVER_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const DRIVER_VERSION: u32 = 4;
 pub const PINNED_RUSTC_RELEASE: &str = "1.100.0-nightly";
 pub const PINNED_RUSTC_COMMIT: &str = "bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed";
 pub const PINNED_RUSTC_COMMIT_DATE: &str = "2026-08-26";
@@ -77,12 +77,9 @@ pub enum Event {
     InvocationStarted(InvocationStarted),
     Profile(Profile),
     SourceFile(SourceFile),
-    Body(Body),
     Definition(Definition),
-    PublicBinding(PublicBinding),
     Root(Root),
     Reference(Reference),
-    Decision(Decision),
     ProductStatus(ProductStatus),
     Diagnostic(Diagnostic),
     InvocationFinished(InvocationFinished),
@@ -187,31 +184,10 @@ pub struct SourceSpan {
     pub file: SourceFileKey,
     pub start: u32,
     pub end: u32,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Body {
-    pub id: FactId,
-    pub compiler_id: CompilerDefId,
-    pub definition_path: String,
-    pub kind: BodyKind,
-    pub span: Option<SourceSpan>,
-    pub attribution_callsite: Option<SourceSpan>,
-    pub expansion_origin: ExpansionOrigin,
-    pub macro_kind: Option<MacroKind>,
-    pub macro_definition: Option<CompilerDefId>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BodyKind {
-    Function,
-    AssociatedFunction,
-    Constant,
-    AssociatedConstant,
-    Static,
-    Closure,
-    InlineConstant,
+    /// One-based source line containing `start`.
+    pub line: u32,
+    /// One-based Unicode scalar column containing `start`.
+    pub column: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -224,7 +200,7 @@ pub struct Definition {
     pub kind: DefinitionKind,
     pub visibility_editable: bool,
     pub nominal_visibility: NominalVisibility,
-    pub effective_public_at: Option<EffectiveVisibilityLevel>,
+    pub externally_reachable: bool,
     pub span: Option<SourceSpan>,
     pub attribution_callsite: Option<SourceSpan>,
     pub expansion_origin: ExpansionOrigin,
@@ -268,59 +244,11 @@ pub enum NominalVisibility {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EffectiveVisibilityLevel {
-    Direct,
-    Reexported,
-    Reachable,
-    ReachableThroughImplTrait,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ExpansionOrigin {
     Authored,
     BuiltinDesugaring,
     LocalMacro,
     ExternalMacro,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MacroKind {
-    Bang,
-    Attribute,
-    Derive,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PublicBinding {
-    pub id: FactId,
-    pub parent: CompilerDefId,
-    pub target: CompilerDefId,
-    pub name: String,
-    pub namespace: Namespace,
-    pub exposure: Exposure,
-    pub exposing_import: Option<CompilerDefId>,
-    pub span: Option<SourceSpan>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Namespace {
-    Type,
-    Value,
-    Macro,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Exposure {
-    Direct,
-    SingleReexport,
-    GlobReexport,
-    ExternCrate,
-    MacroUse,
-    MacroExport,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -359,33 +287,6 @@ pub enum ReferenceKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Decision {
-    pub id: FactId,
-    pub body: CompilerDefId,
-    pub kind: DecisionKind,
-    pub generated_span: Option<SourceSpan>,
-    pub attribution_callsite: Option<SourceSpan>,
-    pub expansion_origin: ExpansionOrigin,
-    pub macro_kind: MacroKind,
-    pub macro_definition: Option<CompilerDefId>,
-    pub ordinal: u32,
-    pub nesting: u32,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionKind {
-    Conditional,
-    Loop,
-    Match,
-    MatchAlternative,
-    Guard,
-    ShortCircuit,
-    Try,
-    LetElse,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProductStatus {
     pub product: Product,
     pub availability: Availability,
@@ -395,10 +296,7 @@ pub struct ProductStatus {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Product {
-    HirBodies,
-    EffectiveApi,
-    References,
-    ExpansionDecisions,
+    VisibilityAudit,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -457,7 +355,7 @@ mod tests {
             invocation_id: InvocationId("invocation".to_owned()),
             sequence: 4,
             event: Event::ProductStatus(ProductStatus {
-                product: Product::EffectiveApi,
+                product: Product::VisibilityAudit,
                 availability: Availability::Complete,
                 message: None,
             }),
@@ -466,6 +364,7 @@ mod tests {
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(encoded.contains(&format!("\"protocol_version\":{PROTOCOL_VERSION}")));
         assert!(encoded.contains("\"event\":\"product_status\""));
+        assert!(encoded.contains("\"product\":\"visibility_audit\""));
         assert_eq!(serde_json::from_str::<Record>(&encoded).unwrap(), record);
     }
 
@@ -528,27 +427,6 @@ mod tests {
     }
 
     #[test]
-    fn public_binding_is_one_finite_namespace_edge() {
-        let binding = PublicBinding {
-            id: FactId("binding-0".to_owned()),
-            parent: compiler_id(1, 2),
-            target: compiler_id(1, 3),
-            name: "Alias".to_owned(),
-            namespace: Namespace::Type,
-            exposure: Exposure::GlobReexport,
-            exposing_import: Some(compiler_id(1, 4)),
-            span: None,
-        };
-
-        let encoded = serde_json::to_string(&binding).unwrap();
-        assert!(!encoded.contains("segments"));
-        assert_eq!(
-            serde_json::from_str::<PublicBinding>(&encoded).unwrap(),
-            binding
-        );
-    }
-
-    #[test]
     fn source_identity_names_its_hash_algorithm() {
         let source = SourceFile {
             key: SourceFileKey("source".to_owned()),
@@ -569,26 +447,17 @@ mod tests {
     }
 
     #[test]
-    fn expansion_decision_retains_macro_identity_and_ordinal() {
-        let decision = Decision {
-            id: FactId("decision-0".to_owned()),
-            body: compiler_id(1, 2),
-            kind: DecisionKind::ShortCircuit,
-            generated_span: None,
-            attribution_callsite: None,
-            expansion_origin: ExpansionOrigin::ExternalMacro,
-            macro_kind: MacroKind::Derive,
-            macro_definition: Some(compiler_id(3, 4)),
-            ordinal: 2,
-            nesting: 1,
+    fn source_spans_include_one_based_locations() {
+        let span = SourceSpan {
+            file: SourceFileKey("source".to_owned()),
+            start: 41,
+            end: 47,
+            line: 3,
+            column: 5,
         };
 
-        let encoded = serde_json::to_string(&decision).unwrap();
-        assert!(encoded.contains(r#""macro_kind":"derive""#));
-        assert!(encoded.contains(r#""ordinal":2"#));
-        assert_eq!(
-            serde_json::from_str::<Decision>(&encoded).unwrap(),
-            decision
-        );
+        let encoded = serde_json::to_string(&span).unwrap();
+        assert!(encoded.contains(r#""line":3,"column":5"#));
+        assert_eq!(serde_json::from_str::<SourceSpan>(&encoded).unwrap(), span);
     }
 }

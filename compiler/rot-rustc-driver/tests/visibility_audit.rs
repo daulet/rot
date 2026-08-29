@@ -7,121 +7,15 @@ use std::{
 };
 
 use rot_compiler_protocol::{
-    Availability, CompilationContext, DecisionKind, Definition, DefinitionKind,
-    EffectiveVisibilityLevel, Event, ExpansionOrigin, Exposure, MacroKind, Namespace, Product,
+    Availability, CompilationContext, Definition, DefinitionKind, Event, ExpansionOrigin, Product,
     RUN_ID_ENV, Record, ReferenceKind, RootKind, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV,
 };
 
 static NEXT_TEMPORARY_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
-fn macro_decisions_are_normalized_and_nested_bodies_are_independent() {
-    let records = collect_fixture("macro_expansion");
-    let bodies = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Body(body) => Some(body),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let body_paths = bodies
-        .iter()
-        .map(|body| (body.compiler_id, body.definition_path.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let macro_body_paths = bodies
-        .iter()
-        .filter(|body| is_macro_origin(body.expansion_origin))
-        .map(|body| body.definition_path.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        macro_body_paths,
-        [
-            "generated",
-            "async_generated",
-            "generated::{closure#0}",
-            "<Derived as std::cmp::PartialEq>::eq",
-        ]
-    );
-    assert!(bodies.iter().any(|body| {
-        body.definition_path == "authored"
-            && body.expansion_origin == ExpansionOrigin::Authored
-            && body.macro_kind.is_none()
-            && body.macro_definition.is_none()
-    }));
-    assert!(
-        !bodies
-            .iter()
-            .any(|body| body.definition_path == "async_generated::{closure#0}")
-    );
-
-    let decisions = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Decision(decision) => Some(decision),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(decisions.len(), 19);
-    assert!(decisions.iter().all(|decision| {
-        is_macro_origin(decision.expansion_origin) && decision.attribution_callsite.is_some()
-    }));
-
-    let mut decisions_by_body = BTreeMap::<&str, Vec<_>>::new();
-    for decision in &decisions {
-        decisions_by_body
-            .entry(body_paths[&decision.body])
-            .or_default()
-            .push(*decision);
-    }
-    let generated = &decisions_by_body["generated"];
-    assert_eq!(generated.len(), 15);
-    assert_eq!(
-        kind_counts(generated),
-        [
-            (DecisionKind::Conditional, 4),
-            (DecisionKind::Loop, 3),
-            (DecisionKind::Match, 1),
-            (DecisionKind::MatchAlternative, 2),
-            (DecisionKind::Guard, 1),
-            (DecisionKind::ShortCircuit, 2),
-            (DecisionKind::Try, 1),
-            (DecisionKind::LetElse, 1),
-        ]
-    );
-    assert_eq!(
-        generated
-            .iter()
-            .filter(|decision| decision.kind == DecisionKind::Conditional && decision.nesting == 1)
-            .count(),
-        2
-    );
-    assert_eq!(decisions_by_body["generated::{closure#0}"].len(), 1);
-    assert_eq!(decisions_by_body["authored"].len(), 1);
-    assert_eq!(
-        decisions_by_body["async_generated"]
-            .iter()
-            .map(|decision| decision.kind)
-            .collect::<Vec<_>>(),
-        [DecisionKind::Conditional]
-    );
-    assert_eq!(
-        decisions_by_body["<Derived as std::cmp::PartialEq>::eq"]
-            .iter()
-            .map(|decision| (decision.kind, decision.macro_kind))
-            .collect::<Vec<_>>(),
-        [(DecisionKind::ShortCircuit, MacroKind::Derive)]
-    );
-    assert_contiguous_group_ordinals(&decisions);
-    assert_product(
-        &records,
-        Product::ExpansionDecisions,
-        Availability::Complete,
-    );
-}
-
-#[test]
-fn effective_api_events_are_finite_complete_and_source_honest() {
-    let records = collect_fixture("effective_api");
+fn visibility_definitions_are_complete_and_source_honest() {
+    let records = collect_fixture("visibility_definitions");
     let definitions = records
         .iter()
         .filter_map(|record| match &record.event {
@@ -129,217 +23,6 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let definitions_by_id = definitions
-        .iter()
-        .map(|definition| (definition.compiler_id, *definition))
-        .collect::<BTreeMap<_, _>>();
-    let bindings = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::PublicBinding(binding) => Some(binding),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let binding_facts = bindings
-        .iter()
-        .map(|binding| {
-            let parent = definitions_by_id[&binding.parent].definition_path.as_str();
-            let target = definitions_by_id
-                .get(&binding.target)
-                .map(|definition| (definition.definition_path.as_str(), definition.kind));
-            (
-                parent,
-                binding.name.as_str(),
-                binding.namespace,
-                binding.exposure,
-                target,
-            )
-        })
-        .collect::<BTreeSet<_>>();
-
-    assert_eq!(bindings.len(), 24, "public bindings must remain finite");
-    assert_eq!(
-        binding_facts.len(),
-        bindings.len(),
-        "duplicate binding event"
-    );
-    assert_eq!(
-        binding_facts,
-        BTreeSet::from([
-            (
-                "",
-                "Choice",
-                Namespace::Type,
-                Exposure::SingleReexport,
-                Some(("hidden::Choice", DefinitionKind::Enum)),
-            ),
-            (
-                "",
-                "Contract",
-                Namespace::Type,
-                Exposure::SingleReexport,
-                Some(("hidden::Contract", DefinitionKind::Trait)),
-            ),
-            (
-                "",
-                "Renamed",
-                Namespace::Type,
-                Exposure::SingleReexport,
-                Some(("hidden::Named", DefinitionKind::Struct)),
-            ),
-            (
-                "",
-                "Globbed",
-                Namespace::Type,
-                Exposure::GlobReexport,
-                Some(("hidden::globbed::Globbed", DefinitionKind::Struct)),
-            ),
-            (
-                "",
-                "Globbed",
-                Namespace::Value,
-                Exposure::GlobReexport,
-                Some(("hidden::globbed::Globbed", DefinitionKind::Constructor)),
-            ),
-            (
-                "",
-                "globbed_function",
-                Namespace::Value,
-                Exposure::GlobReexport,
-                Some((
-                    "hidden::globbed::globbed_function",
-                    DefinitionKind::Function,
-                )),
-            ),
-            (
-                "",
-                "ExternalDebug",
-                Namespace::Type,
-                Exposure::SingleReexport,
-                None,
-            ),
-            (
-                "",
-                "ExternalDebug",
-                Namespace::Macro,
-                Exposure::SingleReexport,
-                None,
-            ),
-            (
-                "",
-                "cycle_a",
-                Namespace::Type,
-                Exposure::Direct,
-                Some(("cycle_a", DefinitionKind::Module)),
-            ),
-            (
-                "",
-                "cycle_b",
-                Namespace::Type,
-                Exposure::Direct,
-                Some(("cycle_b", DefinitionKind::Module)),
-            ),
-            (
-                "",
-                "Generated",
-                Namespace::Type,
-                Exposure::Direct,
-                Some(("Generated", DefinitionKind::Struct)),
-            ),
-            (
-                "",
-                "Generated",
-                Namespace::Value,
-                Exposure::Direct,
-                Some(("Generated", DefinitionKind::Constructor)),
-            ),
-            (
-                "",
-                "exported_macro",
-                Namespace::Macro,
-                Exposure::MacroExport,
-                Some(("exported_macro", DefinitionKind::Macro)),
-            ),
-            (
-                "",
-                "CONSTANT",
-                Namespace::Value,
-                Exposure::Direct,
-                Some(("CONSTANT", DefinitionKind::Constant)),
-            ),
-            (
-                "",
-                "STATIC",
-                Namespace::Value,
-                Exposure::Direct,
-                Some(("STATIC", DefinitionKind::Static)),
-            ),
-            (
-                "",
-                "body_shapes",
-                Namespace::Value,
-                Exposure::Direct,
-                Some(("body_shapes", DefinitionKind::Function)),
-            ),
-            (
-                "cycle_a",
-                "A",
-                Namespace::Type,
-                Exposure::Direct,
-                Some(("cycle_a::A", DefinitionKind::Struct)),
-            ),
-            (
-                "cycle_a",
-                "A",
-                Namespace::Value,
-                Exposure::Direct,
-                Some(("cycle_a::A", DefinitionKind::Constructor)),
-            ),
-            (
-                "cycle_a",
-                "B",
-                Namespace::Type,
-                Exposure::SingleReexport,
-                Some(("cycle_b::B", DefinitionKind::Struct)),
-            ),
-            (
-                "cycle_a",
-                "B",
-                Namespace::Value,
-                Exposure::SingleReexport,
-                Some(("cycle_b::B", DefinitionKind::Constructor)),
-            ),
-            (
-                "cycle_b",
-                "A",
-                Namespace::Type,
-                Exposure::SingleReexport,
-                Some(("cycle_a::A", DefinitionKind::Struct)),
-            ),
-            (
-                "cycle_b",
-                "A",
-                Namespace::Value,
-                Exposure::SingleReexport,
-                Some(("cycle_a::A", DefinitionKind::Constructor)),
-            ),
-            (
-                "cycle_b",
-                "B",
-                Namespace::Type,
-                Exposure::Direct,
-                Some(("cycle_b::B", DefinitionKind::Struct)),
-            ),
-            (
-                "cycle_b",
-                "B",
-                Namespace::Value,
-                Exposure::Direct,
-                Some(("cycle_b::B", DefinitionKind::Constructor)),
-            ),
-        ])
-    );
-
     assert_eq!(
         definition_kinds(&definitions, "hidden::Choice::Unit"),
         BTreeSet::from([DefinitionKind::Variant, DefinitionKind::Constructor])
@@ -358,20 +41,18 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
         "hidden::Choice::Record::visible",
         "hidden::Choice::Record::hidden",
     ] {
-        assert_eq!(
-            find_definition(&definitions, field, DefinitionKind::Field).effective_public_at,
-            Some(EffectiveVisibilityLevel::Reexported),
+        assert!(
+            find_definition(&definitions, field, DefinitionKind::Field).externally_reachable,
             "public ADT field {field} must be part of the effective API"
         );
     }
-    assert_eq!(
-        find_definition(
+    assert!(
+        !find_definition(
             &definitions,
             "hidden::Named::private",
             DefinitionKind::Field,
         )
-        .effective_public_at,
-        None
+        .externally_reachable
     );
 
     for (path, kind) in [
@@ -395,9 +76,8 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
         ),
     ] {
         let definition = find_definition(&definitions, path, kind);
-        assert_eq!(
-            definition.effective_public_at,
-            Some(EffectiveVisibilityLevel::Reexported),
+        assert!(
+            definition.externally_reachable,
             "trait-associated API item {path} must inherit reexport exposure"
         );
         assert!(
@@ -410,24 +90,21 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
         "hidden::Named::exposed",
         DefinitionKind::AssociatedFunction,
     );
-    assert_eq!(
-        exposed.effective_public_at,
-        Some(EffectiveVisibilityLevel::Reexported)
-    );
+    assert!(exposed.externally_reachable);
     assert!(exposed.visibility_editable);
     let private = find_definition(
         &definitions,
         "hidden::Named::private",
         DefinitionKind::AssociatedFunction,
     );
-    assert_eq!(private.effective_public_at, None);
+    assert!(!private.externally_reachable);
     assert!(private.visibility_editable);
     let unreachable_public_method = find_definition(
         &definitions,
         "hidden::PrivateReceiver::nominally_public",
         DefinitionKind::AssociatedFunction,
     );
-    assert_eq!(unreachable_public_method.effective_public_at, None);
+    assert!(!unreachable_public_method.externally_reachable);
     assert!(unreachable_public_method.visibility_editable);
 
     let generated_definitions = definitions
@@ -447,7 +124,8 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
             ("Generated::generated", DefinitionKind::AssociatedFunction,),
         ])
     );
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/effective_api.rs");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/visibility_definitions.rs");
     let source = fs::read(fixture).unwrap();
     for definition in generated_definitions {
         assert!(
@@ -459,7 +137,10 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
             .attribution_callsite
             .as_ref()
             .expect("expanded definition attribution callsite");
-        assert_eq!(source_bytes(&source, callsite), b"emit_api!()");
+        assert_eq!(
+            source_bytes(&source, callsite),
+            b"emit_visibility_definitions!()"
+        );
     }
     let authored = find_definition(&definitions, "hidden::Named", DefinitionKind::Struct);
     assert_eq!(authored.expansion_origin, ExpansionOrigin::Authored);
@@ -471,7 +152,7 @@ fn effective_api_events_are_finite_complete_and_source_honest() {
         ),
         b"pub struct Named"
     );
-    assert_product(&records, Product::EffectiveApi, Availability::Complete);
+    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
 }
 
 #[test]
@@ -525,13 +206,6 @@ fn references_cover_typed_bodies_interfaces_visibility_and_roots() {
         .iter()
         .map(|definition| definition.compiler_id)
         .collect::<BTreeSet<_>>();
-    let body_ids = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Body(body) => Some(body.compiler_id),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
     let local_crates = definition_ids
         .iter()
         .map(|definition| definition.stable_crate_id)
@@ -543,12 +217,31 @@ fn references_cover_typed_bodies_interfaces_visibility_and_roots() {
             _ => None,
         })
         .collect::<Vec<_>>();
+    let roots = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::Root(root) => Some(root),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
     for reference in &references {
-        assert!(definition_ids.contains(&reference.from) || body_ids.contains(&reference.from));
+        assert!(
+            definition_ids.contains(&reference.from),
+            "reference source must be an emitted definition: {reference:#?}"
+        );
         if local_crates.contains(&reference.to.stable_crate_id) {
-            assert!(definition_ids.contains(&reference.to));
+            assert!(
+                definition_ids.contains(&reference.to),
+                "local reference target must be an emitted definition: {reference:#?}"
+            );
         }
+    }
+    for root in &roots {
+        assert!(
+            definition_ids.contains(&root.definition),
+            "root target must be an emitted definition: {root:#?}"
+        );
     }
 
     assert_eq!(
@@ -709,13 +402,6 @@ fn references_cover_typed_bodies_interfaces_visibility_and_roots() {
         ReferenceKind::VisibilityRequirement,
     );
 
-    let roots = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            Event::Root(root) => Some(root),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
     assert!(roots.iter().any(|root| {
         root.kind == RootKind::Conservative && paths[&root.definition].ends_with("::produce")
     }));
@@ -782,7 +468,7 @@ fn references_cover_typed_bodies_interfaces_visibility_and_roots() {
         "async_block_only",
         ReferenceKind::Body,
     );
-    assert_product(&records, Product::References, Availability::Complete);
+    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
 }
 
 #[test]
@@ -1077,21 +763,23 @@ fn test_harness_entry_reaches_selected_tests_without_rooting_unrelated_code() {
     assert!(reachable_paths.contains("selected_test"));
     assert!(reachable_paths.contains("helper"));
     assert!(!reachable_paths.contains("unrelated_dead"));
-    assert_product(&records, Product::References, Availability::Complete);
+    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
 }
 
 #[test]
-fn source_spans_address_original_crlf_bytes() {
+fn source_spans_address_original_crlf_bytes_with_one_based_coordinates() {
     let source = b"pub fn first() {}\r\n\r\npub fn second() {\r\n    first();\r\n}\r\n";
     let records = collect_source("crlf", source);
-    let body = records
+    let second = records
         .iter()
         .find_map(|record| match &record.event {
-            Event::Body(body) if body.definition_path == "second" => Some(body),
+            Event::Definition(definition) if definition.definition_path == "second" => {
+                Some(definition)
+            }
             _ => None,
         })
         .unwrap();
-    let span = body.span.as_ref().unwrap();
+    let span = second.span.as_ref().unwrap();
     let source_file = records
         .iter()
         .find_map(|record| match &record.event {
@@ -1101,9 +789,10 @@ fn source_spans_address_original_crlf_bytes() {
         .unwrap();
 
     assert_eq!(source_file.byte_len, u32::try_from(source.len()).unwrap());
-    let body_bytes =
+    assert_eq!((span.line, span.column), (3, 1));
+    let definition_bytes =
         &source[usize::try_from(span.start).unwrap()..usize::try_from(span.end).unwrap()];
-    assert!(String::from_utf8_lossy(body_bytes).contains("second"));
+    assert!(String::from_utf8_lossy(definition_bytes).contains("second"));
 
     let definitions = records
         .iter()
@@ -1120,7 +809,7 @@ fn source_spans_address_original_crlf_bytes() {
         .iter()
         .find_map(|record| match &record.event {
             Event::Reference(reference)
-                if reference.from == body.compiler_id
+                if reference.from == second.compiler_id
                     && reference.to == first.compiler_id
                     && reference.kind == ReferenceKind::Body =>
             {
@@ -1130,6 +819,7 @@ fn source_spans_address_original_crlf_bytes() {
         })
         .unwrap();
     let reference_span = reference.span.as_ref().unwrap();
+    assert_eq!((reference_span.line, reference_span.column), (4, 5));
     let reference_bytes = &source[usize::try_from(reference_span.start).unwrap()
         ..usize::try_from(reference_span.end).unwrap()];
     assert_eq!(reference_bytes, b"first");
@@ -1143,14 +833,18 @@ fn entry_roots_are_complete_reference_facts_after_edge_collection() {
         &record.event,
         Event::Root(root) if root.kind == RootKind::EntryPoint
     )));
-    assert_product(&records, Product::References, Availability::Complete);
+    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
 }
 
 #[test]
-fn compiler_failure_never_reports_complete_references() {
+fn compiler_failure_never_reports_complete_visibility_audit() {
     let records = collect_failing_source("broken_references", b"pub fn broken( {\n");
 
-    assert_product(&records, Product::References, Availability::Unavailable);
+    assert_product(
+        &records,
+        Product::VisibilityAudit,
+        Availability::Unavailable,
+    );
     assert!(
         !records
             .iter()
@@ -1251,14 +945,6 @@ fn source_bytes<'a>(source: &'a [u8], span: &rot_compiler_protocol::SourceSpan) 
     &source[usize::try_from(span.start).unwrap()..usize::try_from(span.end).unwrap()]
 }
 
-fn kind_counts(decisions: &[&rot_compiler_protocol::Decision]) -> Vec<(DecisionKind, usize)> {
-    let mut counts = BTreeMap::new();
-    for decision in decisions {
-        *counts.entry(decision.kind).or_default() += 1;
-    }
-    counts.into_iter().collect()
-}
-
 fn assert_reference(
     references: &[&rot_compiler_protocol::Reference],
     paths: &BTreeMap<rot_compiler_protocol::CompilerDefId, &str>,
@@ -1287,42 +973,21 @@ fn assert_reference(
     );
 }
 
-fn assert_contiguous_group_ordinals(decisions: &[&rot_compiler_protocol::Decision]) {
-    let mut groups = BTreeMap::new();
-    for decision in decisions {
-        groups
-            .entry((
-                decision.body,
-                decision.attribution_callsite.clone(),
-                decision.expansion_origin,
-                decision.macro_kind,
-                decision.macro_definition,
-            ))
-            .or_insert_with(Vec::new)
-            .push(decision.ordinal);
-    }
-    for ordinals in groups.values_mut() {
-        ordinals.sort_unstable();
-        assert_eq!(
-            ordinals,
-            &(0..u32::try_from(ordinals.len()).unwrap()).collect::<Vec<_>>()
-        );
-    }
-}
-
 fn assert_product(records: &[Record], product: Product, availability: Availability) {
-    assert!(records.iter().any(|record| matches!(
-        &record.event,
-        Event::ProductStatus(status)
-            if status.product == product && status.availability == availability
-    )));
-}
-
-fn is_macro_origin(origin: ExpansionOrigin) -> bool {
-    matches!(
-        origin,
-        ExpansionOrigin::LocalMacro | ExpansionOrigin::ExternalMacro
-    )
+    let statuses = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::ProductStatus(status) => Some(status),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses.len(),
+        1,
+        "one visibility audit must have exactly one atomic product status"
+    );
+    assert_eq!(statuses[0].product, product);
+    assert_eq!(statuses[0].availability, availability);
 }
 
 fn collect_fixture(name: &str) -> Vec<Record> {

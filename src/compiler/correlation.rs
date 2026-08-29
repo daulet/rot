@@ -724,9 +724,7 @@ mod tests {
             platform: Some("host".to_owned()),
         };
         let profile = CompilerProfile {
-            resolved_features: BTreeMap::new(),
             expected_units: vec![unit.clone(), unit],
-            incompatibilities: Vec::new(),
         };
 
         let selected = HashSet::from(["package".to_owned()]);

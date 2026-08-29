@@ -3,11 +3,11 @@ use std::io::{self, Write};
 use anyhow::{Context, Result};
 
 use crate::{
-    cli::{Cli, OutputFormat},
+    cli::{FastCli, OutputFormat},
     model::{BucketReport, DiagnosticSeverity, OutputRole, Report},
 };
 
-pub fn render(report: &Report, cli: &Cli) -> Result<()> {
+pub fn render(report: &Report, cli: &FastCli) -> Result<()> {
     match cli.format {
         OutputFormat::Table => render_table(report, cli.files),
         OutputFormat::Json => {
@@ -76,78 +76,6 @@ fn render_table(report: &Report, by_file: bool) -> Result<()> {
         report.metrics.cognitive_authored,
         total_public,
     )?;
-    if let Some(compiler) = &report.compiler {
-        let status = |name: &str| {
-            compiler
-                .products
-                .iter()
-                .find(|product| product.product == name)
-                .map_or(crate::model::SemanticStatus::Unavailable, |product| {
-                    product.status
-                })
-        };
-        writeln!(
-            output,
-            "\nCompiler: {}/{} invocations correlated; HIR {:?}; API {:?}; required visibility {:?}; closed-world {:?}; macro delta {:?}",
-            compiler.correlated_invocations,
-            compiler.expected_invocations,
-            status("hir_bodies"),
-            status("effective_api"),
-            status("required_visibility"),
-            status("closed_world_liveness"),
-            status("macro_expansion_cyclomatic_delta"),
-        )?;
-        if let Some(api) = &compiler.effective_api {
-            writeln!(
-                output,
-                "Effective API: {} definitions, {} public bindings across {} production library invocations",
-                api.summary.effective_definitions,
-                api.summary.public_bindings,
-                api.summary.production_library_invocations,
-            )?;
-        }
-        if let Some(required) = &compiler.required_visibility {
-            writeln!(
-                output,
-                "Required visibility: {} public definitions [{}; excludes {}]",
-                required.definitions.len(),
-                required.scope,
-                required.evidence_exclusions.join(", "),
-            )?;
-        }
-        if let Some(closed_world) = &compiler.closed_world {
-            writeln!(
-                output,
-                "Closed world: {} dead public, {} unnecessarily public [{}; excludes {}]",
-                closed_world.summary.dead_public,
-                closed_world.summary.unnecessary_public,
-                closed_world.scope,
-                closed_world.evidence_exclusions.join(", "),
-            )?;
-        }
-        if let Some(expansion) = &compiler.macro_expansion_complexity {
-            let (complete, macro_body_bases, decision_delta, cyclomatic_delta) = expansion
-                .invocations
-                .iter()
-                .filter_map(|invocation| invocation.metrics.as_ref())
-                .fold((0_u64, 0_u64, 0_u64, 0_u64), |totals, metrics| {
-                    (
-                        totals.0 + 1,
-                        totals.1 + metrics.totals.macro_body_bases,
-                        totals.2 + metrics.totals.decision_delta,
-                        totals.3 + metrics.totals.cyclomatic_delta,
-                    )
-                });
-            if complete > 0 {
-                writeln!(
-                    output,
-                    "Macro expansion delta: invocation-local sum +{cyclomatic_delta} cyclomatic ({macro_body_bases} body bases + {decision_delta} decision weight; {}/{} invocations complete)",
-                    complete,
-                    expansion.invocations.len(),
-                )?;
-            }
-        }
-    }
     if by_file {
         writeln!(output)?;
         writeln!(
@@ -185,6 +113,12 @@ fn render_table(report: &Report, by_file: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
 }
 
 fn write_bucket(output: &mut impl Write, label: &str, bucket: &BucketReport) -> io::Result<()> {

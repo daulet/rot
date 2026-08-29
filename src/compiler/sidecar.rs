@@ -7,9 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
-    Body, Decision, Definition, Diagnostic, Event, ExpansionOrigin, Handshake, InvocationFinished,
-    InvocationId, InvocationStarted, MAX_SIDECAR_BYTES, PINNED_RUSTC_COMMIT, PROTOCOL_VERSION,
-    Product, ProductStatus, Profile, PublicBinding, Record, Reference, Root, RunId, SourceFile,
+    Definition, DefinitionKind, Diagnostic, Event, Handshake, InvocationFinished, InvocationId,
+    InvocationStarted, MAX_SIDECAR_BYTES, PINNED_RUSTC_COMMIT, PROTOCOL_VERSION, Product,
+    ProductStatus, Profile, Record, Reference, Root, RunId, SourceFile,
 };
 
 const MAX_SIDECARS: usize = 10_000;
@@ -21,14 +21,11 @@ pub struct Invocation {
     pub started: InvocationStarted,
     pub profile: Option<Profile>,
     pub sources: Vec<SourceFile>,
-    pub bodies: Vec<Body>,
     pub products: Vec<ProductStatus>,
     pub diagnostics: Vec<Diagnostic>,
     pub definitions: Vec<Definition>,
-    pub public_bindings: Vec<PublicBinding>,
     pub roots: Vec<Root>,
     pub references: Vec<Reference>,
-    pub decisions: Vec<Decision>,
     pub finished: InvocationFinished,
 }
 
@@ -156,14 +153,11 @@ fn validate_records(
 
     let mut profile = None;
     let mut sources = Vec::new();
-    let mut bodies = Vec::new();
     let mut products = Vec::new();
     let mut diagnostics = Vec::new();
     let mut definitions = Vec::new();
-    let mut public_bindings = Vec::new();
     let mut roots = Vec::new();
     let mut references = Vec::new();
-    let mut decisions = Vec::new();
     let mut finished = None;
     for event in events {
         if finished.is_some() {
@@ -177,15 +171,12 @@ fn validate_records(
                 }
             }
             Event::SourceFile(value) => sources.push(value),
-            Event::Body(value) => bodies.push(value),
             Event::ProductStatus(value) => products.push(value),
             Event::Diagnostic(value) => diagnostics.push(value),
             Event::InvocationFinished(value) => finished = Some(value),
             Event::Definition(value) => definitions.push(value),
-            Event::PublicBinding(value) => public_bindings.push(value),
             Event::Root(value) => roots.push(value),
             Event::Reference(value) => references.push(value),
-            Event::Decision(value) => decisions.push(value),
         }
     }
     let finished = finished.context("sidecar has no invocation_finished record")?;
@@ -221,12 +212,7 @@ fn validate_records(
             bail!("duplicate product_status for {:?}", status.product);
         }
     }
-    let expected_products = BTreeSet::from([
-        Product::HirBodies,
-        Product::EffectiveApi,
-        Product::References,
-        Product::ExpansionDecisions,
-    ]);
+    let expected_products = BTreeSet::from([Product::VisibilityAudit]);
     if product_names != expected_products {
         bail!("sidecar does not report availability for every semantic product");
     }
@@ -235,39 +221,24 @@ fn validate_records(
     }
     validate_product_facts(
         &products,
-        !bodies.is_empty(),
-        !definitions.is_empty() || !public_bindings.is_empty(),
-        !references.is_empty() || !roots.is_empty(),
-        !decisions.is_empty()
-            || bodies.iter().any(|body| {
-                matches!(
-                    body.expansion_origin,
-                    ExpansionOrigin::LocalMacro | ExpansionOrigin::ExternalMacro
-                )
-            }),
+        &definitions,
+        !sources.is_empty()
+            || !definitions.is_empty()
+            || !references.is_empty()
+            || !roots.is_empty(),
     )?;
     sources.sort_by(|left, right| left.key.cmp(&right.key));
-    bodies.sort_by(|left, right| left.id.cmp(&right.id));
     products.sort_by_key(|status| status.product);
     definitions.sort_by(|left, right| left.id.cmp(&right.id));
-    public_bindings.sort_by(|left, right| left.id.cmp(&right.id));
     roots.sort_by(|left, right| left.id.cmp(&right.id));
     references.sort_by(|left, right| left.id.cmp(&right.id));
-    decisions.sort_by(|left, right| left.id.cmp(&right.id));
     reject_duplicate("source file", sources.iter().map(|source| &source.key.0))?;
     let mut fact_ids = BTreeSet::new();
-    for (kind, id) in bodies
+    for (kind, id) in definitions
         .iter()
-        .map(|fact| ("body", &fact.id.0))
-        .chain(definitions.iter().map(|fact| ("definition", &fact.id.0)))
-        .chain(
-            public_bindings
-                .iter()
-                .map(|fact| ("public binding", &fact.id.0)),
-        )
+        .map(|fact| ("definition", &fact.id.0))
         .chain(roots.iter().map(|fact| ("root", &fact.id.0)))
         .chain(references.iter().map(|fact| ("reference", &fact.id.0)))
-        .chain(decisions.iter().map(|fact| ("decision", &fact.id.0)))
     {
         if !fact_ids.insert(id) {
             bail!("duplicate semantic fact identity {id:?} ({kind})");
@@ -277,53 +248,18 @@ fn validate_records(
         .iter()
         .map(|source| (source.key.clone(), source.byte_len))
         .collect::<BTreeMap<_, _>>();
-    for span in bodies
+    for span in definitions
         .iter()
         .flat_map(|fact| [fact.span.as_ref(), fact.attribution_callsite.as_ref()])
-        .chain(
-            definitions
-                .iter()
-                .flat_map(|fact| [fact.span.as_ref(), fact.attribution_callsite.as_ref()]),
-        )
-        .chain(public_bindings.iter().map(|fact| fact.span.as_ref()))
         .chain(references.iter().map(|fact| fact.span.as_ref()))
-        .chain(decisions.iter().flat_map(|fact| {
-            [
-                fact.generated_span.as_ref(),
-                fact.attribution_callsite.as_ref(),
-            ]
-        }))
         .flatten()
     {
         let Some(byte_len) = source_lengths.get(&span.file) else {
             bail!("semantic fact references an unknown source file");
         };
-        if span.start > span.end || span.end > *byte_len {
+        if span.start > span.end || span.end > *byte_len || span.line == 0 || span.column == 0 {
             bail!("semantic fact contains an invalid source span");
         }
-    }
-    let mut body_ids = BTreeSet::new();
-    for body in &bodies {
-        if !body_ids.insert(body.compiler_id) {
-            bail!("duplicate conceptual body compiler identity");
-        }
-        let macro_origin = matches!(
-            body.expansion_origin,
-            ExpansionOrigin::LocalMacro | ExpansionOrigin::ExternalMacro
-        );
-        let macro_identity = body.macro_kind.is_some() || body.macro_definition.is_some();
-        if macro_origin != body.macro_kind.is_some() || (!macro_origin && macro_identity) {
-            bail!("body expansion origin and macro identity disagree");
-        }
-    }
-    if decisions.iter().any(|decision| {
-        !body_ids.contains(&decision.body)
-            || !matches!(
-                decision.expansion_origin,
-                ExpansionOrigin::LocalMacro | ExpansionOrigin::ExternalMacro
-            )
-    }) {
-        bail!("macro decision has an unknown body or invalid expansion provenance");
     }
     let definitions_by_id = definition_ids(&definitions)?;
     let local_crates = definitions_by_id
@@ -335,16 +271,11 @@ fn validate_records(
             && !definitions_by_id.contains(definition)
     };
     validate_definition_boundaries(&definitions, &definitions_by_id)?;
-    if public_bindings.iter().any(|binding| {
-        !definitions_by_id.contains(&binding.parent)
-            || unknown_local(&binding.target)
-            || binding.exposing_import.as_ref().is_some_and(unknown_local)
-    }) || roots
+    if roots
         .iter()
         .any(|root| !definitions_by_id.contains(&root.definition))
         || references.iter().any(|reference| {
-            (!definitions_by_id.contains(&reference.from) && !body_ids.contains(&reference.from))
-                || unknown_local(&reference.to)
+            !definitions_by_id.contains(&reference.from) || unknown_local(&reference.to)
         })
     {
         bail!("semantic graph contains an unknown local definition endpoint");
@@ -355,14 +286,11 @@ fn validate_records(
         started,
         profile,
         sources,
-        bodies,
         products,
         diagnostics,
         definitions,
-        public_bindings,
         roots,
         references,
-        decisions,
         finished,
     })
 }
@@ -481,23 +409,25 @@ fn validate_source(source: &SourceFile) -> Result<()> {
 
 fn validate_product_facts(
     products: &[ProductStatus],
-    hir_facts: bool,
-    api_facts: bool,
-    reference_facts: bool,
-    decision_facts: bool,
+    definitions: &[Definition],
+    has_facts: bool,
 ) -> Result<()> {
-    for (product, has_facts) in [
-        (Product::HirBodies, hir_facts),
-        (Product::EffectiveApi, api_facts),
-        (Product::References, reference_facts),
-        (Product::ExpansionDecisions, decision_facts),
-    ] {
-        let status = products
+    let status = products
+        .iter()
+        .find(|status| status.product == Product::VisibilityAudit)
+        .context("visibility audit status is missing")?;
+    if has_facts && status.availability == rot_compiler_protocol::Availability::Unavailable {
+        bail!("unavailable visibility audit contains facts");
+    }
+    if status.availability != rot_compiler_protocol::Availability::Unavailable {
+        let crate_definitions = definitions
             .iter()
-            .find(|status| status.product == product)
-            .context("semantic product status is missing")?;
-        if has_facts && status.availability == rot_compiler_protocol::Availability::Unavailable {
-            bail!("unavailable {product:?} product contains facts");
+            .filter(|definition| definition.kind == DefinitionKind::Crate)
+            .count();
+        if crate_definitions != 1 {
+            bail!(
+                "visibility audit facts contain {crate_definitions} crate definitions; expected exactly one"
+            );
         }
     }
     Ok(())
@@ -520,9 +450,9 @@ mod tests {
     use super::*;
     use rot_compiler_protocol::{
         ArtifactIdentity, Availability, CfgValue, CodegenProfile, CompilationContext,
-        CompilerDefId, CompilerIdentity, DRIVER_VERSION, DefinitionKind, EffectiveVisibilityLevel,
-        ExpansionOrigin, FactId, InvocationMergeKey, NominalVisibility, OptimizationLevel,
-        PINNED_RUSTC_VERSION, PanicStrategy, ProductStatus,
+        CompilerDefId, CompilerIdentity, DRIVER_VERSION, DefinitionKind, ExpansionOrigin, FactId,
+        InvocationMergeKey, NominalVisibility, OptimizationLevel, PINNED_RUSTC_VERSION,
+        PanicStrategy, ProductStatus,
     };
 
     fn handshake() -> Handshake {
@@ -606,11 +536,26 @@ mod tests {
             kind: DefinitionKind::Function,
             visibility_editable: true,
             nominal_visibility: visibility,
-            effective_public_at: Some(EffectiveVisibilityLevel::Direct),
+            externally_reachable: true,
             span: None,
             attribution_callsite: None,
             expansion_origin: ExpansionOrigin::Authored,
         }
+    }
+
+    fn crate_definition() -> Definition {
+        let mut definition = definition(
+            CompilerDefId {
+                stable_crate_id: 1,
+                local_hash: 1,
+            },
+            NominalVisibility::Public,
+        );
+        definition.name = Some("crate".to_owned());
+        definition.definition_path = "crate".to_owned();
+        definition.kind = DefinitionKind::Crate;
+        definition.visibility_editable = false;
+        definition
     }
 
     #[test]
@@ -619,40 +564,17 @@ mod tests {
         let records = vec![
             record(0, started(compiler)),
             record(1, profile()),
+            record(2, Event::Definition(crate_definition())),
             record(
-                2,
+                3,
                 Event::ProductStatus(ProductStatus {
-                    product: Product::HirBodies,
+                    product: Product::VisibilityAudit,
                     availability: Availability::Complete,
                     message: None,
                 }),
             ),
             record(
-                3,
-                Event::ProductStatus(ProductStatus {
-                    product: Product::EffectiveApi,
-                    availability: Availability::Unavailable,
-                    message: Some("not collected".to_owned()),
-                }),
-            ),
-            record(
                 4,
-                Event::ProductStatus(ProductStatus {
-                    product: Product::References,
-                    availability: Availability::Unavailable,
-                    message: Some("not collected".to_owned()),
-                }),
-            ),
-            record(
-                5,
-                Event::ProductStatus(ProductStatus {
-                    product: Product::ExpansionDecisions,
-                    availability: Availability::Unavailable,
-                    message: Some("not collected".to_owned()),
-                }),
-            ),
-            record(
-                6,
                 Event::InvocationFinished(InvocationFinished {
                     rustc_success: true,
                     analysis_reached: true,
@@ -662,6 +584,32 @@ mod tests {
         let invocation = validate_records(records, "run", &handshake()).unwrap();
         assert_eq!(invocation.started.merge_key.0, "merge");
         assert!(invocation.finished.rustc_success);
+    }
+
+    #[test]
+    fn rejects_complete_visibility_audit_without_crate_definition() {
+        let records = vec![
+            record(0, started(handshake().rustc.clone())),
+            record(1, profile()),
+            record(
+                2,
+                Event::ProductStatus(ProductStatus {
+                    product: Product::VisibilityAudit,
+                    availability: Availability::Complete,
+                    message: None,
+                }),
+            ),
+            record(
+                3,
+                Event::InvocationFinished(InvocationFinished {
+                    rustc_success: true,
+                    analysis_reached: true,
+                }),
+            ),
+        ];
+
+        let error = validate_records(records, "run", &handshake()).unwrap_err();
+        assert!(error.to_string().contains("expected exactly one"));
     }
 
     #[test]
@@ -681,7 +629,7 @@ mod tests {
             record(
                 1,
                 Event::ProductStatus(ProductStatus {
-                    product: Product::HirBodies,
+                    product: Product::VisibilityAudit,
                     availability: Availability::Complete,
                     message: None,
                 }),
