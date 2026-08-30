@@ -1,0 +1,10 @@
+[package]
+name = "dual-app"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+dual-helper = { path = "../dual-helper" }
+
+[build-dependencies]
+dual-helper = { path = "../dual-helper" }

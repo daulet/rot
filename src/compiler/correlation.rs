@@ -115,7 +115,7 @@ pub fn correlate(
                 add_issue(
                     &mut issue,
                     &format!(
-                        "Cargo artifact is absent from the pinned unit graph: {}",
+                        "Cargo artifact is absent from the selected unit graph: {}",
                         unit_key.render()
                     ),
                 );
@@ -191,7 +191,7 @@ pub fn correlate(
             ));
             add_issue(
                 &mut invocation.issue,
-                "compiler sidecar mapped outside the pinned unit graph",
+                "compiler sidecar mapped outside the selected unit graph",
             );
         }
     }
@@ -206,7 +206,7 @@ pub fn correlate(
             uniquely_correlated += indices.len();
         } else {
             let issue = format!(
-                "pinned Cargo unit graph expects {expected_count} compiler sidecar(s), observed {}: {}",
+                "selected Cargo unit graph expects {expected_count} compiler sidecar(s), observed {}: {}",
                 indices.len(),
                 key.render()
             );
@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_unit_ledger_preserves_cargo_multiplicity() {
+    fn selected_unit_ledger_preserves_cargo_multiplicity() {
         let unit = ExpectedUnit {
             package_id: "package".to_owned(),
             target_name: "sample".to_owned(),

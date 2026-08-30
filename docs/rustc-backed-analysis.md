@@ -16,33 +16,62 @@ measurement into a slow or partial operation.
 ## Build and run
 
 The stable orchestration binary is gated by the `audit` Cargo feature. The
-rustc-private driver is a separate workspace pinned to the exact nightly it was
-written against:
+rustc-private driver is a separate workspace compiled once for each exact
+compiler identity. This stable example uses a version-specific target directory
+so its binary cannot be confused with another compiler's driver:
 
 ```console
-rustup toolchain install nightly-2026-08-27 \
+rustup toolchain install 1.98.0 \
   --component rustc-dev --component rust-src --component llvm-tools-preview
 
-cargo +nightly-2026-08-27 build \
-  --manifest-path compiler/rot-rustc-driver/Cargo.toml --release
+RUSTC_BOOTSTRAP=rot_rustc_driver cargo +1.98.0 build \
+  --manifest-path compiler/rot-rustc-driver/Cargo.toml \
+  --target-dir compiler/rot-rustc-driver/target/1.98.0 --release
 
 cargo build --release --features audit --bin rot-audit
 
 ./target/release/rot-audit path/to/workspace --locked --offline \
-  --driver compiler/rot-rustc-driver/target/release/rot-rustc-driver
+  --toolchain 1.98.0 \
+  --driver compiler/rot-rustc-driver/target/1.98.0/release/rot-rustc-driver
 ```
 
-Protocol v4 requires rustc `1.100.0-nightly` at commit
-`bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed`. The handshake checks the protocol,
-driver, linked-rustc, and toolchain identities before any project build starts.
+Stable rustc still gates `rustc_private`; `RUSTC_BOOTSTRAP=rot_rustc_driver`
+opts out only for the named driver crate while building it. The default audit
+toolchain is `nightly-2026-08-27`, whose driver can be built without that
+variable.
 
-`--driver` is optional when `rot-rustc-driver` is next to the audit executable or
-exists in the repository's driver target directory. Passing it explicitly makes
-automation independent of those lookup rules.
+Protocol v4 is independent of a particular rustc, but each driver binary is
+linked to one exact compiler. The handshake checks the protocol and driver
+versions plus the selected and linked rustc release, full commit, and host
+before any project build starts. A driver must be rebuilt for every rustc patch
+release; ABI-compatible-looking reuse is unsupported.
+
+`--driver` is required. Rot does not guess a driver location or read an
+environment-variable fallback, so automation always names the exact helper it
+intends to execute.
+
+## Supported compiler window
+
+Rot treats compatibility as tested evidence, not a version range. The embedded
+[`supported-rustc.toml`](../compiler/supported-rustc.toml) ledger records the
+verification date, host, Rust publication dates, and exact compiler identities.
+As of 2026-08-29, the supported stable window on
+`aarch64-apple-darwin` contains all 14 releases published in the preceding 365
+days: 1.90.0, 1.91.0, 1.91.1, 1.92.0, 1.93.0, 1.93.1, 1.94.0, 1.94.1,
+1.95.0, 1.96.0, 1.96.1, 1.97.0, 1.97.1, and 1.98.0. The default development
+nightly is recorded separately.
+
+Every listed stable compiler built the driver and passed all 12 driver unit
+tests and all 16 semantic visibility fixtures. `rot-audit` rejects a selected
+release, commit, or host absent from the ledger. A rolling update therefore has
+three atomic steps: derive the current stable list from Rust's release record,
+run the complete exact-toolchain matrix on each claimed host, and update the
+ledger only after every row passes. Building old-compatible source with a newer
+rustc does not establish support.
 
 ## Execution boundary
 
-The audit runs the pinned equivalent of:
+The audit runs the selected-toolchain equivalent of:
 
 ```console
 cargo check --workspace --all-targets --keep-going
@@ -57,6 +86,12 @@ This operation executes project-controlled build scripts and procedural macros.
 It may download dependencies unless `--offline` is supplied. `--locked` and
 `--offline` have their normal Cargo meanings. The audit also rejects compiler or
 workspace-wrapper overrides that would make its observations ambiguous.
+Rot sets `RUSTC_BOOTSTRAP=1` only on the read-only unstable configuration and
+unit-graph preflights. It removes ambient `RUSTC_BOOTSTRAP` from the actual
+project `cargo check`, preventing either that preflight setting or the caller's
+process environment from leaking into the build. Explicit Cargo user/project
+configuration remains part of the build trust boundary and may deliberately set
+the variable.
 
 ## Concrete Cargo profiles
 
@@ -64,11 +99,11 @@ Each invocation describes one real Cargo program configuration. The supported
 profile controls are:
 
 ```console
-rot-audit . --features serde,cli
-rot-audit . --no-default-features --features minimal
-rot-audit . --all-features
-rot-audit . --target aarch64-unknown-linux-gnu
-rot-audit . --cfg loom
+rot-audit . --driver PATH --features serde,cli
+rot-audit . --driver PATH --no-default-features --features minimal
+rot-audit . --driver PATH --all-features
+rot-audit . --driver PATH --target aarch64-unknown-linux-gnu
+rot-audit . --driver PATH --cfg loom
 ```
 
 Features are resolved by Cargo, including dependency feature unification and
@@ -186,7 +221,7 @@ before narrowing a published library API.
 Visibility results are emitted only when all selected semantic evidence is
 complete. The audit exits unsuccessfully when any of these conditions holds:
 
-- the pinned driver is missing or fails its handshake;
+- the driver is missing, unsupported, mismatched, or fails its handshake;
 - Cargo metadata or the unit graph cannot be obtained;
 - Cargo/rustc does not complete successfully;
 - an expected selected invocation is missing, duplicated, or ambiguously
@@ -202,7 +237,7 @@ declarations, and the process still exits nonzero.
 
 ## JSON contract
 
-`rot-audit --format json` emits a separate `schema_version: 1` report. Its main
+`rot-audit --format json` emits a separate `schema_version: 2` report. Its main
 fields are:
 
 ```text
@@ -220,12 +255,15 @@ diagnostics
 ```
 
 The top-level report retains invocation identity and observed target/profile
-facts so a result can be audited later. `required_visibility` and `closed_world`
+facts, including the requested toolchain and exact rustc release, commit, date,
+and host, so a result can be audited later. Once the selected compiler validates,
+that exact identity is retained even when a later driver, Cargo, or correlation
+failure makes the audit unavailable. `required_visibility` and `closed_world`
 both repeat the scope and exclusions at the point where they qualify the data.
 
-Fast `rot --format json` remains schema version 2 and contains only source
-metrics, profile information, file/role buckets, and diagnostics. It has no
-`compiler` field.
+Fast `rot --format json` uses schema version 3 and contains only source metrics,
+profile information, file/role buckets, and diagnostics. Snapshot and comparison
+documents declare `report_kind` and `detail`; it has no `compiler` field.
 
 ## Deliberate non-goals
 

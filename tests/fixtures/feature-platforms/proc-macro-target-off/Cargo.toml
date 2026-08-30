@@ -1,0 +1,10 @@
+[package]
+name = "proc-macro-target-off"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[features]
+marker = []

@@ -3,5 +3,8 @@ name = "a"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+default = ["dep:renamed_b"]
+
 [dependencies]
-b = { path = "../b", features = ["foo"] }
+renamed_b = { package = "b", path = "../b", optional = true, features = ["foo"] }

@@ -1,0 +1,24 @@
+[package]
+name = "platform-app"
+version = "0.0.0"
+edition = "2024"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+proc-macro-member = { path = "../proc-macro-member" }
+target-on = { path = "../target-on", features = ["marker"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+proc-macro-target-off = { path = "../proc-macro-target-off", features = ["marker"] }
+target-off = { path = "../target-off", features = ["marker"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
+host-build-on = { path = "../host-build-on", features = ["marker"] }
+
+[target.'cfg(target_arch = "wasm32")'.build-dependencies]
+target-build-off = { path = "../target-build-off", features = ["marker"] }
+
+[target.'cfg(debug_assertions)'.dependencies]
+debug-on = { path = "../debug-on", features = ["marker"] }
+
+[target.'cfg(not(debug_assertions))'.dependencies]
+release-off = { path = "../release-off", features = ["marker"] }

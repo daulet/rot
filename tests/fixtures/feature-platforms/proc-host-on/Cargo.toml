@@ -1,0 +1,13 @@
+[package]
+name = "proc-host-on"
+version = "0.0.0"
+edition = "2024"
+
+[features]
+marker = []
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+context-host-leaf = { path = "../context-host-leaf", features = ["marker"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+context-target-leaf = { path = "../context-target-leaf", features = ["marker"] }

@@ -22,6 +22,7 @@ struct AuditOutput<'a> {
 
 #[derive(Serialize)]
 struct AuditProfile<'a> {
+    toolchain: &'a str,
     target: &'a str,
     feature_mode: &'static str,
     requested_features: &'a [String],
@@ -64,9 +65,10 @@ fn execute(cli: &AuditCli) -> Result<bool> {
     let status = outcome.report.status;
     let reason = outcome.report.reason.as_deref();
     let output = AuditOutput {
-        schema_version: 1,
+        schema_version: 2,
         root: &root,
         profile: AuditProfile {
+            toolchain: &cli.toolchain,
             target: inventory
                 .audit_target
                 .as_deref()
@@ -123,6 +125,11 @@ fn render_table(
         status_name(status),
         report.correlated_invocations,
         report.expected_invocations,
+    )?;
+    writeln!(
+        output,
+        "Compiler: {} ({} {} for {})",
+        report.rustc_version, report.rustc_commit, report.rustc_commit_date, report.rustc_host,
     )?;
     if let Some(reason) = reason {
         writeln!(output, "Reason: {reason}")?;

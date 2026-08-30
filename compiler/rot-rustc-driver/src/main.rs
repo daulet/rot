@@ -7,6 +7,7 @@ extern crate rustc_lint_defs;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+#[cfg(rot_crate_type_in_structures)]
 extern crate rustc_structures;
 extern crate rustc_target;
 
@@ -25,9 +26,8 @@ use rot_compiler_protocol::{
     CompilerDefId, CompilerIdentity, DRIVER_VERSION, Definition, DefinitionKind, Diagnostic,
     DiagnosticPhase, DiagnosticSeverity, Event, ExpansionOrigin, FactId, HANDSHAKE_ARG, Handshake,
     InvocationFinished, InvocationId, InvocationMergeKey, InvocationStarted, MAX_SIDECAR_BYTES,
-    NominalVisibility, OptimizationLevel, PINNED_RUSTC_COMMIT, PINNED_RUSTC_COMMIT_DATE,
-    PINNED_RUSTC_RELEASE, PINNED_RUSTC_VERSION, PROTOCOL_VERSION, PanicStrategy, Product,
-    ProductStatus, Profile, RUN_ID_ENV, Record, Reference, ReferenceKind, Root, RootKind, RunId,
+    NominalVisibility, OptimizationLevel, PROTOCOL_VERSION, PanicStrategy, Product, ProductStatus,
+    Profile, RUN_ID_ENV, Record, Reference, ReferenceKind, Root, RootKind, RunId,
     SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile, SourceFileKey, SourceSpan,
     TARGET_DIR_ENV,
 };
@@ -44,17 +44,21 @@ use rustc_middle::{
     middle::codegen_fn_attrs::CodegenFnAttrFlags,
     ty::{self, TyCtxt, Visibility},
 };
+#[cfg(not(rot_crate_type_in_structures))]
+use rustc_session::config::CrateType;
 use rustc_session::config::{self, OptLevel};
 use rustc_span::{
     FileName, Pos, Span,
     def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId},
     hygiene::ExpnKind,
 };
+#[cfg(rot_crate_type_in_structures)]
 use rustc_structures::CrateType;
 use rustc_target::spec::PanicStrategy as RustcPanicStrategy;
 
 const TRAILER_RESERVE_BYTES: usize = 64 * 1024;
 const MAX_SELECTED_MANIFEST_DIRS: usize = 4096;
+const BUILD_RUSTC_VERSION: &str = env!("ROT_BUILD_RUSTC_VERSION");
 
 fn main() -> ExitCode {
     let args = match unicode_args() {
@@ -79,14 +83,14 @@ fn main() -> ExitCode {
 
     let invocation = InvocationArgs::parse(rustc_path.clone(), &args[1..]);
     let linked_compiler = linked_rustc_version();
-    if linked_compiler.as_deref() != Some(PINNED_RUSTC_VERSION) {
+    if linked_compiler.as_deref() != Some(BUILD_RUSTC_VERSION) {
         eprintln!(
-            "rot-rustc-driver: refusing compiler fact collection: expected linked rustc {PINNED_RUSTC_VERSION}, found {}",
+            "rot-rustc-driver: refusing compiler fact collection: driver was built for rustc {BUILD_RUSTC_VERSION}, found {}",
             linked_compiler.as_deref().unwrap_or("unknown")
         );
     }
     let mut callbacks = DriverCallbacks {
-        collection: (linked_compiler.as_deref() == Some(PINNED_RUSTC_VERSION))
+        collection: (linked_compiler.as_deref() == Some(BUILD_RUSTC_VERSION))
             .then(|| Collection::from_environment(invocation))
             .flatten(),
     };
@@ -95,13 +99,24 @@ fn main() -> ExitCode {
     });
 
     if let Some(collection) = &mut callbacks.collection {
+        #[cfg(rot_driver_exit_code)]
         collection.finish(exit == ExitCode::SUCCESS);
+        #[cfg(not(rot_driver_exit_code))]
+        collection.finish(exit == 0);
         if let Err(error) = collection.write_sidecar() {
             eprintln!("rot-rustc-driver: cannot write compiler sidecar: {error}");
         }
     }
 
-    exit
+    #[cfg(rot_driver_exit_code)]
+    let exit_code = exit;
+    #[cfg(not(rot_driver_exit_code))]
+    let exit_code = if exit == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(u8::try_from(exit).unwrap_or(1))
+    };
+    exit_code
 }
 
 fn unicode_args() -> Result<Vec<String>, OsString> {
@@ -116,9 +131,9 @@ fn write_handshake() -> ExitCode {
         eprintln!("rot-rustc-driver: linked rustc did not report its version");
         return ExitCode::FAILURE;
     };
-    if linked_rustc_version != PINNED_RUSTC_VERSION {
+    if linked_rustc_version != BUILD_RUSTC_VERSION {
         eprintln!(
-            "rot-rustc-driver: linked rustc mismatch: expected {PINNED_RUSTC_VERSION}, found {linked_rustc_version}"
+            "rot-rustc-driver: linked rustc mismatch: driver was built for {BUILD_RUSTC_VERSION}, found {linked_rustc_version}"
         );
         return ExitCode::FAILURE;
     }
@@ -146,10 +161,10 @@ fn linked_rustc_version() -> Option<String> {
 
 fn compiler_identity() -> CompilerIdentity {
     CompilerIdentity {
-        release: PINNED_RUSTC_RELEASE.to_owned(),
-        commit_hash: PINNED_RUSTC_COMMIT.to_owned(),
-        commit_date: PINNED_RUSTC_COMMIT_DATE.to_owned(),
-        host: config::host_tuple().to_owned(),
+        release: env!("ROT_BUILD_RUSTC_RELEASE").to_owned(),
+        commit_hash: env!("ROT_BUILD_RUSTC_COMMIT").to_owned(),
+        commit_date: env!("ROT_BUILD_RUSTC_COMMIT_DATE").to_owned(),
+        host: env!("ROT_BUILD_RUSTC_HOST").to_owned(),
     }
 }
 
@@ -722,11 +737,9 @@ impl<'roots, 'tcx> ReferenceVisitor<'roots, 'tcx> {
             }
             Res::Def(DefKind::Variant, variant) => self.record_variant(variant, span),
             Res::SelfCtor(implementation) => {
-                let self_type = self
-                    .tcx
-                    .type_of(implementation)
-                    .instantiate_identity()
-                    .skip_norm_wip();
+                let self_type = self.tcx.type_of(implementation).instantiate_identity();
+                #[cfg(rot_type_of_unnormalized)]
+                let self_type = self_type.skip_norm_wip();
                 if let Some(adt) = self_type.ty_adt_def() {
                     self.record_def(adt.did(), span);
                     if !adt.is_enum() {
@@ -849,6 +862,7 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'_, 'tcx> {
                 }
                 ExprKind::OffsetOf(..) => {
                     if let Some(fields) = typeck_results.offset_of_data().get(expression.hir_id) {
+                        #[cfg(rot_flat_offset_of)]
                         for (container, variant, field) in fields {
                             if let ty::Adt(adt, _) = container.kind()
                                 && !adt.is_enum()
@@ -857,6 +871,20 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'_, 'tcx> {
                                     adt.variant(*variant).fields[*field].did,
                                     expression.span,
                                 );
+                            }
+                        }
+                        #[cfg(not(rot_flat_offset_of))]
+                        {
+                            let (container, fields) = fields;
+                            if let ty::Adt(adt, _) = container.kind()
+                                && !adt.is_enum()
+                            {
+                                for (variant, field) in fields {
+                                    self.record_def(
+                                        adt.variant(*variant).fields[*field].did,
+                                        expression.span,
+                                    );
+                                }
                             }
                         }
                     }
@@ -965,7 +993,13 @@ fn collect_references(
         facts.push_resolved_references(tcx, local_def_id.to_def_id(), kind, &references);
 
         let parent = tcx.opt_local_parent(local_def_id);
-        if let Some(trait_item) = tcx.trait_item_of(local_def_id.to_def_id())
+        #[cfg(rot_trait_item_of)]
+        let trait_item = tcx.trait_item_of(local_def_id.to_def_id());
+        #[cfg(not(rot_trait_item_of))]
+        let trait_item = tcx
+            .opt_associated_item(local_def_id.to_def_id())
+            .and_then(|item| item.trait_item_def_id);
+        if let Some(trait_item) = trait_item
             && parent.is_some_and(|parent| {
                 matches!(tcx.def_kind(parent), DefKind::Impl { of_trait: true })
             })
@@ -1013,12 +1047,10 @@ fn collect_references(
                         DefKind::AssocFn | DefKind::AssocConst { .. } | DefKind::AssocTy
                     ) =>
                 {
-                    if let ty::Adt(adt, _) = tcx
-                        .type_of(parent)
-                        .instantiate_identity()
-                        .skip_norm_wip()
-                        .kind()
-                    {
+                    let self_type = tcx.type_of(parent).instantiate_identity();
+                    #[cfg(rot_type_of_unnormalized)]
+                    let self_type = self_type.skip_norm_wip();
+                    if let ty::Adt(adt, _) = self_type.kind() {
                         facts.push_reference(
                             tcx,
                             local_def_id.to_def_id(),
@@ -1151,11 +1183,12 @@ fn collect_reference_roots(
     }
 
     for local_def_id in emitted_definitions.iter().copied() {
-        if tcx
-            .lint_level_spec_at_node(DEAD_CODE, tcx.local_def_id_to_hir_id(local_def_id))
-            .level()
-            == LintLevel::Allow
-        {
+        let hir_id = tcx.local_def_id_to_hir_id(local_def_id);
+        #[cfg(rot_lint_level_spec)]
+        let dead_code_level = tcx.lint_level_spec_at_node(DEAD_CODE, hir_id).level();
+        #[cfg(not(rot_lint_level_spec))]
+        let dead_code_level = tcx.lint_level_at_node(DEAD_CODE, hir_id).level;
+        if dead_code_level == LintLevel::Allow {
             push_root(
                 tcx,
                 facts,
@@ -1170,11 +1203,15 @@ fn collect_reference_roots(
             DefKind::Fn | DefKind::AssocFn | DefKind::Static { .. }
         ) {
             let attributes = tcx.codegen_fn_attrs(local_def_id.to_def_id());
+            #[cfg(rot_codegen_symbol_name)]
+            let has_exported_name = attributes.symbol_name.is_some();
+            #[cfg(not(rot_codegen_symbol_name))]
+            let has_exported_name = attributes.export_name.is_some();
             if attributes.flags.intersects(
                 CodegenFnAttrFlags::NO_MANGLE
                     | CodegenFnAttrFlags::USED_COMPILER
                     | CodegenFnAttrFlags::USED_LINKER,
-            ) || attributes.symbol_name.is_some()
+            ) || has_exported_name
             {
                 push_root(
                     tcx,
@@ -1564,17 +1601,23 @@ fn definition_kind(kind: DefKind, local_def_id: LocalDefId) -> Option<Definition
         | DefKind::GlobalAsm
         | DefKind::Closure
         | DefKind::SyntheticCoroutineBody
-        | DefKind::Static { nested: true, .. }
-        | DefKind::TestBinderConstraints => None,
+        | DefKind::Static { nested: true, .. } => None,
+        #[cfg(rot_inline_const_def_kind)]
+        DefKind::InlineConst => None,
+        #[cfg(rot_test_binder_constraints)]
+        DefKind::TestBinderConstraints => None,
     }
 }
 
 fn nominal_visibility(tcx: TyCtxt<'_>, def_id: DefId) -> NominalVisibility {
     match tcx.visibility(def_id) {
         Visibility::Public => NominalVisibility::Public,
+        #[cfg(rot_local_module_visibility)]
         Visibility::Restricted(module) => {
             NominalVisibility::Restricted(compiler_id(tcx, module.to_def_id()))
         }
+        #[cfg(not(rot_local_module_visibility))]
+        Visibility::Restricted(module) => NominalVisibility::Restricted(compiler_id(tcx, module)),
     }
 }
 
@@ -1640,8 +1683,11 @@ fn binding_namespace(kind: DefKind) -> Option<BindingNamespace> {
         | DefKind::GlobalAsm
         | DefKind::Impl { .. }
         | DefKind::Closure
-        | DefKind::SyntheticCoroutineBody
-        | DefKind::TestBinderConstraints => None,
+        | DefKind::SyntheticCoroutineBody => None,
+        #[cfg(rot_inline_const_def_kind)]
+        DefKind::InlineConst => None,
+        #[cfg(rot_test_binder_constraints)]
+        DefKind::TestBinderConstraints => None,
     }
 }
 
@@ -1669,9 +1715,11 @@ fn binding_exposure(
 }
 
 fn profile(tcx: TyCtxt<'_>) -> Profile {
-    let mut cfg = tcx
-        .sess
-        .config
+    #[cfg(rot_session_config)]
+    let session_cfg = &tcx.sess.config;
+    #[cfg(not(rot_session_config))]
+    let session_cfg = &tcx.sess.psess.config;
+    let mut cfg = session_cfg
         .iter()
         .map(|(name, value)| CfgValue {
             name: name.to_string(),
@@ -1689,9 +1737,11 @@ fn profile(tcx: TyCtxt<'_>) -> Profile {
         .filter(|cfg| cfg.name == "feature")
         .filter_map(|cfg| cfg.value.clone())
         .collect();
-    let mut target_features = tcx
-        .sess
-        .internal_target_features
+    #[cfg(rot_internal_target_features)]
+    let target_features = &tcx.sess.internal_target_features;
+    #[cfg(not(rot_internal_target_features))]
+    let target_features = &tcx.sess.unstable_target_features;
+    let mut target_features = target_features
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
@@ -1716,6 +1766,7 @@ fn profile(tcx: TyCtxt<'_>) -> Profile {
             panic: match tcx.sess.panic_strategy() {
                 RustcPanicStrategy::Unwind => PanicStrategy::Unwind,
                 RustcPanicStrategy::Abort => PanicStrategy::Abort,
+                #[cfg(rot_immediate_abort)]
                 RustcPanicStrategy::ImmediateAbort => PanicStrategy::ImmediateAbort,
             },
             debug_assertions: tcx.sess.opts.debug_assertions,
@@ -1836,7 +1887,9 @@ fn source_span(
         remapped_path,
         source_hash_algorithm,
         source_hash,
-        byte_len: file.unnormalized_source_len,
+        byte_len: file
+            .original_relative_byte_pos(file.end_position())
+            .to_u32(),
     };
     let location = source_map.lookup_char_pos(span.lo());
     let source_span = SourceSpan {
@@ -1905,8 +1958,7 @@ fn manifest_is_selected(manifest_dir: Option<&str>, allowlist: Option<&OsStr>) -
         .take(MAX_SELECTED_MANIFEST_DIRS + 1)
         .map(|path| canonical_path(&path))
         .collect::<Vec<_>>();
-    selected.len() <= MAX_SELECTED_MANIFEST_DIRS
-        && selected.iter().any(|path| *path == manifest_dir)
+    selected.len() <= MAX_SELECTED_MANIFEST_DIRS && selected.contains(&manifest_dir)
 }
 
 fn valid_run_id(run_id: &str) -> bool {
@@ -2029,6 +2081,21 @@ mod tests {
     use super::*;
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn compiler_identity_matches_the_driver_build() {
+        assert_eq!(linked_rustc_version().as_deref(), Some(BUILD_RUSTC_VERSION));
+        assert_eq!(
+            compiler_identity(),
+            CompilerIdentity {
+                release: env!("ROT_BUILD_RUSTC_RELEASE").to_owned(),
+                commit_hash: env!("ROT_BUILD_RUSTC_COMMIT").to_owned(),
+                commit_date: env!("ROT_BUILD_RUSTC_COMMIT_DATE").to_owned(),
+                host: env!("ROT_BUILD_RUSTC_HOST").to_owned(),
+            }
+        );
+        assert_eq!(config::host_tuple(), env!("ROT_BUILD_RUSTC_HOST"));
+    }
 
     #[test]
     fn parses_cargo_rustc_invocation_identity() {

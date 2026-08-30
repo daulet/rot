@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
     Definition, DefinitionKind, Diagnostic, Event, Handshake, InvocationFinished, InvocationId,
-    InvocationStarted, MAX_SIDECAR_BYTES, PINNED_RUSTC_COMMIT, PROTOCOL_VERSION, Product,
-    ProductStatus, Profile, Record, Reference, Root, RunId, SourceFile,
+    InvocationStarted, MAX_SIDECAR_BYTES, PROTOCOL_VERSION, Product, ProductStatus, Profile,
+    Record, Reference, Root, RunId, SourceFile,
 };
 
 const MAX_SIDECARS: usize = 10_000;
@@ -146,7 +146,7 @@ fn validate_records(
     let Some(Event::InvocationStarted(started)) = events.next() else {
         bail!("first record is not invocation_started");
     };
-    if started.compiler != handshake.rustc || started.compiler.commit_hash != PINNED_RUSTC_COMMIT {
+    if started.compiler != handshake.rustc {
         bail!("sidecar compiler identity does not match the handshake");
     }
     validate_started(&started)?;
@@ -451,18 +451,17 @@ mod tests {
     use rot_compiler_protocol::{
         ArtifactIdentity, Availability, CfgValue, CodegenProfile, CompilationContext,
         CompilerDefId, CompilerIdentity, DRIVER_VERSION, DefinitionKind, ExpansionOrigin, FactId,
-        InvocationMergeKey, NominalVisibility, OptimizationLevel, PINNED_RUSTC_VERSION,
-        PanicStrategy, ProductStatus,
+        InvocationMergeKey, NominalVisibility, OptimizationLevel, PanicStrategy, ProductStatus,
     };
 
     fn handshake() -> Handshake {
         Handshake {
             protocol_version: PROTOCOL_VERSION,
             driver_version: DRIVER_VERSION,
-            linked_rustc_version: PINNED_RUSTC_VERSION.to_owned(),
+            linked_rustc_version: "1.100.0-nightly (bff8e12ff 2026-08-26)".to_owned(),
             rustc: CompilerIdentity {
                 release: "nightly".to_owned(),
-                commit_hash: PINNED_RUSTC_COMMIT.to_owned(),
+                commit_hash: "bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed".to_owned(),
                 commit_date: "date".to_owned(),
                 host: "host".to_owned(),
             },

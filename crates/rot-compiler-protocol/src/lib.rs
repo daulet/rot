@@ -2,10 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const DRIVER_VERSION: u32 = 4;
-pub const PINNED_RUSTC_RELEASE: &str = "1.100.0-nightly";
-pub const PINNED_RUSTC_COMMIT: &str = "bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed";
-pub const PINNED_RUSTC_COMMIT_DATE: &str = "2026-08-26";
-pub const PINNED_RUSTC_VERSION: &str = "1.100.0-nightly (bff8e12ff 2026-08-26)";
 pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const RUN_ID_ENV: &str = "ROT_COMPILER_RUN_ID";

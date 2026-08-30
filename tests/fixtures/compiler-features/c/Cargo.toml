@@ -1,0 +1,11 @@
+[package]
+name = "c"
+version = "0.0.0"
+edition = "2024"
+
+[features]
+dependency_alias = []
+trigger = ["dependency_alias/bar"]
+
+[dependencies]
+dependency_alias = { package = "b", path = "../b", default-features = false }

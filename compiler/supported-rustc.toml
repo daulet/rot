@@ -1,0 +1,116 @@
+# Exact rustc-private compatibility evidence for rot-audit.
+#
+# `rot-audit` accepts only these compiler identities. Stable entries are every
+# Rust release published in the 365-day window ending on `verified_on`. Each
+# listed driver was built and its full visibility fixture suite was run on the
+# verified host. Refresh this file and rerun the matrix whenever the window or
+# a supported host changes.
+
+verified_on = "2026-08-29"
+window_start = "2025-08-29"
+window_days = 365
+verified_host = "aarch64-apple-darwin"
+
+[[toolchains]]
+kind = "development"
+release = "1.100.0-nightly"
+commit_hash = "bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed"
+commit_date = "2026-08-26"
+
+[[toolchains]]
+kind = "stable"
+release = "1.90.0"
+release_date = "2025-09-18"
+commit_hash = "1159e78c4747b02ef996e55082b704c09b970588"
+commit_date = "2025-09-14"
+
+[[toolchains]]
+kind = "stable"
+release = "1.91.0"
+release_date = "2025-10-30"
+commit_hash = "f8297e351a40c1439a467bbbb6879088047f50b3"
+commit_date = "2025-10-28"
+
+[[toolchains]]
+kind = "stable"
+release = "1.91.1"
+release_date = "2025-11-10"
+commit_hash = "ed61e7d7e242494fb7057f2657300d9e77bb4fcb"
+commit_date = "2025-11-07"
+
+[[toolchains]]
+kind = "stable"
+release = "1.92.0"
+release_date = "2025-12-11"
+commit_hash = "ded5c06cf21d2b93bffd5d884aa6e96934ee4234"
+commit_date = "2025-12-08"
+
+[[toolchains]]
+kind = "stable"
+release = "1.93.0"
+release_date = "2026-01-22"
+commit_hash = "254b59607d4417e9dffbc307138ae5c86280fe4c"
+commit_date = "2026-01-19"
+
+[[toolchains]]
+kind = "stable"
+release = "1.93.1"
+release_date = "2026-02-12"
+commit_hash = "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf"
+commit_date = "2026-02-11"
+
+[[toolchains]]
+kind = "stable"
+release = "1.94.0"
+release_date = "2026-03-05"
+commit_hash = "4a4ef493e3a1488c6e321570238084b38948f6db"
+commit_date = "2026-03-02"
+
+[[toolchains]]
+kind = "stable"
+release = "1.94.1"
+release_date = "2026-03-26"
+commit_hash = "e408947bfd200af42db322daf0fadfe7e26d3bd1"
+commit_date = "2026-03-25"
+
+[[toolchains]]
+kind = "stable"
+release = "1.95.0"
+release_date = "2026-04-16"
+commit_hash = "59807616e1fa2540724bfbac14d7976d7e4a3860"
+commit_date = "2026-04-14"
+
+[[toolchains]]
+kind = "stable"
+release = "1.96.0"
+release_date = "2026-05-28"
+commit_hash = "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96"
+commit_date = "2026-05-25"
+
+[[toolchains]]
+kind = "stable"
+release = "1.96.1"
+release_date = "2026-06-30"
+commit_hash = "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd"
+commit_date = "2026-06-26"
+
+[[toolchains]]
+kind = "stable"
+release = "1.97.0"
+release_date = "2026-07-09"
+commit_hash = "2d8144b7880597b6e6d3dfd63a9a9efae3f533d3"
+commit_date = "2026-07-07"
+
+[[toolchains]]
+kind = "stable"
+release = "1.97.1"
+release_date = "2026-07-16"
+commit_hash = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+commit_date = "2026-07-14"
+
+[[toolchains]]
+kind = "stable"
+release = "1.98.0"
+release_date = "2026-08-20"
+commit_hash = "88d9e12ae178fab0fb5cc050a94da85685d449ea"
+commit_date = "2026-08-18"

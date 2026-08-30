@@ -13,7 +13,7 @@ use crate::{
     cli::FastCli,
     model::{
         BucketReport, ComplexityMetrics, Contexts, Diagnostic, DiagnosticSeverity, FileReport,
-        LineCounts, OutputRole, Report,
+        LineCounts, OutputRole, Report, SelectedPathKind, SelectedPathReport, SelectionReport,
     },
     source::{ContentKind, LocalFile, analyze_file, reachability_states},
     workspace::{Inventory, inventory},
@@ -76,11 +76,15 @@ pub fn analyze(cli: &FastCli) -> Result<Report> {
                     }
                     files.insert(path, file);
                 }
-                Err(error) => inventory.diagnostics.push(Diagnostic {
-                    severity: DiagnosticSeverity::Error,
-                    path: Some(inventory.display_path(&path)),
-                    message: format!("cannot read source: {error}"),
-                }),
+                Err(error) => {
+                    if inventory.should_report(&path) {
+                        inventory.diagnostics.push(Diagnostic {
+                            severity: DiagnosticSeverity::Error,
+                            path: Some(inventory.display_path(&path)),
+                            message: format!("cannot read source: {error}"),
+                        });
+                    }
+                }
             }
         }
     }
@@ -92,7 +96,8 @@ pub fn analyze(cli: &FastCli) -> Result<Report> {
         .map(|(index, path)| (path.clone(), index))
         .collect::<HashMap<_, _>>();
     let contexts = classify_module_graph(&inventory, &files, &path_indices);
-    build_report(inventory, files, paths, contexts)
+    let selection = selection_report(&inventory, cli);
+    build_report(inventory, files, paths, contexts, selection)
 }
 
 fn classify_module_graph(
@@ -177,6 +182,7 @@ fn build_report(
     files: BTreeMap<PathBuf, LocalFile>,
     paths: Vec<PathBuf>,
     contexts: Vec<Contexts>,
+    selection: SelectionReport,
 ) -> Result<Report> {
     let mut project_buckets = empty_buckets();
     let mut project_total = LineCounts::default();
@@ -286,8 +292,9 @@ fn build_report(
     }
 
     Ok(Report {
-        schema_version: 2,
+        schema_version: 3,
         root: inventory.root.to_string_lossy().into_owned(),
+        selection,
         profile: inventory.profile,
         file_count: file_reports.len() as u64,
         bytes,
@@ -300,6 +307,39 @@ fn build_report(
         metrics: project_metrics,
         diagnostics: inventory.diagnostics,
     })
+}
+
+fn selection_report(inventory: &Inventory, cli: &FastCli) -> SelectionReport {
+    let mut paths = inventory
+        .requested
+        .iter()
+        .map(|path| {
+            let kind = if path.is_dir() {
+                SelectedPathKind::Directory
+            } else {
+                SelectedPathKind::File
+            };
+            let relative = path.strip_prefix(&inventory.root).unwrap_or(path);
+            let path = if relative.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            };
+            SelectedPathReport { path, kind }
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    paths.dedup();
+    SelectionReport {
+        paths,
+        include_hidden: cli.hidden,
+        respect_ignores: !cli.no_ignore,
+        ignore_boundary: "path",
+    }
 }
 
 fn empty_buckets() -> [BucketReport; crate::model::OUTPUT_ROLE_COUNT] {

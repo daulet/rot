@@ -8,17 +8,22 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
-    BUILD_DIR_ENV, PINNED_RUSTC_COMMIT, RUN_ID_ENV, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV,
+    BUILD_DIR_ENV, CompilerIdentity, RUN_ID_ENV, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV,
     TARGET_DIR_ENV,
 };
 use tempfile::{Builder, TempDir};
 
 use crate::cli::AuditCli;
 
-pub const TOOLCHAIN: &str = "nightly-2026-08-27";
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedCompiler {
+    pub(crate) identity: CompilerIdentity,
+    pub(crate) linked_version: String,
+}
 
 pub struct CompilerEnvironment {
     pub artifacts: ArtifactDirs,
+    pub selected: SelectedCompiler,
     dynamic_library_path: OsString,
 }
 
@@ -31,29 +36,15 @@ pub struct ArtifactDirs {
 }
 
 impl CompilerEnvironment {
-    pub fn discover(cli: &AuditCli, workspace: &Path) -> Result<Self> {
-        reject_compiler_overrides(workspace)?;
+    pub fn discover(cli: &AuditCli, workspace: &Path, selected: &SelectedCompiler) -> Result<Self> {
+        reject_compiler_overrides(cli, workspace)?;
         let artifacts = ArtifactDirs::new(cli.scratch_dir.as_deref())?;
-        let verbose = pinned_output(workspace, "rustc", ["-Vv"])?;
-        if !verbose.status.success() {
-            bail!(
-                "cannot query pinned rustc: {}",
-                String::from_utf8_lossy(&verbose.stderr).trim()
-            );
-        }
-        let verbose = String::from_utf8(verbose.stdout).context("rustc -Vv was not UTF-8")?;
-        let commit = field(&verbose, "commit-hash").context("rustc -Vv omitted commit-hash")?;
-        if commit != PINNED_RUSTC_COMMIT {
-            bail!("pinned rustc commit mismatch: expected {PINNED_RUSTC_COMMIT}, found {commit}");
-        }
-        let host = field(&verbose, "host")
-            .context("rustc -Vv omitted host")?
-            .to_owned();
+        let host = &selected.identity.host;
 
-        let sysroot = pinned_output(workspace, "rustc", ["--print", "sysroot"])?;
+        let sysroot = toolchain_output(cli, workspace, "rustc", ["--print", "sysroot"])?;
         if !sysroot.status.success() {
             bail!(
-                "cannot query pinned rustc sysroot: {}",
+                "cannot query selected rustc sysroot: {}",
                 String::from_utf8_lossy(&sysroot.stderr).trim()
             );
         }
@@ -62,10 +53,10 @@ impl CompilerEnvironment {
                 .context("rustc sysroot was not UTF-8")?
                 .trim(),
         );
-        let compiler_lib = sysroot.join("lib/rustlib").join(&host).join("lib");
+        let compiler_lib = sysroot.join("lib/rustlib").join(host).join("lib");
         if !compiler_lib.is_dir() {
             bail!(
-                "pinned rustc-dev library directory is missing: {}",
+                "selected rustc-dev library directory is missing: {}",
                 compiler_lib.display()
             );
         }
@@ -73,6 +64,7 @@ impl CompilerEnvironment {
 
         Ok(Self {
             artifacts,
+            selected: selected.clone(),
             dynamic_library_path,
         })
     }
@@ -91,7 +83,7 @@ impl CompilerEnvironment {
         target: &str,
         selected_manifest_dirs: &OsStr,
     ) -> Result<Command> {
-        let mut command = pinned_command("cargo");
+        let mut command = toolchain_command(cli, "cargo");
         command
             .current_dir(workspace)
             .arg("check")
@@ -109,6 +101,7 @@ impl CompilerEnvironment {
             .env(BUILD_DIR_ENV, &self.artifacts.build)
             .env("CARGO_TARGET_DIR", &self.artifacts.target)
             .env("CARGO_BUILD_BUILD_DIR", &self.artifacts.build)
+            .env_remove("RUSTC_BOOTSTRAP")
             .env(dynamic_library_variable(), &self.dynamic_library_path);
 
         if cli.locked {
@@ -128,12 +121,12 @@ impl CompilerEnvironment {
             }
         }
         if !cli.cfg.is_empty() {
-            if cargo_target_rustflags_configured(workspace)? {
+            if cargo_target_rustflags_configured(cli, workspace)? {
                 bail!(
                     "custom --cfg cannot be composed safely with Cargo target-specific rustflags"
                 );
             }
-            let mut flags = configured_build_rustflags(workspace)?;
+            let mut flags = configured_build_rustflags(cli, workspace)?;
             flags.reserve(cli.cfg.len() * 2);
             for predicate in &cli.cfg {
                 flags.push("--cfg".to_owned());
@@ -153,17 +146,54 @@ impl CompilerEnvironment {
     }
 }
 
+pub(super) fn selected_compiler(cli: &AuditCli, workspace: &Path) -> Result<SelectedCompiler> {
+    let verbose = toolchain_output(cli, workspace, "rustc", ["-Vv"])?;
+    if !verbose.status.success() {
+        bail!(
+            "cannot query selected rustc {}: {}",
+            cli.toolchain,
+            String::from_utf8_lossy(&verbose.stderr).trim()
+        );
+    }
+    let verbose = String::from_utf8(verbose.stdout).context("rustc -Vv was not UTF-8")?;
+    let linked_version = verbose
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("rustc "))
+        .context("rustc -Vv omitted its version header")?
+        .to_owned();
+    let compiler = CompilerIdentity {
+        release: field(&verbose, "release")
+            .context("rustc -Vv omitted release")?
+            .to_owned(),
+        commit_hash: field(&verbose, "commit-hash")
+            .context("rustc -Vv omitted commit-hash")?
+            .to_owned(),
+        commit_date: field(&verbose, "commit-date")
+            .context("rustc -Vv omitted commit-date")?
+            .to_owned(),
+        host: field(&verbose, "host")
+            .context("rustc -Vv omitted host")?
+            .to_owned(),
+    };
+    super::support::validate(&compiler)?;
+    Ok(SelectedCompiler {
+        identity: compiler,
+        linked_version,
+    })
+}
+
 pub(super) fn effective_target(cli: &AuditCli, workspace: &Path) -> Result<String> {
     if let Some(target) = &cli.target {
         return Ok(target.clone());
     }
-    if let Some(target) = cargo_config_json(workspace, "build.target")? {
+    if let Some(target) = cargo_config_json(cli, workspace, "build.target")? {
         return configured_target(target);
     }
-    let verbose = pinned_output(workspace, "rustc", ["-vV"])?;
+    let verbose = toolchain_output(cli, workspace, "rustc", ["-vV"])?;
     if !verbose.status.success() {
         bail!(
-            "cannot query pinned rustc target: {}",
+            "cannot query selected rustc target: {}",
             String::from_utf8_lossy(&verbose.stderr).trim()
         );
     }
@@ -229,10 +259,10 @@ impl ArtifactDirs {
     }
 }
 
-pub(super) fn reject_compiler_overrides(workspace: &Path) -> Result<()> {
+pub(super) fn reject_compiler_overrides(cli: &AuditCli, workspace: &Path) -> Result<()> {
     for variable in ["RUSTC", "CARGO_BUILD_RUSTC"] {
         if env::var_os(variable).is_some() {
-            bail!("visibility audit rejects {variable}; it must use the exact pinned rustc");
+            bail!("visibility audit rejects {variable}; it must use the exact selected rustc");
         }
     }
     for variable in [
@@ -244,20 +274,20 @@ pub(super) fn reject_compiler_overrides(workspace: &Path) -> Result<()> {
         }
     }
     for key in ["build.rustc", "build.rustc-workspace-wrapper"] {
-        if let Some(value) = cargo_config(workspace, key)? {
+        if let Some(value) = cargo_config(cli, workspace, key)? {
             bail!("visibility audit rejects Cargo {key}={value:?}");
         }
     }
     Ok(())
 }
 
-pub fn ordinary_wrapper_configured(workspace: &Path) -> Result<bool> {
+pub fn ordinary_wrapper_configured(cli: &AuditCli, workspace: &Path) -> Result<bool> {
     if env::var_os("RUSTC_WRAPPER").is_some_and(|value| !value.is_empty())
         || env::var_os("CARGO_BUILD_RUSTC_WRAPPER").is_some_and(|value| !value.is_empty())
     {
         return Ok(true);
     }
-    Ok(cargo_config(workspace, "build.rustc-wrapper")?.is_some())
+    Ok(cargo_config(cli, workspace, "build.rustc-wrapper")?.is_some())
 }
 
 pub fn custom_cfg_environment_is_safe() -> bool {
@@ -270,8 +300,8 @@ pub fn custom_cfg_environment_is_safe() -> bool {
     })
 }
 
-fn cargo_config(workspace: &Path, key: &str) -> Result<Option<String>> {
-    let Some(current) = cargo_config_json(workspace, key)? else {
+fn cargo_config(cli: &AuditCli, workspace: &Path, key: &str) -> Result<Option<String>> {
+    let Some(current) = cargo_config_json(cli, workspace, key)? else {
         return Ok(None);
     };
     let value = current
@@ -280,8 +310,12 @@ fn cargo_config(workspace: &Path, key: &str) -> Result<Option<String>> {
     Ok((!value.is_empty()).then(|| value.to_owned()))
 }
 
-fn cargo_config_json(workspace: &Path, key: &str) -> Result<Option<serde_json::Value>> {
-    let output = pinned_command("cargo")
+fn cargo_config_json(
+    cli: &AuditCli,
+    workspace: &Path,
+    key: &str,
+) -> Result<Option<serde_json::Value>> {
+    let output = unstable_cargo_command(cli)
         .current_dir(workspace)
         .args([
             "-Z",
@@ -311,8 +345,8 @@ fn cargo_config_json(workspace: &Path, key: &str) -> Result<Option<serde_json::V
     Ok(Some(current.clone()))
 }
 
-fn configured_build_rustflags(workspace: &Path) -> Result<Vec<String>> {
-    let Some(value) = cargo_config_json(workspace, "build.rustflags")? else {
+fn configured_build_rustflags(cli: &AuditCli, workspace: &Path) -> Result<Vec<String>> {
+    let Some(value) = cargo_config_json(cli, workspace, "build.rustflags")? else {
         return Ok(Vec::new());
     };
     match value {
@@ -331,8 +365,8 @@ fn configured_build_rustflags(workspace: &Path) -> Result<Vec<String>> {
     }
 }
 
-fn cargo_target_rustflags_configured(workspace: &Path) -> Result<bool> {
-    let Some(value) = cargo_config_json(workspace, "target")? else {
+fn cargo_target_rustflags_configured(cli: &AuditCli, workspace: &Path) -> Result<bool> {
+    let Some(value) = cargo_config_json(cli, workspace, "target")? else {
         return Ok(false);
     };
     Ok(contains_key(&value, "rustflags"))
@@ -348,21 +382,30 @@ fn contains_key(value: &serde_json::Value, key: &str) -> bool {
     }
 }
 
-fn pinned_output<const N: usize>(
+fn toolchain_output<const N: usize>(
+    cli: &AuditCli,
     workspace: &Path,
     program: &str,
     arguments: [&str; N],
 ) -> Result<Output> {
-    pinned_command(program)
+    toolchain_command(cli, program)
         .current_dir(workspace)
         .args(arguments)
         .output()
-        .with_context(|| format!("cannot run pinned {program}"))
+        .with_context(|| format!("cannot run {program} from toolchain {}", cli.toolchain))
 }
 
-pub(super) fn pinned_command(program: &str) -> Command {
+pub(super) fn toolchain_command(cli: &AuditCli, program: &str) -> Command {
     let mut command = Command::new("rustup");
-    command.args(["run", TOOLCHAIN, program]);
+    command.args(["run", &cli.toolchain, program]);
+    command
+}
+
+pub(super) fn unstable_cargo_command(cli: &AuditCli) -> Command {
+    let mut command = toolchain_command(cli, "cargo");
+    // Stable Cargo otherwise rejects these read-only preflights. The actual
+    // Cargo build removes this injected process value; project config is kept.
+    command.env("RUSTC_BOOTSTRAP", "1");
     command
 }
 
@@ -392,6 +435,8 @@ fn prepend_path(variable: &str, path: &Path) -> Result<OsString> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     #[test]
@@ -413,6 +458,50 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("requires one")
+        );
+    }
+
+    #[test]
+    fn ambient_bootstrap_is_removed_from_the_project_cargo_command() {
+        let cli =
+            AuditCli::parse_from(["rot-audit", "--driver", "driver", "--toolchain", "1.98.0"]);
+        let environment = CompilerEnvironment {
+            artifacts: ArtifactDirs::new(None).unwrap(),
+            selected: SelectedCompiler {
+                identity: CompilerIdentity {
+                    release: "1.98.0".to_owned(),
+                    commit_hash: "commit".to_owned(),
+                    commit_date: "date".to_owned(),
+                    host: "host".to_owned(),
+                },
+                linked_version: "linked".to_owned(),
+            },
+            dynamic_library_path: OsString::new(),
+        };
+        let command = environment
+            .cargo_command(
+                Path::new("workspace"),
+                Path::new("driver"),
+                &cli,
+                "target",
+                OsStr::new("manifest"),
+            )
+            .unwrap();
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == "RUSTC_BOOTSTRAP")
+                .map(|(_, value)| value),
+            Some(None),
+        );
+
+        let preflight = unstable_cargo_command(&cli);
+        assert_eq!(
+            preflight
+                .get_envs()
+                .find(|(name, _)| *name == "RUSTC_BOOTSTRAP")
+                .and_then(|(_, value)| value),
+            Some(OsStr::new("1")),
         );
     }
 }

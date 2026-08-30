@@ -4,6 +4,7 @@ mod correlation;
 mod environment;
 mod profile;
 mod sidecar;
+mod support;
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -13,8 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
-    Availability, CfgValue, DRIVER_VERSION, HANDSHAKE_ARG, Handshake, PINNED_RUSTC_COMMIT,
-    PINNED_RUSTC_RELEASE, PINNED_RUSTC_VERSION, PROTOCOL_VERSION, Product,
+    Availability, CfgValue, DRIVER_VERSION, HANDSHAKE_ARG, Handshake, PROTOCOL_VERSION, Product,
 };
 
 use crate::{
@@ -32,9 +32,9 @@ use self::{
     sidecar::Invocation,
 };
 
-const DRIVER_ENV: &str = "ROT_AUDIT_DRIVER";
+pub(crate) use environment::SelectedCompiler;
 
-pub(crate) fn pinned_metadata(
+pub(crate) fn compiler_metadata(
     cli: &AuditCli,
     workspace: &Path,
     no_dependencies: bool,
@@ -46,6 +46,10 @@ pub(crate) fn effective_target(cli: &AuditCli, workspace: &Path) -> Result<Strin
     environment::effective_target(cli, workspace)
 }
 
+pub(crate) fn selected_compiler(cli: &AuditCli, workspace: &Path) -> Result<SelectedCompiler> {
+    environment::selected_compiler(cli, workspace)
+}
+
 pub struct Outcome {
     pub report: CompilerReport,
     pub diagnostics: Vec<Diagnostic>,
@@ -53,17 +57,26 @@ pub struct Outcome {
 
 pub fn collect(cli: &AuditCli, inventory: &Inventory) -> Outcome {
     if inventory.packages.is_empty() {
-        return unavailable("visibility audit requires a Cargo workspace or package".to_owned());
+        return unavailable(
+            inventory,
+            "visibility audit requires a Cargo workspace or package".to_owned(),
+        );
     }
     let compiler_profile = match profile::resolve(cli, inventory) {
         Ok(profile) => profile,
         Err(error) => {
-            return unavailable(format!("compiler analysis unavailable: {error:#}"));
+            return unavailable(
+                inventory,
+                format!("compiler analysis unavailable: {error:#}"),
+            );
         }
     };
     match try_collect(cli, inventory, &compiler_profile) {
         Ok(outcome) => outcome,
-        Err(error) => unavailable(format!("compiler analysis unavailable: {error:#}")),
+        Err(error) => unavailable(
+            inventory,
+            format!("compiler analysis unavailable: {error:#}"),
+        ),
     }
 }
 
@@ -76,8 +89,8 @@ fn try_collect(
         bail!("custom --cfg cannot be composed with configured rustflag environment variables");
     }
 
-    let driver = locate_driver(cli)?;
-    let ordinary_wrapper = environment::ordinary_wrapper_configured(&inventory.root)?;
+    let driver = explicit_driver(&cli.driver)?;
+    let ordinary_wrapper = environment::ordinary_wrapper_configured(cli, &inventory.root)?;
     let first = run_once(cli, inventory, compiler_profile, &driver, false)?;
     let retry = ordinary_wrapper
         && (first.correlation.missing_invoked_sidecars > 0
@@ -117,7 +130,8 @@ fn run_once(
     driver: &Path,
     disable_ordinary_wrapper: bool,
 ) -> Result<CollectedRun> {
-    let environment = CompilerEnvironment::discover(cli, &inventory.root)?;
+    let environment =
+        CompilerEnvironment::discover(cli, &inventory.root, inventory.selected_compiler())?;
     let handshake = handshake(&environment, driver)?;
     let selected_manifest_dirs = selected_manifest_dirs(inventory)?;
     let mut command = environment.cargo_command(
@@ -199,19 +213,22 @@ fn handshake(environment: &CompilerEnvironment, driver: &Path) -> Result<Handsha
             handshake.driver_version
         );
     }
-    if handshake.linked_rustc_version != PINNED_RUSTC_VERSION {
+    if handshake.linked_rustc_version != environment.selected.linked_version {
         bail!(
-            "compiler driver linked-rustc mismatch: expected {PINNED_RUSTC_VERSION}, found {}",
+            "compiler driver linked-rustc mismatch: selected toolchain is {}, driver is {}",
+            environment.selected.linked_version,
             handshake.linked_rustc_version
         );
     }
-    if handshake.rustc.commit_hash != PINNED_RUSTC_COMMIT
-        || handshake.rustc.release != PINNED_RUSTC_RELEASE
-    {
+    if handshake.rustc != environment.selected.identity {
         bail!(
-            "compiler toolchain mismatch: expected {PINNED_RUSTC_RELEASE} ({PINNED_RUSTC_COMMIT}), found {} ({})",
+            "compiler toolchain mismatch: selected {} ({} for {}), driver is {} ({} for {})",
+            environment.selected.identity.release,
+            environment.selected.identity.commit_hash,
+            environment.selected.identity.host,
             handshake.rustc.release,
-            handshake.rustc.commit_hash
+            handshake.rustc.commit_hash,
+            handshake.rustc.host,
         );
     }
     Ok(handshake)
@@ -334,6 +351,8 @@ fn build_outcome(
             driver_version: run.handshake.driver_version.to_string(),
             rustc_version: run.handshake.rustc.release,
             rustc_commit: run.handshake.rustc.commit_hash,
+            rustc_commit_date: run.handshake.rustc.commit_date,
+            rustc_host: run.handshake.rustc.host,
             expected_invocations: expected as u64,
             collected_invocations: collected as u64,
             correlated_invocations: run.correlation.correlated as u64,
@@ -596,43 +615,12 @@ fn normalize_cfg(value: &str) -> String {
         })
 }
 
-fn locate_driver(cli: &AuditCli) -> Result<PathBuf> {
-    if let Some(explicit) = cli
-        .driver
-        .clone()
-        .or_else(|| env::var_os(DRIVER_ENV).map(PathBuf::from))
-    {
-        if !explicit.is_file() {
-            bail!("compiler driver {} does not exist", explicit.display());
-        }
-        return fs::canonicalize(&explicit)
-            .with_context(|| format!("cannot resolve compiler driver {}", explicit.display()));
+fn explicit_driver(driver: &Path) -> Result<PathBuf> {
+    if !driver.is_file() {
+        bail!("compiler driver {} does not exist", driver.display());
     }
-    let mut candidates = Vec::new();
-    if let Ok(executable) = env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        candidates.push(directory.join(driver_filename()));
-    }
-    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    candidates.push(
-        repository
-            .join("compiler/rot-rustc-driver/target/release")
-            .join(driver_filename()),
-    );
-    candidates.push(
-        repository
-            .join("compiler/rot-rustc-driver/target/debug")
-            .join(driver_filename()),
-    );
-    for candidate in candidates {
-        if candidate.is_file() {
-            return fs::canonicalize(&candidate).with_context(|| {
-                format!("cannot resolve compiler driver {}", candidate.display())
-            });
-        }
-    }
-    bail!("rot-rustc-driver was not found; build compiler/rot-rustc-driver or pass --driver PATH")
+    fs::canonicalize(driver)
+        .with_context(|| format!("cannot resolve compiler driver {}", driver.display()))
 }
 
 fn apply_build_script_cfg_issues(run: &mut CollectedRun) -> Vec<String> {
@@ -720,21 +708,16 @@ fn append_issue(current: &mut Option<String>, issue: &str) {
     }
 }
 
-fn driver_filename() -> &'static str {
-    if cfg!(windows) {
-        "rot-rustc-driver.exe"
-    } else {
-        "rot-rustc-driver"
-    }
-}
-
-fn unavailable(reason: String) -> Outcome {
+fn unavailable(inventory: &Inventory, reason: String) -> Outcome {
+    let compiler = &inventory.selected_compiler().identity;
     Outcome {
         report: CompilerReport {
             protocol_version: PROTOCOL_VERSION,
             driver_version: DRIVER_VERSION.to_string(),
-            rustc_version: PINNED_RUSTC_RELEASE.to_owned(),
-            rustc_commit: PINNED_RUSTC_COMMIT.to_owned(),
+            rustc_version: compiler.release.clone(),
+            rustc_commit: compiler.commit_hash.clone(),
+            rustc_commit_date: compiler.commit_date.clone(),
+            rustc_host: compiler.host.clone(),
             expected_invocations: 0,
             collected_invocations: 0,
             correlated_invocations: 0,

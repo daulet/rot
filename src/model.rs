@@ -303,7 +303,10 @@ pub struct FileReport {
 pub struct ProfileReport {
     pub target: String,
     pub rustc: String,
+    pub cfg_preset: String,
+    pub cfg_resolution: String,
     pub feature_mode: String,
+    pub feature_resolution: String,
     pub enabled_features: BTreeMap<String, Vec<String>>,
     pub excluded_features: Vec<String>,
     pub active_cfg: Vec<String>,
@@ -462,6 +465,8 @@ pub struct CompilerReport {
     pub driver_version: String,
     pub rustc_version: String,
     pub rustc_commit: String,
+    pub rustc_commit_date: String,
+    pub rustc_host: String,
     pub expected_invocations: u64,
     pub collected_invocations: u64,
     pub correlated_invocations: u64,
@@ -479,6 +484,7 @@ pub struct CompilerReport {
 pub struct Report {
     pub schema_version: u32,
     pub root: String,
+    pub selection: SelectionReport,
     pub profile: ProfileReport,
     pub file_count: u64,
     pub bytes: u64,
@@ -488,4 +494,34 @@ pub struct Report {
     #[serde(flatten)]
     pub metrics: ComplexityMetrics,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectionReport {
+    pub paths: Vec<SelectedPathReport>,
+    pub include_hidden: bool,
+    pub respect_ignores: bool,
+    pub ignore_boundary: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectedPathReport {
+    pub path: String,
+    pub kind: SelectedPathKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectedPathKind {
+    File,
+    Directory,
+}
+
+impl SelectedPathKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
 }

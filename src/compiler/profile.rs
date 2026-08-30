@@ -53,7 +53,7 @@ impl CompilerProfile {
 }
 
 pub(super) fn resolve(cli: &AuditCli, inventory: &Inventory) -> Result<CompilerProfile> {
-    environment::reject_compiler_overrides(&inventory.root)?;
+    environment::reject_compiler_overrides(cli, &inventory.root)?;
     let target = inventory
         .audit_target
         .as_deref()
@@ -63,7 +63,7 @@ pub(super) fn resolve(cli: &AuditCli, inventory: &Inventory) -> Result<CompilerP
 }
 
 fn load_unit_graph(cli: &AuditCli, workspace: &Path, target: &str) -> Result<Vec<ExpectedUnit>> {
-    let mut command = environment::pinned_command("cargo");
+    let mut command = environment::unstable_cargo_command(cli);
     command.current_dir(workspace).args([
         "check",
         "-Z",
@@ -77,18 +77,18 @@ fn load_unit_graph(cli: &AuditCli, workspace: &Path, target: &str) -> Result<Vec
     append_profile_options(&mut command, cli);
     let output = command
         .output()
-        .context("cannot query pinned Cargo unit graph")?;
+        .context("cannot query selected Cargo unit graph")?;
     if !output.status.success() {
         bail!(
-            "pinned Cargo unit-graph preflight failed: {}",
+            "selected Cargo unit-graph preflight failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let graph: UnitGraph =
-        serde_json::from_slice(&output.stdout).context("pinned Cargo unit graph was malformed")?;
+    let graph: UnitGraph = serde_json::from_slice(&output.stdout)
+        .context("selected Cargo unit graph was malformed")?;
     if graph.version != 1 {
         bail!(
-            "unsupported pinned Cargo unit-graph version {}",
+            "unsupported selected Cargo unit-graph version {}",
             graph.version
         );
     }
@@ -148,18 +148,18 @@ pub(crate) fn load_metadata(
     let mut command = metadata_command(cli, workspace, no_dependencies)?;
     let output = command
         .output()
-        .context("cannot run pinned Cargo metadata preflight")?;
+        .context("cannot run selected Cargo metadata preflight")?;
     if !output.status.success() {
         bail!(
-            "pinned Cargo metadata preflight failed: {}",
+            "selected Cargo metadata preflight failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    serde_json::from_slice(&output.stdout).context("pinned Cargo metadata was malformed")
+    serde_json::from_slice(&output.stdout).context("selected Cargo metadata was malformed")
 }
 
 fn metadata_command(cli: &AuditCli, workspace: &Path, no_dependencies: bool) -> Result<Command> {
-    let mut command = environment::pinned_command("cargo");
+    let mut command = environment::toolchain_command(cli, "cargo");
     command
         .current_dir(workspace)
         .args(["metadata", "--format-version", "1"]);
@@ -204,6 +204,8 @@ mod tests {
     fn metadata_preflight_uses_compiler_profile_controls() {
         let cli = AuditCli::parse_from([
             "rot-audit",
+            "--driver",
+            "driver",
             "--features",
             "member/selected",
             "--no-default-features",
@@ -221,7 +223,7 @@ mod tests {
             arguments,
             [
                 "run",
-                environment::TOOLCHAIN,
+                "nightly-2026-08-27",
                 "cargo",
                 "metadata",
                 "--format-version",

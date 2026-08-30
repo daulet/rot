@@ -60,7 +60,7 @@ pub struct CargoRun {
 pub fn run(command: &mut Command) -> Result<CargoRun> {
     let output = command
         .output()
-        .context("cannot run pinned Cargo compiler pass")?;
+        .context("cannot run selected Cargo compiler pass")?;
     let mut artifacts = Vec::new();
     let mut failures = Vec::new();
     let mut build_script_outputs = Vec::new();

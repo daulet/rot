@@ -341,13 +341,11 @@ fn references_cover_typed_bodies_interfaces_visibility_and_roots() {
             ReferenceKind::Body,
         );
     }
-    for field in ["field_precision::Named::rest"] {
-        assert!(!references.iter().any(|reference| {
-            reference.kind == ReferenceKind::Body
-                && paths.get(&reference.from) == Some(&"field_precision::destructure")
-                && paths.get(&reference.to) == Some(&field)
-        }));
-    }
+    assert!(!references.iter().any(|reference| {
+        reference.kind == ReferenceKind::Body
+            && paths.get(&reference.from) == Some(&"field_precision::destructure")
+            && paths.get(&reference.to) == Some(&"field_precision::Named::rest")
+    }));
     assert_reference(
         &references,
         &paths,
@@ -882,19 +880,7 @@ fn bare_test_cfg_agrees_across_invocation_and_profile() {
 
 #[test]
 fn explicit_host_triple_is_a_target_context_on_the_wire() {
-    let rustc = command_output(Command::new("rustup").args([
-        "which",
-        "--toolchain",
-        "nightly-2026-08-27",
-        "rustc",
-    ]));
-    let rustc = String::from_utf8(rustc.stdout).unwrap();
-    let verbose = command_output(Command::new(rustc.trim()).arg("-vV"));
-    let verbose = String::from_utf8(verbose.stdout).unwrap();
-    let host = verbose
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .unwrap();
+    let host = env!("ROT_BUILD_RUSTC_HOST");
     let target = format!("--target={host}");
     let records = collect_source_with_rustc_args(
         "explicit_host_target",
@@ -1083,14 +1069,7 @@ fn run_fixture_path_with_args(
         fs::create_dir(path).unwrap();
     }
 
-    let rustc = command_output(Command::new("rustup").args([
-        "which",
-        "--toolchain",
-        "nightly-2026-08-27",
-        "rustc",
-    ]));
-    let rustc = String::from_utf8(rustc.stdout).unwrap();
-    let rustc = rustc.trim();
+    let rustc = env!("ROT_BUILD_RUSTC");
     let sysroot = command_output(Command::new(rustc).args(["--print", "sysroot"]));
     let sysroot = String::from_utf8(sysroot.stdout).unwrap();
     let dynamic_libraries = Path::new(sysroot.trim()).join("lib");
@@ -1098,7 +1077,7 @@ fn run_fixture_path_with_args(
     let output = Command::new(env!("CARGO_BIN_EXE_rot-rustc-driver"))
         .arg(rustc)
         .args(["--crate-name", name])
-        .arg(&fixture)
+        .arg(fixture)
         .args(["--crate-type", crate_type, "--edition", "2024", "--out-dir"])
         .arg(&out_dir)
         .args(["--emit", "metadata"])
@@ -1115,6 +1094,7 @@ fn run_fixture_path_with_args(
         .env("CARGO_PKG_NAME", name)
         .env("CARGO_PRIMARY_PACKAGE", "1")
         .env("OUT_DIR", &build_script_out_dir)
+        .env("RUSTC_BOOTSTRAP", "1")
         .env("DYLD_LIBRARY_PATH", &dynamic_libraries)
         .env("LD_LIBRARY_PATH", &dynamic_libraries)
         .output()

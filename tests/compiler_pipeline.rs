@@ -66,11 +66,11 @@ fn incomplete_report(output: &Output) -> Value {
     report
 }
 
-fn pinned_host() -> String {
+fn default_host() -> String {
     let output = Command::new("rustup")
         .args(["run", "nightly-2026-08-27", "rustc", "-vV"])
         .output()
-        .expect("query pinned rustc host");
+        .expect("query default rustc host");
     assert!(output.status.success());
     String::from_utf8(output.stdout)
         .unwrap()
@@ -91,6 +91,16 @@ fn required_paths(report: &Value) -> BTreeSet<&str> {
 
 fn findings(report: &Value) -> &[Value] {
     report["closed_world"]["findings"].as_array().unwrap()
+}
+
+fn assert_default_compiler_identity(report: &Value) {
+    assert_eq!(report["rustc_version"], "1.100.0-nightly");
+    assert_eq!(
+        report["rustc_commit"],
+        "bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed"
+    );
+    assert_eq!(report["rustc_commit_date"], "2026-08-26");
+    assert_eq!(report["rustc_host"], "aarch64-apple-darwin");
 }
 
 #[test]
@@ -143,7 +153,7 @@ fn custom_cfg_refuses_ambient_rustflags_before_driver_execution() {
 }
 
 #[test]
-fn rejected_rustc_override_is_a_structured_unavailable_audit() {
+fn rejected_rustc_override_keeps_exact_compiler_identity_in_unavailable_json() {
     // A resolvable override lets metadata establish the report root/profile;
     // the audit must then reject the override as structured unavailable evidence.
     let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
@@ -156,6 +166,7 @@ fn rejected_rustc_override_is_a_structured_unavailable_audit() {
     let report = incomplete_report(&output);
 
     assert_eq!(report["status"], "unavailable");
+    assert_default_compiler_identity(&report);
     assert!(
         report["diagnostics"]
             .as_array()
@@ -175,6 +186,36 @@ fn rejected_rustc_override_is_a_structured_unavailable_audit() {
             .any(|diagnostic| diagnostic["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("does not exist")))
+    );
+}
+
+#[test]
+fn missing_driver_keeps_exact_compiler_identity_in_unavailable_json() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
+        .args([
+            "--driver",
+            "/definitely/not/a/rot-driver",
+            "--locked",
+            "--offline",
+        ])
+        .arg(fixture("workspace"))
+        .args(["--format", "json"])
+        .output()
+        .expect("run rot-audit");
+    let report = incomplete_report(&output);
+
+    assert_eq!(report["status"], "unavailable");
+    assert_default_compiler_identity(&report);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["message"].as_str().is_some_and(|message| {
+                    message.contains("compiler driver") && message.contains("does not exist")
+                })
+            })
     );
 }
 
@@ -315,7 +356,7 @@ fn isolated_runs_are_deterministic_and_leave_no_artifacts() {
 #[test]
 #[ignore = "requires the pinned nightly rustc-dev helper"]
 fn explicit_target_cfg_does_not_require_target_flags_on_host_build_scripts() {
-    let host = pinned_host();
+    let host = default_host();
     let arguments = ["--target", host.as_str(), "--cfg", "rot_requested"];
     let report = complete_report(&run_audit(&fixture("workspace"), &arguments));
 

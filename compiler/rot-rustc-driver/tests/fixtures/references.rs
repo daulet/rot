@@ -28,7 +28,7 @@ pub mod public_api {
     impl Contract for Implementation {
         type Item = Required;
 
-        fn produce(&self) -> Self::Item {
+        fn produce(&self) -> <Self as Contract>::Item {
             Required
         }
 

@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "app",
+    "context-host-leaf",
+    "context-target-leaf",
+    "debug-on",
+    "dev-child",
+    "dev-root",
+    "dual-app",
+    "dual-helper",
+    "host-build-on",
+    "proc-host-on",
+    "proc-macro-member",
+    "proc-macro-target-off",
+    "proc-target-off",
+    "release-off",
+    "target-build-off",
+    "target-off",
+    "target-on",
+]
+default-members = ["app"]
+resolver = "3"

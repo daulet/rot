@@ -1,0 +1,13 @@
+[package]
+name = "proc-macro-member"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+proc-host-on = { path = "../proc-host-on", features = ["marker"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+proc-target-off = { path = "../proc-target-off", features = ["marker"] }
