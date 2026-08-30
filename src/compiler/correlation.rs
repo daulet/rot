@@ -692,23 +692,12 @@ fn sorted(mut values: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn target(
-        name: &str,
-        source: &str,
-        kind: &str,
-        crate_type: &str,
-        required_features: &[&str],
-    ) -> PackageTargetInfo {
+    fn target(name: &str, source: &str, kind: &str, crate_type: &str) -> PackageTargetInfo {
         PackageTargetInfo {
             name: name.to_owned(),
             kinds: vec![kind.to_owned()],
             crate_types: vec![crate_type.to_owned()],
             source: PathBuf::from(source),
-            required_features: required_features
-                .iter()
-                .map(|feature| (*feature).to_owned())
-                .collect(),
-            test_reachable: false,
         }
     }
 
@@ -759,9 +748,9 @@ mod tests {
 
     #[test]
     fn test_mode_only_maps_to_a_unit_test_when_target_is_testable() {
-        let testable = target("sample", "src/lib.rs", "lib", "lib", &[]);
-        let not_testable = target("sample", "src/main.rs", "bin", "bin", &[]);
-        let integration = target("it", "tests/it.rs", "test", "bin", &[]);
+        let testable = target("sample", "src/lib.rs", "lib", "lib");
+        let not_testable = target("sample", "src/main.rs", "bin", "bin");
+        let integration = target("it", "tests/it.rs", "test", "bin");
 
         assert_eq!(invocation_role(&testable, false), Some("production"));
         assert_eq!(invocation_role(&testable, true), Some("unit_test"));

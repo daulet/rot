@@ -1,4 +1,4 @@
-use std::{ops::Deref, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{Args, Parser, ValueEnum};
 
@@ -41,6 +41,24 @@ pub struct CargoSelection {
     pub cfg: Vec<String>,
 }
 
+impl CargoSelection {
+    pub fn feature_mode(&self, exclusions: bool) -> &'static str {
+        match (
+            self.all_features,
+            self.no_default_features,
+            self.features.is_empty(),
+            exclusions,
+        ) {
+            (true, _, _, false) => "all",
+            (true, _, _, true) => "all_except",
+            (false, true, true, _) => "none",
+            (false, true, false, _) => "selected_without_defaults",
+            (false, false, true, _) => "default",
+            (false, false, false, _) => "default_plus_selected",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rot",
@@ -48,29 +66,7 @@ pub struct CargoSelection {
     about = "Fast, configuration-aware Rust source metrics",
     long_about = "Fast, configuration-aware Rust source metrics for humans and coding agents.\n\
                   Counts Rust only; Markdown and other files are ignored.",
-    after_help = "EXAMPLES:\n  \
-                  rot .\n  \
-                  rot . --files\n  \
-                  rot . --format json --summary-only\n  \
-                  rot . --baseline HEAD~1\n  \
-                  rot . --all-features --exclude-feature testability --strict\n  \
-                  rot . --release\n\n\
-                  --files expands the human table; it does not select input files.\n\
-                  Each directory PATH is an ignore boundary: parent .ignore/.gitignore files are not inherited.\n\
-                  Ignore files inside that directory and below still apply; an explicit Rust file is always included.\n\
-                  --baseline compares one Git commit with live Rust discovered under the same PATH-local ignore rules.\n\
-                  Its dirty flag follows repository-wide Git status independently of discovered Rust metrics.\n\
-                  Revision ranges are rejected.\n\
-                  Baseline inputs must exist with the same file/directory kind and belong to one Git repository.\n\
-                  If a selected path changed kind, select a stable containing directory instead.\n\
-                  Unqualified features apply to PATH roots. PACKAGE/FEATURE addresses a forward member without waking its optional path.\n\
-                  A selected root's direct dependency alias may replace PACKAGE and activates that dependency, including renamed aliases.\n\
-                  Feature exclusions never activate dependencies. Dependency contexts propagate through target and host build/proc-macro units.\n\
-                  Authored cfg is one requested-target-global approximation; cross-target host-unit source can differ from Cargo.\n\
-                  Role file counts overlap; Total is the number of distinct Rust files.\n\
-                  Lexical complexity is Rot's SCC-style token score, not a promise of numeric identity with scc.\n\
-                  JSON records normalized PATH/ignore provenance, writes to stdout, and sends diagnostics to stderr.\n\
-                  Metric changes do not change the exit status."
+    after_help = include_str!("fast-help.txt")
 )]
 #[derive(Clone)]
 pub struct FastCli {
@@ -126,13 +122,7 @@ pub struct FastCli {
     pub strict: bool,
 }
 
-impl Deref for FastCli {
-    type Target = CargoSelection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.cargo
-    }
-}
+deref_field!(FastCli => CargoSelection, cargo);
 
 #[cfg(feature = "audit")]
 #[derive(Debug, Parser)]
@@ -191,10 +181,4 @@ pub struct AuditCli {
 }
 
 #[cfg(feature = "audit")]
-impl Deref for AuditCli {
-    type Target = CargoSelection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.cargo
-    }
-}
+deref_field!(AuditCli => CargoSelection, cargo);

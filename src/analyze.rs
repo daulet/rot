@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use anyhow::{Context, Result};
@@ -12,10 +11,11 @@ use crate::{
     cfg::CfgProfile,
     cli::FastCli,
     model::{
-        BucketReport, ComplexityMetrics, Contexts, Diagnostic, DiagnosticSeverity, FileReport,
-        LineCounts, OutputRole, Report, SelectedPathKind, SelectedPathReport, SelectionReport,
+        BucketReport, Contexts, Diagnostic, DiagnosticSeverity, FileReport, OutputRole, Report,
+        SelectedPathKind, SelectedPathReport, SelectionReport, SourceMetrics,
     },
-    source::{ContentKind, LocalFile, analyze_file, reachability_states},
+    paths::{canonical_or_original, portable},
+    source::{LocalFile, analyze_file, reachability_states},
     workspace::{Inventory, inventory},
 };
 
@@ -89,15 +89,14 @@ pub fn analyze(cli: &FastCli) -> Result<Report> {
         }
     }
 
-    let paths = files.keys().cloned().collect::<Vec<_>>();
-    let path_indices = paths
-        .iter()
+    let path_indices = files
+        .keys()
         .enumerate()
         .map(|(index, path)| (path.clone(), index))
         .collect::<HashMap<_, _>>();
     let contexts = classify_module_graph(&inventory, &files, &path_indices);
     let selection = selection_report(&inventory, cli);
-    build_report(inventory, files, paths, contexts, selection)
+    Ok(build_report(inventory, files, contexts, selection))
 }
 
 fn classify_module_graph(
@@ -117,21 +116,14 @@ fn classify_module_graph(
     }
 
     if inventory.packages.is_empty() {
-        let conventional_roots = files
-            .keys()
-            .filter(|path| {
-                matches!(
-                    path.file_name().and_then(|name| name.to_str()),
-                    Some("lib.rs" | "main.rs")
-                )
-            })
-            .filter_map(|path| path_indices.get(path).copied())
-            .collect::<Vec<_>>();
-        for index in conventional_roots {
-            if contexts[index].merge(Contexts::seed(
-                crate::model::TargetRole::Production,
-                crate::model::Reachability::BOTH,
-            )) {
+        for path in files.keys().filter(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("lib.rs" | "main.rs")
+            )
+        }) {
+            let index = path_indices[path];
+            if contexts[index].merge(Contexts::production()) {
                 queue.push_back(index);
             }
         }
@@ -141,12 +133,7 @@ fn classify_module_graph(
 
     if inventory.packages.is_empty() {
         for (index, context) in contexts.iter_mut().enumerate() {
-            if !context.referenced
-                && context.merge(Contexts::seed(
-                    crate::model::TargetRole::Production,
-                    crate::model::Reachability::BOTH,
-                ))
-            {
+            if !context.referenced && context.merge(Contexts::production()) {
                 queue.push_back(index);
             }
         }
@@ -180,72 +167,32 @@ fn propagate(
 fn build_report(
     mut inventory: Inventory,
     files: BTreeMap<PathBuf, LocalFile>,
-    paths: Vec<PathBuf>,
     contexts: Vec<Contexts>,
     selection: SelectionReport,
-) -> Result<Report> {
+) -> Report {
     let mut project_buckets = empty_buckets();
-    let mut project_total = LineCounts::default();
-    let mut project_metrics = ComplexityMetrics::default();
+    let mut project = SourceMetrics::default();
     let mut file_reports = Vec::with_capacity(files.len());
     let mut bytes = 0;
 
-    for (index, path) in paths.iter().enumerate() {
-        if !inventory.should_report(path) {
+    for ((path, file), context) in files.into_iter().zip(contexts) {
+        if !inventory.should_report(&path) {
             continue;
         }
-        let file = &files[path];
-        let context = contexts[index];
-        let display_path = inventory.display_path(path);
+        let display_path = inventory.display_path(&path);
         let package = inventory
-            .package_for(path)
+            .package_for(&path)
             .map(|package| package.name.clone());
         let mut buckets = empty_buckets();
-        let mut total = LineCounts::default();
-        let mut metrics = ComplexityMetrics::default();
-
-        for line in &file.lines {
-            let role = context.classify(line.reachability());
-            add_line(&mut buckets[role as usize].lines, line.kind, line.doc);
-            add_line(&mut total, line.kind, line.doc);
-
-            for (reachability, count) in reachability_states().zip(line.lexical_complexity) {
-                if count == 0 {
-                    continue;
-                }
-                let event_role = context.classify(reachability);
-                let contribution = ComplexityMetrics {
-                    lexical_complexity: u64::from(count),
-                    ..ComplexityMetrics::default()
-                };
-                buckets[event_role as usize].metrics.add(contribution);
-                metrics.add(contribution);
-            }
-        }
-
-        for &fact in &file.authored_facts {
-            let role = context.classify(fact.reachability());
-            let contribution = fact.metrics();
-            buckets[role as usize].metrics.add(contribution);
-            metrics.add(contribution);
-        }
-
-        for (reachability, count) in reachability_states().zip(file.declared_public) {
-            if count == 0 {
-                continue;
-            }
-            let role = context.classify(reachability);
-            buckets[role as usize].declared_public += u64::from(count);
+        let mut source = SourceMetrics::default();
+        for (reachability, metrics) in reachability_states().zip(file.metrics) {
+            buckets[context.classify(reachability) as usize]
+                .source
+                .add(metrics);
+            source.add(metrics);
         }
         for bucket in &mut buckets {
-            if bucket.lines.physical > 0
-                || bucket.metrics.lexical_complexity > 0
-                || bucket.metrics.cyclomatic_authored > 0
-                || bucket.metrics.cognitive_authored > 0
-                || bucket.declared_public > 0
-            {
-                bucket.files = 1;
-            }
+            bucket.files = u64::from(!bucket.source.is_empty());
         }
 
         if !file.syntax_errors.is_empty() {
@@ -271,13 +218,9 @@ fn build_report(
         }
 
         for (project, file_bucket) in project_buckets.iter_mut().zip(&buckets) {
-            project.files += file_bucket.files;
-            project.lines.add(file_bucket.lines);
-            project.metrics.add(file_bucket.metrics);
-            project.declared_public += file_bucket.declared_public;
+            project.add(file_bucket);
         }
-        project_total.add(total);
-        project_metrics.add(metrics);
+        project.add(source);
         bytes += file.bytes;
 
         file_reports.push(FileReport {
@@ -285,14 +228,16 @@ fn build_report(
             package,
             bytes: file.bytes,
             syntax_errors: file.syntax_errors.len() as u64,
-            buckets: buckets.into_iter().filter(nonempty_bucket).collect(),
-            total,
-            metrics,
+            buckets: buckets
+                .into_iter()
+                .filter(|bucket| !bucket.is_empty())
+                .collect(),
+            total: source.lines,
+            metrics: source.metrics,
         });
     }
 
-    Ok(Report {
-        schema_version: 3,
+    Report {
         root: inventory.root.to_string_lossy().into_owned(),
         selection,
         profile: inventory.profile,
@@ -301,75 +246,42 @@ fn build_report(
         files: file_reports,
         buckets: project_buckets
             .into_iter()
-            .filter(nonempty_bucket)
+            .filter(|bucket| !bucket.is_empty())
             .collect(),
-        total: project_total,
-        metrics: project_metrics,
+        total: project.lines,
+        metrics: project.metrics,
         diagnostics: inventory.diagnostics,
-    })
+    }
 }
 
 fn selection_report(inventory: &Inventory, cli: &FastCli) -> SelectionReport {
-    let mut paths = inventory
-        .requested
-        .iter()
-        .map(|path| {
-            let kind = if path.is_dir() {
-                SelectedPathKind::Directory
-            } else {
-                SelectedPathKind::File
-            };
-            let relative = path.strip_prefix(&inventory.root).unwrap_or(path);
-            let path = if relative.as_os_str().is_empty() {
-                ".".to_owned()
-            } else {
-                relative.to_string_lossy().replace('\\', "/")
-            };
-            SelectedPathReport { path, kind }
-        })
-        .collect::<Vec<_>>();
-    paths.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.kind.cmp(&right.kind))
-    });
-    paths.dedup();
-    SelectionReport {
-        paths,
-        include_hidden: cli.hidden,
-        respect_ignores: !cli.no_ignore,
-        ignore_boundary: "path",
-    }
+    SelectionReport::new(
+        inventory
+            .requested
+            .iter()
+            .map(|path| {
+                let kind = if path.is_dir() {
+                    SelectedPathKind::Directory
+                } else {
+                    SelectedPathKind::File
+                };
+                let relative = path.strip_prefix(&inventory.root).unwrap_or(path);
+                let path = if relative.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    portable(relative)
+                };
+                SelectedPathReport { path, kind }
+            })
+            .collect(),
+        cli.hidden,
+        !cli.no_ignore,
+    )
 }
 
 fn empty_buckets() -> [BucketReport; crate::model::OUTPUT_ROLE_COUNT] {
     std::array::from_fn(|index| BucketReport {
-        role: OutputRole::ALL[index].key().to_owned(),
+        role: OutputRole::ALL[index],
         ..BucketReport::default()
     })
-}
-
-fn nonempty_bucket(bucket: &BucketReport) -> bool {
-    bucket.files > 0
-        || bucket.lines.physical > 0
-        || bucket.metrics.lexical_complexity > 0
-        || bucket.metrics.cyclomatic_authored > 0
-        || bucket.metrics.cognitive_authored > 0
-        || bucket.declared_public > 0
-}
-
-fn add_line(counts: &mut LineCounts, kind: ContentKind, doc: bool) {
-    counts.physical += 1;
-    match kind {
-        ContentKind::Code => counts.code += 1,
-        ContentKind::Comment => {
-            counts.comments += 1;
-            counts.docs += u64::from(doc);
-        }
-        ContentKind::Blank => counts.blank += 1,
-    }
-}
-
-fn canonical_or_original(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

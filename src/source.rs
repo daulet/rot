@@ -10,8 +10,9 @@ use ra_ap_syntax::{
 };
 
 use crate::{
-    cfg::{CfgProfile, PackageFeatures, reachability_for_node},
-    model::{ComplexityMetrics, Reachability},
+    cfg::{CfgProfile, PackageFeatures},
+    model::{ComplexityMetrics, Reachability, SourceMetrics},
+    paths::containing_directory,
 };
 
 const REACHABILITY_STATES: usize = 9;
@@ -43,104 +44,6 @@ impl LocalLine {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BodyKind {
-    Function,
-    Closure,
-    Const,
-    Static,
-    AsyncBlock,
-    ConstBlock,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DecisionKind {
-    Conditional,
-    Loop,
-    Match,
-    MatchAlternative,
-    Guard,
-    ShortCircuit,
-    Try,
-    LetElse,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AuthoredBody {
-    kind: BodyKind,
-    range: TextRange,
-    reachability: Reachability,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AuthoredDecision {
-    kind: DecisionKind,
-    range: TextRange,
-    reachability: Reachability,
-    nesting: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthoredFact {
-    Body(AuthoredBody),
-    Decision(AuthoredDecision),
-}
-
-impl AuthoredFact {
-    pub fn reachability(self) -> Reachability {
-        match self {
-            Self::Body(body) => body.reachability,
-            Self::Decision(decision) => decision.reachability,
-        }
-    }
-
-    pub fn metrics(self) -> ComplexityMetrics {
-        match self {
-            Self::Body(body) => {
-                debug_assert!(!body.range.is_empty());
-                let cyclomatic_authored = match body.kind {
-                    BodyKind::Function
-                    | BodyKind::Closure
-                    | BodyKind::Const
-                    | BodyKind::Static
-                    | BodyKind::AsyncBlock
-                    | BodyKind::ConstBlock => 1,
-                };
-                ComplexityMetrics {
-                    cyclomatic_authored,
-                    ..ComplexityMetrics::default()
-                }
-            }
-            Self::Decision(decision) => {
-                debug_assert!(!decision.range.is_empty());
-                let (cyclomatic_authored, cognitive_authored) = match decision.kind {
-                    DecisionKind::Conditional | DecisionKind::Loop | DecisionKind::LetElse => (
-                        1,
-                        decision
-                            .nesting
-                            .checked_add(1)
-                            .expect("syntax nesting cannot exhaust u64"),
-                    ),
-                    DecisionKind::Match => (
-                        0,
-                        decision
-                            .nesting
-                            .checked_add(1)
-                            .expect("syntax nesting cannot exhaust u64"),
-                    ),
-                    DecisionKind::MatchAlternative => (1, 0),
-                    DecisionKind::Guard | DecisionKind::ShortCircuit | DecisionKind::Try => (1, 1),
-                };
-                ComplexityMetrics {
-                    cyclomatic_authored,
-                    cognitive_authored,
-                    ..ComplexityMetrics::default()
-                }
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SourceEdge {
     pub target: PathBuf,
@@ -156,31 +59,31 @@ pub struct UnresolvedEdge {
 #[derive(Clone, Debug)]
 pub struct LocalFile {
     pub bytes: u64,
+    pub metrics: [SourceMetrics; REACHABILITY_STATES],
+    #[cfg(test)]
     pub lines: Vec<LocalLine>,
     pub syntax_errors: Vec<String>,
     pub edges: Vec<SourceEdge>,
     pub unresolved_edges: Vec<UnresolvedEdge>,
-    pub authored_facts: Vec<AuthoredFact>,
-    pub declared_public: [u32; REACHABILITY_STATES],
 }
 
 impl LocalFile {
-    fn invalid_utf8(bytes: Vec<u8>) -> Self {
-        let mut lines = raw_lines(&bytes);
+    fn invalid_utf8(bytes: &[u8]) -> Self {
+        let mut lines = raw_lines(bytes);
         for line in &mut lines {
             line.significant_reach = Reachability::BOTH;
             line.any_reach = Reachability::BOTH;
         }
         Self {
             bytes: bytes.len() as u64,
+            metrics: aggregate_metrics(&lines, Default::default(), Default::default()),
+            #[cfg(test)]
             lines,
             syntax_errors: vec![
                 "source is not valid UTF-8; only raw line kinds are available".to_owned(),
             ],
             edges: Vec::new(),
             unresolved_edges: Vec::new(),
-            authored_facts: Vec::new(),
-            declared_public: [0; REACHABILITY_STATES],
         }
     }
 }
@@ -192,44 +95,55 @@ pub fn analyze_file(
     features: Option<&PackageFeatures>,
 ) -> Result<LocalFile, std::io::Error> {
     let bytes = fs::read(&path)?;
-    Ok(analyze_bytes(path, &bytes, edition, profile, features))
-}
-
-pub fn analyze_bytes(
-    path: PathBuf,
-    bytes: &[u8],
-    edition: Edition,
-    profile: &CfgProfile,
-    features: Option<&PackageFeatures>,
-) -> LocalFile {
-    let source = match std::str::from_utf8(bytes) {
-        Ok(source) => source,
-        Err(_) => return LocalFile::invalid_utf8(bytes.to_vec()),
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return Ok(LocalFile::invalid_utf8(&bytes));
     };
     let line_index = LineIndex::new(source);
     let parse = SourceFile::parse(source, edition);
-    let syntax_errors = parse
-        .errors()
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect();
+    let syntax_errors = parse.errors().iter().map(ToString::to_string).collect();
     let tree = parse.tree();
     let root = tree.syntax();
-    let mut lines = vec![LocalLine::default(); line_index.len()];
+    let mut lines = vec![LocalLine::default(); line_index.starts.len()];
     collect_tokens(root, &line_index, &mut lines, profile, features);
-    let authored_facts = collect_authored_complexity(root, profile, features);
-    let declared_public = collect_declared_public(root, profile, features);
-    let (edges, unresolved_edges) = collect_edges(&path, root, profile, features);
+    let semantics = collect_semantics(&path, root, profile, features);
 
-    LocalFile {
+    Ok(LocalFile {
         bytes: bytes.len() as u64,
+        metrics: aggregate_metrics(&lines, semantics.authored, semantics.declared_public),
+        #[cfg(test)]
         lines,
         syntax_errors,
-        edges,
-        unresolved_edges,
-        authored_facts,
-        declared_public,
+        edges: semantics.edges,
+        unresolved_edges: semantics.unresolved_edges,
+    })
+}
+
+fn aggregate_metrics(
+    lines: &[LocalLine],
+    authored: [ComplexityMetrics; REACHABILITY_STATES],
+    declared_public: [u64; REACHABILITY_STATES],
+) -> [SourceMetrics; REACHABILITY_STATES] {
+    let mut metrics = [SourceMetrics::default(); REACHABILITY_STATES];
+    for line in lines {
+        let counts = &mut metrics[line.reachability().index()].lines;
+        counts.physical += 1;
+        match line.kind {
+            ContentKind::Code => counts.code += 1,
+            ContentKind::Comment => {
+                counts.comments += 1;
+                counts.docs += u64::from(line.doc);
+            }
+            ContentKind::Blank => counts.blank += 1,
+        }
+        for (metrics, count) in metrics.iter_mut().zip(line.lexical_complexity) {
+            metrics.metrics.lexical_complexity += u64::from(count);
+        }
     }
+    for index in 0..REACHABILITY_STATES {
+        metrics[index].metrics.add(authored[index]);
+        metrics[index].declared_public = declared_public[index];
+    }
+    metrics
 }
 
 fn collect_tokens(
@@ -315,273 +229,204 @@ fn is_complexity_token(token: &SyntaxToken) -> bool {
 
 fn next_significant_token(token: &SyntaxToken) -> Option<SyntaxToken> {
     let mut next = token.next_token();
-    while next
-        .as_ref()
-        .is_some_and(|token| matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))
-    {
+    while next.as_ref().is_some_and(|token| token.kind().is_trivia()) {
         next = next.and_then(|token| token.next_token());
     }
     next
 }
 
-struct BodyState {
-    owner: SyntaxNode,
-    nesting: u64,
+#[derive(Default)]
+struct Semantics {
+    authored: [ComplexityMetrics; REACHABILITY_STATES],
+    declared_public: [u64; REACHABILITY_STATES],
+    edges: Vec<SourceEdge>,
+    unresolved_edges: Vec<UnresolvedEdge>,
 }
 
-struct BodyCut {
-    owner: SyntaxNode,
-    body_depth: usize,
+struct SemanticVisitor<'a> {
+    file: &'a Path,
+    profile: &'a CfgProfile,
+    features: Option<&'a PackageFeatures>,
+    semantics: Semantics,
+    bodies: Vec<u64>,
+    body_cuts: Vec<usize>,
+    matches: Vec<Reachability>,
 }
 
-struct MatchState {
-    owner: SyntaxNode,
-    preceding_arms: Reachability,
+impl SemanticVisitor<'_> {
+    fn visit(&mut self, node: &SyntaxNode, parent: Reachability) {
+        let local = parent.and(self.profile.node_gate(node, self.features));
+        self.record_source(node, local);
+        if node.kind() == SyntaxKind::TOKEN_TREE {
+            return;
+        }
+
+        let body_count = body_count(node);
+        for _ in 0..body_count {
+            self.semantics.authored[local.index()].cyclomatic_authored += 1;
+            self.bodies.push(0);
+        }
+        let boundary = is_declaration_boundary(node);
+        if boundary {
+            self.body_cuts.push(self.bodies.len());
+        }
+
+        if node.kind() == SyntaxKind::MATCH_ARM {
+            let in_body = self.active_body().is_some();
+            record_match_alternative(
+                node,
+                local,
+                self.matches.last_mut(),
+                in_body,
+                &mut self.semantics.authored,
+            );
+        } else if let Some(nesting) = self.active_body().copied() {
+            record_decision(node, local, nesting, &mut self.semantics.authored);
+        }
+
+        let match_expression = node.kind() == SyntaxKind::MATCH_EXPR;
+        if match_expression {
+            self.matches.push(Reachability::NEVER);
+        }
+        let nested = opens_nesting_region(node);
+        if nested && let Some(body) = self.active_body() {
+            *body += 1;
+        }
+        for child in node.children() {
+            self.visit(&child, local);
+        }
+        if nested && let Some(body) = self.active_body() {
+            *body -= 1;
+        }
+        if match_expression {
+            self.matches.pop();
+        }
+        if boundary {
+            self.body_cuts.pop();
+        }
+        self.bodies.truncate(self.bodies.len() - body_count);
+    }
+
+    fn active_body(&mut self) -> Option<&mut u64> {
+        let active = self.bodies.len() > self.body_cuts.last().copied().unwrap_or(0);
+        active.then(|| self.bodies.last_mut()).flatten()
+    }
 }
 
-fn collect_authored_complexity(
+fn collect_semantics(
+    file: &Path,
     root: &SyntaxNode,
     profile: &CfgProfile,
     features: Option<&PackageFeatures>,
-) -> Vec<AuthoredFact> {
-    let mut facts = Vec::new();
-    let mut reachability = Vec::new();
-    let mut bodies: Vec<BodyState> = Vec::new();
-    let mut body_cuts: Vec<BodyCut> = Vec::new();
-    let mut matches: Vec<MatchState> = Vec::new();
-    let mut walk = root.preorder();
-
-    while let Some(event) = walk.next() {
-        match event {
-            WalkEvent::Enter(node) => {
-                let parent = reachability.last().copied().unwrap_or(Reachability::BOTH);
-                let local = parent.and(profile.node_gate(&node, features));
-                reachability.push(local);
-
-                if node.kind() == SyntaxKind::TOKEN_TREE {
-                    walk.skip_subtree();
-                    continue;
-                }
-
-                for kind in body_kinds(&node).into_iter().flatten() {
-                    let range = node.text_range();
-                    if !range.is_empty() {
-                        facts.push(AuthoredFact::Body(AuthoredBody {
-                            kind,
-                            range,
-                            reachability: local,
-                        }));
-                        bodies.push(BodyState {
-                            owner: node.clone(),
-                            nesting: 0,
-                        });
-                    }
-                }
-
-                if active_body(&bodies, &body_cuts).is_some() && is_declaration_boundary(&node) {
-                    body_cuts.push(BodyCut {
-                        owner: node.clone(),
-                        body_depth: bodies.len(),
-                    });
-                }
-
-                if node.kind() == SyntaxKind::MATCH_ARM {
-                    record_match_alternative(
-                        &node,
-                        local,
-                        matches.last_mut(),
-                        active_body(&bodies, &body_cuts),
-                        &mut facts,
-                    );
-                } else if let Some(body) = active_body(&bodies, &body_cuts) {
-                    record_decision(&node, local, body.nesting, &mut facts);
-                }
-
-                if node.kind() == SyntaxKind::MATCH_EXPR {
-                    matches.push(MatchState {
-                        owner: node.clone(),
-                        preceding_arms: Reachability::NEVER,
-                    });
-                }
-
-                if opens_nesting_region(&node)
-                    && let Some(body) = active_body_mut(&mut bodies, &body_cuts)
-                {
-                    body.nesting = body
-                        .nesting
-                        .checked_add(1)
-                        .expect("syntax nesting cannot exhaust u64");
-                }
-            }
-            WalkEvent::Leave(node) => {
-                if opens_nesting_region(&node)
-                    && let Some(body) = active_body_mut(&mut bodies, &body_cuts)
-                {
-                    body.nesting = body
-                        .nesting
-                        .checked_sub(1)
-                        .expect("nesting-region traversal must be balanced");
-                }
-                if matches.last().is_some_and(|state| state.owner == node) {
-                    matches.pop();
-                }
-                while bodies.last().is_some_and(|body| body.owner == node) {
-                    bodies.pop();
-                }
-                if body_cuts.last().is_some_and(|cut| cut.owner == node) {
-                    body_cuts.pop();
-                }
-                reachability.pop();
-            }
-        }
-    }
-
-    debug_assert!(bodies.is_empty());
-    debug_assert!(body_cuts.is_empty());
-    debug_assert!(matches.is_empty());
-    debug_assert!(reachability.is_empty());
-    facts
-}
-
-fn active_body<'a>(bodies: &'a [BodyState], cuts: &[BodyCut]) -> Option<&'a BodyState> {
-    let cut_depth = cuts.last().map_or(0, |cut| cut.body_depth);
-    (bodies.len() > cut_depth).then(|| bodies.last()).flatten()
-}
-
-fn active_body_mut<'a>(bodies: &'a mut [BodyState], cuts: &[BodyCut]) -> Option<&'a mut BodyState> {
-    let cut_depth = cuts.last().map_or(0, |cut| cut.body_depth);
-    (bodies.len() > cut_depth)
-        .then(|| bodies.last_mut())
-        .flatten()
+) -> Semantics {
+    let mut visitor = SemanticVisitor {
+        file,
+        profile,
+        features,
+        semantics: Semantics::default(),
+        bodies: Vec::new(),
+        body_cuts: Vec::new(),
+        matches: Vec::new(),
+    };
+    visitor.visit(root, Reachability::BOTH);
+    visitor.semantics
 }
 
 fn is_declaration_boundary(node: &SyntaxNode) -> bool {
     ast::Item::cast(node.clone()).is_some() || ast::ClosureExpr::cast(node.clone()).is_some()
 }
 
-fn body_kinds(node: &SyntaxNode) -> [Option<BodyKind>; 2] {
-    [owner_body_kind(node), block_body_kind(node)]
+fn body_count(node: &SyntaxNode) -> usize {
+    usize::from(is_owner_body(node)) + usize::from(is_deferred_block(node))
 }
 
-fn owner_body_kind(node: &SyntaxNode) -> Option<BodyKind> {
-    let parent = node.parent()?;
-    if ast::Fn::cast(parent.clone())
-        .is_some_and(|function| function.body().is_some_and(|body| body.syntax() == node))
-    {
-        return Some(BodyKind::Function);
-    }
-    if ast::ClosureExpr::cast(parent.clone())
-        .is_some_and(|closure| closure.body().is_some_and(|body| body.syntax() == node))
-    {
-        return Some(BodyKind::Closure);
-    }
-    if ast::Const::cast(parent.clone())
-        .is_some_and(|constant| constant.body().is_some_and(|body| body.syntax() == node))
-    {
-        return Some(BodyKind::Const);
-    }
-    ast::Static::cast(parent)
-        .is_some_and(|static_item| static_item.body().is_some_and(|body| body.syntax() == node))
-        .then_some(BodyKind::Static)
+fn is_owner_body(node: &SyntaxNode) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let body = match parent.kind() {
+        SyntaxKind::FN => ast::Fn::cast(parent)
+            .and_then(|owner| owner.body())
+            .map(|body| body.syntax().clone()),
+        SyntaxKind::CLOSURE_EXPR => ast::ClosureExpr::cast(parent)
+            .and_then(|owner| owner.body())
+            .map(|body| body.syntax().clone()),
+        SyntaxKind::CONST => ast::Const::cast(parent)
+            .and_then(|owner| owner.body())
+            .map(|body| body.syntax().clone()),
+        SyntaxKind::STATIC => ast::Static::cast(parent)
+            .and_then(|owner| owner.body())
+            .map(|body| body.syntax().clone()),
+        _ => None,
+    };
+    body.as_ref().is_some_and(|body| body == node)
 }
 
-fn block_body_kind(node: &SyntaxNode) -> Option<BodyKind> {
-    let block = ast::BlockExpr::cast(node.clone())?;
-    if block.async_token().is_some() {
-        Some(BodyKind::AsyncBlock)
-    } else if block.const_token().is_some() {
-        Some(BodyKind::ConstBlock)
-    } else {
-        None
-    }
+fn is_deferred_block(node: &SyntaxNode) -> bool {
+    ast::BlockExpr::cast(node.clone())
+        .is_some_and(|block| block.async_token().is_some() || block.const_token().is_some())
 }
 
 fn record_decision(
     node: &SyntaxNode,
     reachability: Reachability,
     nesting: u64,
-    facts: &mut Vec<AuthoredFact>,
+    metrics: &mut [ComplexityMetrics; REACHABILITY_STATES],
 ) {
-    let decision = match node.kind() {
-        SyntaxKind::IF_EXPR => ast::IfExpr::cast(node.clone())
-            .and_then(|expression| expression.if_token())
-            .map(|token| (DecisionKind::Conditional, token)),
-        SyntaxKind::WHILE_EXPR => ast::WhileExpr::cast(node.clone())
-            .and_then(|expression| expression.while_token())
-            .map(|token| (DecisionKind::Loop, token)),
-        SyntaxKind::FOR_EXPR => ast::ForExpr::cast(node.clone())
-            .and_then(|expression| expression.for_token())
-            .map(|token| (DecisionKind::Loop, token)),
-        SyntaxKind::LOOP_EXPR => ast::LoopExpr::cast(node.clone())
-            .and_then(|expression| expression.loop_token())
-            .map(|token| (DecisionKind::Loop, token)),
-        SyntaxKind::MATCH_EXPR => ast::MatchExpr::cast(node.clone())
-            .and_then(|expression| expression.match_token())
-            .map(|token| (DecisionKind::Match, token)),
-        SyntaxKind::MATCH_GUARD => ast::MatchGuard::cast(node.clone())
-            .and_then(|guard| guard.if_token())
-            .map(|token| (DecisionKind::Guard, token)),
-        SyntaxKind::BIN_EXPR => ast::BinExpr::cast(node.clone()).and_then(|expression| {
-            matches!(
-                expression.op_kind(),
-                Some(ast::BinaryOp::LogicOp(ast::LogicOp::And | ast::LogicOp::Or))
-            )
-            .then(|| expression.op_token())
-            .flatten()
-            .map(|token| (DecisionKind::ShortCircuit, token))
-        }),
-        SyntaxKind::TRY_EXPR => ast::TryExpr::cast(node.clone())
-            .and_then(|expression| expression.question_mark_token())
-            .map(|token| (DecisionKind::Try, token)),
-        SyntaxKind::LET_STMT => ast::LetStmt::cast(node.clone())
-            .and_then(|statement| statement.let_else())
-            .and_then(|let_else| let_else.else_token())
-            .map(|token| (DecisionKind::LetElse, token)),
+    let nested = nesting + 1;
+    let contribution = match node.kind() {
+        SyntaxKind::IF_EXPR
+        | SyntaxKind::WHILE_EXPR
+        | SyntaxKind::FOR_EXPR
+        | SyntaxKind::LOOP_EXPR => Some((1, nested)),
+        SyntaxKind::MATCH_EXPR => Some((0, nested)),
+        SyntaxKind::MATCH_GUARD | SyntaxKind::TRY_EXPR => Some((1, 1)),
+        SyntaxKind::BIN_EXPR
+            if ast::BinExpr::cast(node.clone()).is_some_and(|expression| {
+                matches!(
+                    expression.op_kind(),
+                    Some(ast::BinaryOp::LogicOp(ast::LogicOp::And | ast::LogicOp::Or))
+                )
+            }) =>
+        {
+            Some((1, 1))
+        }
+        SyntaxKind::LET_STMT
+            if ast::LetStmt::cast(node.clone()).is_some_and(|statement| {
+                statement
+                    .let_else()
+                    .is_some_and(|let_else| let_else.else_token().is_some())
+            }) =>
+        {
+            Some((1, nested))
+        }
         _ => None,
     };
-
-    let Some((kind, token)) = decision else {
-        return;
-    };
-    let range = token.text_range();
-    if !range.is_empty() {
-        facts.push(AuthoredFact::Decision(AuthoredDecision {
-            kind,
-            range,
-            reachability,
-            nesting,
-        }));
+    if let Some((cyclomatic, cognitive)) = contribution {
+        let total = &mut metrics[reachability.index()];
+        total.cyclomatic_authored += cyclomatic;
+        total.cognitive_authored += cognitive;
     }
 }
 
 fn record_match_alternative(
     node: &SyntaxNode,
     reachability: Reachability,
-    state: Option<&mut MatchState>,
-    body: Option<&BodyState>,
-    facts: &mut Vec<AuthoredFact>,
+    preceding_arms: Option<&mut Reachability>,
+    in_body: bool,
+    metrics: &mut [ComplexityMetrics; REACHABILITY_STATES],
 ) {
-    let Some(state) = state else {
+    let Some(preceding_arms) = preceding_arms else {
         return;
     };
-    let Some(arrow) = ast::MatchArm::cast(node.clone()).and_then(|arm| arm.fat_arrow_token())
-    else {
-        return;
-    };
-    let alternative = reachability.and(state.preceding_arms);
-    state.preceding_arms = state.preceding_arms.or(reachability);
-    let Some(body) = body else {
-        return;
-    };
-    if alternative == Reachability::NEVER {
+    if ast::MatchArm::cast(node.clone()).is_none_or(|arm| arm.fat_arrow_token().is_none()) {
         return;
     }
-    facts.push(AuthoredFact::Decision(AuthoredDecision {
-        kind: DecisionKind::MatchAlternative,
-        range: arrow.text_range(),
-        reachability: alternative,
-        nesting: body.nesting,
-    }));
+    let alternative = reachability.and(*preceding_arms);
+    *preceding_arms = (*preceding_arms).or(reachability);
+    if in_body && alternative != Reachability::NEVER {
+        metrics[alternative.index()].cyclomatic_authored += 1;
+    }
 }
 
 fn opens_nesting_region(node: &SyntaxNode) -> bool {
@@ -603,97 +448,79 @@ fn opens_nesting_region(node: &SyntaxNode) -> bool {
                 Some(ast::ElseBranch::Block(branch)) if branch.syntax() == block.syntax()
             );
     }
-    if let Some(expression) = ast::WhileExpr::cast(parent.clone()) {
-        return expression
-            .loop_body()
-            .is_some_and(|body| body.syntax() == block.syntax());
-    }
-    if let Some(expression) = ast::ForExpr::cast(parent.clone()) {
-        return expression
-            .loop_body()
-            .is_some_and(|body| body.syntax() == block.syntax());
-    }
-    ast::LoopExpr::cast(parent)
-        .and_then(|expression| expression.loop_body())
-        .is_some_and(|body| body.syntax() == block.syntax())
+    let loop_body = match parent.kind() {
+        SyntaxKind::WHILE_EXPR => ast::WhileExpr::cast(parent).and_then(|owner| owner.loop_body()),
+        SyntaxKind::FOR_EXPR => ast::ForExpr::cast(parent).and_then(|owner| owner.loop_body()),
+        SyntaxKind::LOOP_EXPR => ast::LoopExpr::cast(parent).and_then(|owner| owner.loop_body()),
+        _ => None,
+    };
+    loop_body.is_some_and(|body| body.syntax() == block.syntax())
 }
 
-fn collect_declared_public(
-    root: &SyntaxNode,
-    profile: &CfgProfile,
-    features: Option<&PackageFeatures>,
-) -> [u32; REACHABILITY_STATES] {
-    let mut counts = [0; REACHABILITY_STATES];
-    for visibility in root.descendants().filter_map(ast::Visibility::cast) {
-        if !matches!(visibility.kind(), VisibilityKind::Pub) {
-            continue;
+impl SemanticVisitor<'_> {
+    fn record_source(&mut self, node: &SyntaxNode, gate: Reachability) {
+        if ast::Visibility::cast(node.clone())
+            .is_some_and(|visibility| matches!(visibility.kind(), VisibilityKind::Pub))
+        {
+            self.semantics.declared_public[gate.index()] += 1;
         }
-        let reachability = reachability_for_node(profile, visibility.syntax(), features);
-        counts[reachability.index()] += 1;
-    }
-    counts
-}
 
-fn collect_edges(
-    file: &Path,
-    root: &SyntaxNode,
-    profile: &CfgProfile,
-    features: Option<&PackageFeatures>,
-) -> (Vec<SourceEdge>, Vec<UnresolvedEdge>) {
-    let mut edges = Vec::new();
-    let mut unresolved = Vec::new();
-    for module in root.descendants().filter_map(ast::Module::cast) {
-        if module.semicolon_token().is_none() {
-            continue;
+        if let Some(module) = ast::Module::cast(node.clone())
+            && module.semicolon_token().is_some()
+        {
+            match resolve_module(self.file, &module) {
+                Some(target) => self.semantics.edges.push(SourceEdge { target, gate }),
+                None => self.semantics.unresolved_edges.push(UnresolvedEdge {
+                    gate,
+                    message: format!(
+                        "cannot resolve out-of-line module {}",
+                        module
+                            .name()
+                            .map_or("<missing name>".to_owned(), |name| name.text().to_string())
+                    ),
+                }),
+            }
         }
-        let gate = reachability_for_node(profile, module.syntax(), features);
-        match resolve_module(file, &module) {
-            Some(target) => edges.push(SourceEdge { target, gate }),
-            None => unresolved.push(UnresolvedEdge {
-                gate,
-                message: format!(
-                    "cannot resolve out-of-line module {}",
-                    module.name().map_or_else(
-                        || "<missing name>".to_owned(),
-                        |name| name.text().to_string()
-                    )
-                ),
-            }),
-        }
-    }
 
-    for call in root.descendants().filter_map(ast::MacroCall::cast) {
-        let Some(path) = call.path() else {
-            continue;
+        let Some(call) = ast::MacroCall::cast(node.clone()) else {
+            return;
         };
-        if compact_text(path.syntax()) != "include" {
-            continue;
+        if call
+            .path()
+            .and_then(|path| path.as_single_name_ref())
+            .is_none_or(|name| name.text() != "include")
+        {
+            return;
         }
-        let gate = reachability_for_node(profile, call.syntax(), features);
         let Some(included) = literal_macro_string(&call) else {
-            unresolved.push(UnresolvedEdge {
+            self.semantics.unresolved_edges.push(UnresolvedEdge {
                 gate,
                 message: "non-literal include! source is unresolved".to_owned(),
             });
-            continue;
+            return;
         };
-        let target = file.parent().unwrap_or(Path::new(".")).join(included);
+        let target = containing_directory(self.file).join(included);
         if target.is_file() {
-            edges.push(SourceEdge { target, gate });
+            self.semantics.edges.push(SourceEdge { target, gate });
         } else {
-            unresolved.push(UnresolvedEdge {
+            self.semantics.unresolved_edges.push(UnresolvedEdge {
                 gate,
                 message: format!("include! source does not exist: {}", target.display()),
             });
         }
     }
-    (edges, unresolved)
 }
 
 fn resolve_module(file: &Path, module: &ast::Module) -> Option<PathBuf> {
     let module_name = module.name()?.text().to_string();
-    let mut base = conventional_module_base(file);
-    let mut inline_ancestors = module
+    let parent = containing_directory(file);
+    let mut base = match file.file_name().and_then(|name| name.to_str()) {
+        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
+        _ => file
+            .file_stem()
+            .map_or_else(|| parent.to_path_buf(), |stem| parent.join(stem)),
+    };
+    let inline_ancestors = module
         .syntax()
         .ancestors()
         .skip(1)
@@ -701,53 +528,30 @@ fn resolve_module(file: &Path, module: &ast::Module) -> Option<PathBuf> {
         .filter(|ancestor| ancestor.item_list().is_some())
         .filter_map(|ancestor| ancestor.name().map(|name| name.text().to_string()))
         .collect::<Vec<_>>();
-    inline_ancestors.reverse();
-    let nested_inline = !inline_ancestors.is_empty();
-    for ancestor in inline_ancestors {
+    for ancestor in inline_ancestors.iter().rev() {
         base.push(ancestor);
     }
 
     if let Some(path) = attribute_string(module.attrs(), "path") {
-        let parent = file.parent().unwrap_or(Path::new("."));
         let sibling = parent.join(&path);
         let nested = base.join(path);
-        let candidates = if nested_inline {
-            [nested, sibling]
-        } else {
+        return if inline_ancestors.is_empty() {
             [sibling, nested]
-        };
-        return candidates.into_iter().find(|candidate| candidate.is_file());
+        } else {
+            [nested, sibling]
+        }
+        .into_iter()
+        .find(|candidate| candidate.is_file());
     }
 
-    let candidates = [
+    [
         base.join(format!("{module_name}.rs")),
         base.join(&module_name).join("mod.rs"),
-    ];
-    if let Some(found) = candidates.into_iter().find(|candidate| candidate.is_file()) {
-        return Some(found);
-    }
-
-    let parent = file.parent().unwrap_or(Path::new("."));
-    if base != parent {
-        [
-            parent.join(format!("{module_name}.rs")),
-            parent.join(module_name).join("mod.rs"),
-        ]
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-    } else {
-        None
-    }
-}
-
-fn conventional_module_base(file: &Path) -> PathBuf {
-    let parent = file.parent().unwrap_or(Path::new("."));
-    match file.file_name().and_then(|name| name.to_str()) {
-        Some("lib.rs" | "main.rs" | "mod.rs") => parent.to_path_buf(),
-        _ => file
-            .file_stem()
-            .map_or_else(|| parent.to_path_buf(), |stem| parent.join(stem)),
-    }
+        parent.join(format!("{module_name}.rs")),
+        parent.join(module_name).join("mod.rs"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
 }
 
 fn attribute_string(attributes: impl Iterator<Item = ast::Attr>, name: &str) -> Option<String> {
@@ -757,93 +561,57 @@ fn attribute_string(attributes: impl Iterator<Item = ast::Attr>, name: &str) -> 
             let ast::Meta::KeyValueMeta(key_value) = meta else {
                 return None;
             };
-            if key_value
-                .path()
-                .is_none_or(|path| compact_text(path.syntax()) != name)
-            {
+            if key_value.path()?.as_single_name_ref()?.text() != name {
                 return None;
             }
-            key_value
-                .syntax()
-                .descendants_with_tokens()
-                .filter_map(NodeOrToken::into_token)
-                .find_map(ast::String::cast)
-                .and_then(|literal| literal.value().ok().map(|value| value.into_owned()))
+            let ast::Expr::Literal(literal) = key_value.expr()? else {
+                return None;
+            };
+            let ast::LiteralKind::String(literal) = literal.kind() else {
+                return None;
+            };
+            literal.value().ok().map(std::borrow::Cow::into_owned)
         })
 }
 
 fn literal_macro_string(call: &ast::MacroCall) -> Option<String> {
     let tree = call.token_tree()?;
-    let mut payload = tree
-        .syntax()
-        .children_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .filter(|token| {
-            !matches!(
-                token.kind(),
-                SyntaxKind::WHITESPACE
-                    | SyntaxKind::COMMENT
-                    | SyntaxKind::L_PAREN
-                    | SyntaxKind::R_PAREN
-                    | SyntaxKind::L_BRACK
-                    | SyntaxKind::R_BRACK
-                    | SyntaxKind::L_CURLY
-                    | SyntaxKind::R_CURLY
-            )
-        });
-    let literal = ast::String::cast(payload.next()?)?;
-    if payload.next().is_some() {
-        return None;
-    }
-    literal.value().ok().map(|value| value.into_owned())
-}
-
-fn compact_text(node: &SyntaxNode) -> String {
-    node.text()
-        .to_string()
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect()
+    let mut payload = ast::TokenTreeChildren::new(&tree);
+    let literal = ast::String::cast(payload.next()?.into_token()?)?;
+    payload
+        .next()
+        .is_none()
+        .then(|| literal.value().ok().map(std::borrow::Cow::into_owned))
+        .flatten()
 }
 
 struct LineIndex {
     starts: Vec<usize>,
-    source_len: usize,
 }
 
 impl LineIndex {
     fn new(source: &str) -> Self {
-        if source.is_empty() {
-            return Self {
-                starts: Vec::new(),
-                source_len: 0,
-            };
-        }
-        let mut starts = Vec::with_capacity(source.len() / 32 + 1);
-        starts.push(0);
-        for (index, byte) in source.bytes().enumerate() {
-            if byte == b'\n' && index + 1 < source.len() {
-                starts.push(index + 1);
-            }
-        }
-        Self {
-            starts,
-            source_len: source.len(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.starts.len()
+        let starts = if source.is_empty() {
+            Vec::new()
+        } else {
+            std::iter::once(0)
+                .chain(
+                    source
+                        .match_indices('\n')
+                        .map(|(index, _)| index + 1)
+                        .filter(|index| *index < source.len()),
+                )
+                .collect()
+        };
+        Self { starts }
     }
 
     fn covered_lines(&self, range: TextRange) -> Option<(usize, usize)> {
         if self.starts.is_empty() || range.is_empty() {
             return None;
         }
-        let start = usize::from(range.start()).min(self.source_len.saturating_sub(1));
-        let end = usize::from(range.end())
-            .saturating_sub(1)
-            .min(self.source_len.saturating_sub(1));
+        let start = usize::from(range.start());
+        let end = usize::from(range.end()).saturating_sub(1);
         Some((self.line_at(start), self.line_at(end)))
     }
 
@@ -858,18 +626,12 @@ fn raw_lines(bytes: &[u8]) -> Vec<LocalLine> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            lines.push(raw_line(&bytes[start..index]));
-            start = index + 1;
-        }
-    }
-    if start < bytes.len() {
-        lines.push(raw_line(&bytes[start..]));
-    }
-    lines
+    bytes
+        .strip_suffix(b"\n")
+        .unwrap_or(bytes)
+        .split(|byte| *byte == b'\n')
+        .map(raw_line)
+        .collect()
 }
 
 fn raw_line(bytes: &[u8]) -> LocalLine {
@@ -995,11 +757,12 @@ mod tests {
     }
 
     fn authored_metrics(file: &LocalFile) -> ComplexityMetrics {
-        let mut metrics = ComplexityMetrics::default();
-        for &fact in &file.authored_facts {
-            metrics.add(fact.metrics());
-        }
-        metrics
+        file.metrics
+            .iter()
+            .fold(ComplexityMetrics::default(), |mut total, source| {
+                total.add(source.metrics);
+                total
+            })
     }
 
     #[test]
@@ -1032,9 +795,15 @@ pub struct Record { pub field: usize, pub(crate) restricted: usize }
 pub fn test_only() {}
 "#,
         );
-        assert_eq!(file.declared_public[Reachability::BOTH.index()], 7);
-        assert_eq!(file.declared_public[Reachability::TEST.index()], 1);
-        assert_eq!(file.declared_public.into_iter().sum::<u32>(), 8);
+        assert_eq!(file.metrics[Reachability::BOTH.index()].declared_public, 7);
+        assert_eq!(file.metrics[Reachability::TEST.index()].declared_public, 1);
+        assert_eq!(
+            file.metrics
+                .into_iter()
+                .map(|metrics| metrics.declared_public)
+                .sum::<u64>(),
+            8
+        );
     }
 
     #[test]
@@ -1159,15 +928,7 @@ fn classify(value: u8) {
 }
 "#,
         );
-        let test_alternatives = file
-            .authored_facts
-            .iter()
-            .copied()
-            .filter(|fact| fact.reachability() == Reachability::TEST)
-            .fold(ComplexityMetrics::default(), |mut metrics, fact| {
-                metrics.add(fact.metrics());
-                metrics
-            });
+        let test_alternatives = file.metrics[Reachability::TEST.index()].metrics;
         assert_eq!(test_alternatives.cyclomatic_authored, 2);
         assert_eq!(test_alternatives.cognitive_authored, 0);
     }

@@ -5,7 +5,7 @@ use serde::Serialize;
 pub const TARGET_ROLE_COUNT: usize = 5;
 pub const OUTPUT_ROLE_COUNT: usize = 8;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum Activation {
     #[default]
@@ -16,27 +16,21 @@ pub enum Activation {
 
 impl Activation {
     pub fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Never, _) | (_, Self::Never) => Self::Never,
-            (Self::Always, value) | (value, Self::Always) => value,
-            (Self::Maybe, Self::Maybe) => Self::Maybe,
-        }
+        self.min(other)
     }
 
     pub fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Always, _) | (_, Self::Always) => Self::Always,
-            (Self::Never, value) | (value, Self::Never) => value,
-            (Self::Maybe, Self::Maybe) => Self::Maybe,
-        }
+        self.max(other)
     }
 
     pub fn not(self) -> Self {
-        match self {
-            Self::Never => Self::Always,
-            Self::Maybe => Self::Maybe,
-            Self::Always => Self::Never,
-        }
+        [Self::Always, Self::Maybe, Self::Never][self as usize]
+    }
+}
+
+impl From<bool> for Activation {
+    fn from(active: bool) -> Self {
+        [Self::Never, Self::Always][active as usize]
     }
 }
 
@@ -47,25 +41,14 @@ pub struct Reachability {
 }
 
 impl Reachability {
-    pub const NEVER: Self = Self {
-        production: Activation::Never,
-        test: Activation::Never,
-    };
+    pub const NEVER: Self = Self::new(Activation::Never, Activation::Never);
+    pub const PRODUCTION: Self = Self::new(Activation::Always, Activation::Never);
+    pub const TEST: Self = Self::new(Activation::Never, Activation::Always);
+    pub const BOTH: Self = Self::new(Activation::Always, Activation::Always);
 
-    pub const PRODUCTION: Self = Self {
-        production: Activation::Always,
-        test: Activation::Never,
-    };
-
-    pub const TEST: Self = Self {
-        production: Activation::Never,
-        test: Activation::Always,
-    };
-
-    pub const BOTH: Self = Self {
-        production: Activation::Always,
-        test: Activation::Always,
-    };
+    const fn new(production: Activation, test: Activation) -> Self {
+        Self { production, test }
+    }
 
     pub fn and(self, other: Self) -> Self {
         Self {
@@ -140,46 +123,32 @@ impl Contexts {
         }
     }
 
+    pub fn production() -> Self {
+        Self::seed(TargetRole::Production, Reachability::BOTH)
+    }
+
     pub fn classify(self, local: Reachability) -> OutputRole {
         let production = self.roles[TargetRole::Production as usize].and(local);
-        match production.production {
-            Activation::Always => return OutputRole::Production,
-            Activation::Maybe => return OutputRole::Conditional,
-            Activation::Never => {}
-        }
-
         let example = self.roles[TargetRole::Example as usize].and(local);
-        match example.production {
-            Activation::Always => return OutputRole::Example,
-            Activation::Maybe => return OutputRole::Conditional,
-            Activation::Never => {}
-        }
-
         let integration_test = self.roles[TargetRole::Test as usize].and(local).test;
-        let unit_test = production.test;
-        match integration_test.or(unit_test).or(example.test) {
-            Activation::Always => return OutputRole::Test,
-            Activation::Maybe => return OutputRole::Conditional,
-            Activation::Never => {}
-        }
-
-        for (target_role, output_role, mode) in [
-            (TargetRole::Bench, OutputRole::Bench, true),
-            (TargetRole::Build, OutputRole::Build, false),
+        let bench = self.roles[TargetRole::Bench as usize].and(local).test;
+        let build = self.roles[TargetRole::Build as usize].and(local).production;
+        for (role, activation) in [
+            (OutputRole::Production, production.production),
+            (OutputRole::Example, example.production),
+            (
+                OutputRole::Test,
+                integration_test.or(production.test).or(example.test),
+            ),
+            (OutputRole::Bench, bench),
+            (OutputRole::Build, build),
         ] {
-            let reachability = self.roles[target_role as usize].and(local);
-            let activation = if mode {
-                reachability.test
-            } else {
-                reachability.production
-            };
             match activation {
-                Activation::Always => return output_role,
+                Activation::Always => return role,
                 Activation::Maybe => return OutputRole::Conditional,
                 Activation::Never => {}
             }
         }
-
         if self.referenced {
             OutputRole::Inactive
         } else {
@@ -188,102 +157,89 @@ impl Contexts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(usize)]
-pub enum OutputRole {
-    Production = 0,
-    Test = 1,
-    Bench = 2,
-    Example = 3,
-    Build = 4,
-    Conditional = 5,
-    Inactive = 6,
-    Orphan = 7,
-}
+#[rustfmt::skip]
+labelled_enum! { pub enum OutputRole {
+    Production => "Production", Test => "Tests", Bench => "Benches", Example => "Examples", Build => "Build",
+    Conditional => "Conditional", Inactive => "Inactive", Orphan => "Orphan",
+} }
 
 impl OutputRole {
-    pub const ALL: [Self; OUTPUT_ROLE_COUNT] = [
-        Self::Production,
-        Self::Test,
-        Self::Bench,
-        Self::Example,
-        Self::Build,
-        Self::Conditional,
-        Self::Inactive,
-        Self::Orphan,
-    ];
+    #[rustfmt::skip]
+    pub const ALL: [Self; OUTPUT_ROLE_COUNT] = [Self::Production, Self::Test, Self::Bench, Self::Example, Self::Build, Self::Conditional, Self::Inactive, Self::Orphan];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Production => "Production",
-            Self::Test => "Tests",
-            Self::Bench => "Benches",
-            Self::Example => "Examples",
-            Self::Build => "Build",
-            Self::Conditional => "Conditional",
-            Self::Inactive => "Inactive",
-            Self::Orphan => "Orphan",
+    pub fn bucket(self, buckets: &[BucketReport]) -> Option<&BucketReport> {
+        buckets.iter().find(|bucket| bucket.role == self)
+    }
+}
+
+macro_rules! metric_group {
+    ($name:ident { $($field:ident),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+        pub struct $name {
+            $(pub $field: u64,)+
         }
-    }
 
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Production => "production",
-            Self::Test => "test",
-            Self::Bench => "bench",
-            Self::Example => "example",
-            Self::Build => "build",
-            Self::Conditional => "conditional",
-            Self::Inactive => "inactive",
-            Self::Orphan => "orphan",
+        impl $name {
+            pub fn add(&mut self, other: Self) {
+                $(self.$field += other.$field;)+
+            }
         }
-    }
+    };
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct LineCounts {
-    pub physical: u64,
-    pub code: u64,
-    pub comments: u64,
-    pub docs: u64,
-    pub blank: u64,
-}
+#[rustfmt::skip]
+metric_group!(LineCounts { physical, code, comments, docs, blank });
+#[rustfmt::skip]
+metric_group!(ComplexityMetrics { lexical_complexity, cyclomatic_authored, cognitive_authored });
 
-impl LineCounts {
-    pub fn add(&mut self, other: Self) {
-        self.physical += other.physical;
-        self.code += other.code;
-        self.comments += other.comments;
-        self.docs += other.docs;
-        self.blank += other.blank;
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct ComplexityMetrics {
-    pub lexical_complexity: u64,
-    pub cyclomatic_authored: u64,
-    pub cognitive_authored: u64,
-}
-
-impl ComplexityMetrics {
-    pub fn add(&mut self, other: Self) {
-        self.lexical_complexity += other.lexical_complexity;
-        self.cyclomatic_authored += other.cyclomatic_authored;
-        self.cognitive_authored += other.cognitive_authored;
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct BucketReport {
-    pub role: String,
-    pub files: u64,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SourceMetrics {
     #[serde(flatten)]
     pub lines: LineCounts,
     #[serde(flatten)]
     pub metrics: ComplexityMetrics,
     pub declared_public: u64,
+}
+
+impl SourceMetrics {
+    pub fn total(lines: LineCounts, metrics: ComplexityMetrics, buckets: &[BucketReport]) -> Self {
+        Self {
+            lines,
+            metrics,
+            declared_public: buckets.iter().map(|bucket| bucket.declared_public).sum(),
+        }
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.lines.add(other.lines);
+        self.metrics.add(other.metrics);
+        self.declared_public += other.declared_public;
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BucketReport {
+    pub role: OutputRole,
+    pub files: u64,
+    #[serde(flatten)]
+    pub source: SourceMetrics,
+}
+
+deref_field!(BucketReport => SourceMetrics, source);
+
+impl BucketReport {
+    pub fn add(&mut self, other: &Self) {
+        self.files += other.files;
+        self.source.add(other.source);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files == 0 && self.source.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -303,10 +259,10 @@ pub struct FileReport {
 pub struct ProfileReport {
     pub target: String,
     pub rustc: String,
-    pub cfg_preset: String,
-    pub cfg_resolution: String,
-    pub feature_mode: String,
-    pub feature_resolution: String,
+    pub cfg_preset: &'static str,
+    pub cfg_resolution: &'static str,
+    pub feature_mode: &'static str,
+    pub feature_resolution: &'static str,
     pub enabled_features: BTreeMap<String, Vec<String>>,
     pub excluded_features: Vec<String>,
     pub active_cfg: Vec<String>,
@@ -482,12 +438,12 @@ pub struct CompilerReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Report {
-    pub schema_version: u32,
     pub root: String,
     pub selection: SelectionReport,
     pub profile: ProfileReport,
     pub file_count: u64,
     pub bytes: u64,
+    #[serde(skip)]
     pub files: Vec<FileReport>,
     pub buckets: Vec<BucketReport>,
     pub total: LineCounts,
@@ -504,24 +460,28 @@ pub struct SelectionReport {
     pub ignore_boundary: &'static str,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+impl SelectionReport {
+    pub fn new(
+        mut paths: Vec<SelectedPathReport>,
+        include_hidden: bool,
+        respect_ignores: bool,
+    ) -> Self {
+        paths.sort();
+        paths.dedup();
+        Self {
+            paths,
+            include_hidden,
+            respect_ignores,
+            ignore_boundary: "path",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SelectedPathReport {
     pub path: String,
     pub kind: SelectedPathKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SelectedPathKind {
-    File,
-    Directory,
-}
-
-impl SelectedPathKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Directory => "directory",
-        }
-    }
-}
+#[rustfmt::skip]
+labelled_enum! { pub enum SelectedPathKind { File => "file", Directory => "directory" } }

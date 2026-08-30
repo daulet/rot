@@ -5,8 +5,8 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package, PackageId};
+use anyhow::{Context, Result, bail};
+use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, Package, TargetKind};
 use cargo_platform::{Cfg, Platform};
 use ignore::WalkBuilder;
 
@@ -17,31 +17,33 @@ use crate::{
         Activation, Contexts, Diagnostic, DiagnosticSeverity, ProfileReport, Reachability,
         TargetRole,
     },
+    paths::{canonical_or_original, containing_directory, portable},
 };
 
 #[cfg(feature = "audit")]
 use crate::compiler::SelectedCompiler;
+#[cfg(feature = "audit")]
+use cargo_metadata::PackageId;
 
 #[derive(Clone, Debug)]
 pub struct PackageInfo {
+    #[cfg(feature = "audit")]
     pub id: PackageId,
     pub name: String,
     pub root: PathBuf,
     pub edition: String,
     pub features: PackageFeatures,
+    #[cfg(feature = "audit")]
     pub targets: Vec<PackageTargetInfo>,
 }
 
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug)]
 pub struct PackageTargetInfo {
-    #[cfg(feature = "audit")]
     pub name: String,
     pub kinds: Vec<String>,
-    #[cfg(feature = "audit")]
     pub crate_types: Vec<String>,
     pub source: PathBuf,
-    pub required_features: Vec<String>,
-    pub test_reachable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +130,7 @@ struct CargoPlatforms {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(usize)]
 enum CompilationContext {
     Host,
     Target,
@@ -136,75 +139,30 @@ enum CompilationContext {
 const COMPILATION_CONTEXTS: [CompilationContext; 2] =
     [CompilationContext::Host, CompilationContext::Target];
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ContextFeatureState {
     active: bool,
     active_dependencies: BTreeSet<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct FeatureState {
-    host: ContextFeatureState,
-    target: ContextFeatureState,
+    contexts: [ContextFeatureState; 2],
     enabled: BTreeSet<String>,
+    excluded: BTreeSet<String>,
 }
 
 impl FeatureState {
     fn context(&self, context: CompilationContext) -> &ContextFeatureState {
-        match context {
-            CompilationContext::Host => &self.host,
-            CompilationContext::Target => &self.target,
-        }
+        &self.contexts[context as usize]
     }
 
     fn context_mut(&mut self, context: CompilationContext) -> &mut ContextFeatureState {
-        match context {
-            CompilationContext::Host => &mut self.host,
-            CompilationContext::Target => &mut self.target,
-        }
+        &mut self.contexts[context as usize]
     }
 
     fn active(&self) -> bool {
-        self.host.active || self.target.active
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FeatureSelection<'a> {
-    features: &'a [String],
-    all_features: bool,
-    no_default_features: bool,
-    excluded_features: &'a [String],
-}
-
-impl<'a> FeatureSelection<'a> {
-    fn fast(cli: &'a FastCli) -> Self {
-        Self {
-            features: &cli.features,
-            all_features: cli.all_features,
-            no_default_features: cli.no_default_features,
-            excluded_features: &cli.exclude_feature,
-        }
-    }
-
-    fn mode(self) -> &'static str {
-        if self.all_features {
-            if self.excluded_features.is_empty() {
-                "all"
-            } else {
-                "all_except"
-            }
-        } else if self.no_default_features {
-            if self.features.is_empty() {
-                "none"
-            } else {
-                "selected_without_defaults"
-            }
-        } else if self.features.is_empty() {
-            "default"
-        } else {
-            "default_plus_selected"
-        }
+        self.contexts.iter().any(|context| context.active)
     }
 }
 
@@ -212,7 +170,6 @@ struct RustcCfg {
     known_true: HashSet<String>,
     known_false: HashSet<String>,
     closed_world_names: HashSet<String>,
-    target: String,
     version: String,
     preset: &'static str,
     cargo_platforms: CargoPlatforms,
@@ -227,10 +184,7 @@ impl Inventory {
     }
 
     pub fn display_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
+        portable(path.strip_prefix(&self.root).unwrap_or(path))
     }
 
     pub fn should_report(&self, path: &Path) -> bool {
@@ -241,12 +195,7 @@ impl Inventory {
     pub fn selected_package_ids(&self) -> HashSet<String> {
         self.packages
             .iter()
-            .filter(|package| {
-                self.requested.iter().any(|input| {
-                    input.starts_with(&package.root)
-                        || input.is_dir() && package.root.starts_with(input)
-                })
-            })
+            .filter(|package| root_selected(&package.root, &self.requested))
             .map(|package| package.id.to_string())
             .collect()
     }
@@ -283,32 +232,19 @@ pub fn inventory(cli: &FastCli) -> Result<Inventory> {
     {
         bail!("Cargo feature options require a Cargo workspace or package");
     }
-    let cargo_aware = metadata.is_some();
     let rustc_cfg = rustc_cfg(cli)?;
-    let feature_selection = FeatureSelection::fast(cli);
-    let feature_mode = feature_selection.mode().to_owned();
+    let feature_mode = cli.feature_mode(!cli.exclude_feature.is_empty());
     let PackageBuild {
         packages,
-        mut targets,
+        targets,
         enabled_features,
     } = build_packages(
         metadata.as_ref(),
-        feature_selection,
+        cli,
         &requested,
         &rustc_cfg.cargo_platforms,
     )?;
-    let synthetic = !feature_selection.excluded_features.is_empty() || !cli.unset_cfg.is_empty();
-    for input in requested.iter().filter(|path| {
-        path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
-    }) {
-        if !cargo_aware && !targets.iter().any(|target| target.path == *input) {
-            targets.push(TargetSeed {
-                path: input.clone(),
-                contexts: Contexts::seed(TargetRole::Production, Reachability::BOTH),
-            });
-        }
-    }
-
+    let synthetic = !cli.exclude_feature.is_empty() || !cli.unset_cfg.is_empty();
     let reportable_sources = discover_sources(&requested, cli)?;
     let mut sources = reportable_sources.clone();
     for target in &targets {
@@ -321,29 +257,27 @@ pub fn inventory(cli: &FastCli) -> Result<Inventory> {
         known_true: cfg_true,
         known_false: cfg_false,
         closed_world_names: cfg_closed_world,
-        target,
         version: rustc,
         preset: cfg_preset,
-        cargo_platforms: _,
+        cargo_platforms: CargoPlatforms { target, .. },
     } = rustc_cfg;
     let profile = ProfileReport {
         target,
         rustc,
-        cfg_preset: cfg_preset.to_owned(),
-        cfg_resolution: "requested_target_global".to_owned(),
+        cfg_preset,
+        cfg_resolution: "requested_target_global",
         feature_mode,
-        feature_resolution: "workspace_package_union".to_owned(),
+        feature_resolution: "workspace_package_union",
         enabled_features,
-        excluded_features: sorted_trimmed(&cli.exclude_feature),
-        active_cfg: sorted(&cfg_true),
-        forced_cfg: sorted_normalized(&cli.cfg),
-        forced_unset_cfg: sorted_normalized(&cli.unset_cfg),
-        additional_test_attributes: {
-            let mut attributes = cli.test_attribute.clone();
-            attributes.sort();
-            attributes.dedup();
-            attributes
-        },
+        excluded_features: sorted(
+            cli.exclude_feature
+                .iter()
+                .map(|value| value.trim().to_owned()),
+        ),
+        active_cfg: sorted(cfg_true.iter().cloned()),
+        forced_cfg: sorted(cli.cfg.iter().map(|value| normalize_predicate(value))),
+        forced_unset_cfg: sorted(cli.unset_cfg.iter().map(|value| normalize_predicate(value))),
+        additional_test_attributes: sorted(cli.test_attribute.iter().cloned()),
         synthetic,
     };
 
@@ -377,11 +311,7 @@ pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<Inventory> {
         })
         .collect::<Result<Vec<_>>>()?;
     let first = requested.first().context("at least one path is required")?;
-    let current_dir = if first.is_dir() {
-        first.as_path()
-    } else {
-        first.parent().unwrap_or(first)
-    };
+    let current_dir = containing_directory(first);
     let selected_compiler = crate::compiler::selected_compiler(cli, current_dir)?;
     let metadata = crate::compiler::compiler_metadata(cli, current_dir, false)?;
     let root = fs::canonicalize(metadata.workspace_root.as_std_path())
@@ -396,30 +326,18 @@ pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<Inventory> {
 
     let packages = audit_packages(&metadata);
     let target = crate::compiler::effective_target(cli, &root)?;
-    let feature_mode = if cli.all_features {
-        "all"
-    } else if cli.no_default_features {
-        if cli.features.is_empty() {
-            "none"
-        } else {
-            "selected_without_defaults"
-        }
-    } else if cli.features.is_empty() {
-        "default"
-    } else {
-        "default_plus_selected"
-    };
+    let feature_mode = cli.feature_mode(false);
     let profile = ProfileReport {
         target: target.clone(),
         rustc: cli.toolchain.clone(),
-        cfg_preset: "cargo".to_owned(),
-        cfg_resolution: "cargo_unit_graph".to_owned(),
-        feature_mode: feature_mode.to_owned(),
-        feature_resolution: "cargo_unit_graph".to_owned(),
+        cfg_preset: "cargo",
+        cfg_resolution: "cargo_unit_graph",
+        feature_mode,
+        feature_resolution: "cargo_unit_graph",
         enabled_features: BTreeMap::new(),
         excluded_features: Vec::new(),
         active_cfg: Vec::new(),
-        forced_cfg: sorted_normalized(&cli.cfg),
+        forced_cfg: sorted(cli.cfg.iter().map(|value| normalize_predicate(value))),
         forced_unset_cfg: Vec::new(),
         additional_test_attributes: Vec::new(),
         synthetic: false,
@@ -444,11 +362,9 @@ pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<Inventory> {
 
 #[cfg(feature = "audit")]
 fn audit_packages(metadata: &Metadata) -> Vec<PackageInfo> {
-    let workspace_members = metadata.workspace_members.iter().collect::<HashSet<_>>();
     metadata
-        .packages
-        .iter()
-        .filter(|package| workspace_members.contains(&package.id))
+        .workspace_packages()
+        .into_iter()
         .map(|package| {
             let manifest = package.manifest_path.as_std_path();
             PackageInfo {
@@ -465,8 +381,6 @@ fn audit_packages(metadata: &Metadata) -> Vec<PackageInfo> {
                         kinds: target.kind.iter().map(ToString::to_string).collect(),
                         crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
                         source: target.src_path.as_std_path().to_path_buf(),
-                        required_features: target.required_features.clone(),
-                        test_reachable: target.test,
                     })
                     .collect(),
             }
@@ -486,11 +400,7 @@ fn load_metadata(
         {
             continue;
         }
-        let current_dir = if input.is_dir() {
-            input.as_path()
-        } else {
-            input.parent().unwrap_or(input)
-        };
+        let current_dir = containing_directory(input);
         let loaded = ambient_metadata(current_dir);
         match loaded {
             Ok(metadata) => {
@@ -548,37 +458,39 @@ fn find_manifest(start: &Path) -> Option<PathBuf> {
 
 fn build_packages(
     metadata: Option<&Metadata>,
-    selection: FeatureSelection<'_>,
+    cli: &FastCli,
     requested: &[PathBuf],
     platforms: &CargoPlatforms,
 ) -> Result<PackageBuild> {
     let Some(metadata) = metadata else {
         return Ok(PackageBuild {
             packages: Vec::new(),
-            targets: standalone_seeds(requested),
+            targets: requested
+                .iter()
+                .filter(|path| is_rust_file(path))
+                .map(|path| TargetSeed {
+                    path: path.clone(),
+                    contexts: Contexts::production(),
+                })
+                .collect(),
             enabled_features: BTreeMap::new(),
         });
     };
 
-    let workspace_members = metadata.workspace_members.iter().collect::<HashSet<_>>();
-    let workspace_packages = metadata
-        .packages
-        .iter()
-        .filter(|package| workspace_members.contains(&package.id))
-        .collect::<Vec<_>>();
-    let selectors = selection
+    let workspace_packages = metadata.workspace_packages();
+    let selectors = cli
         .features
         .iter()
         .map(|selector| FeatureSelector::parse(selector))
         .collect::<Result<Vec<_>>>()?;
-    let exclusions = selection
-        .excluded_features
+    let exclusions = cli
+        .exclude_feature
         .iter()
         .map(|selector| FeatureSelector::parse(selector))
         .collect::<Result<Vec<_>>>()?;
     let resolved_features = resolve_workspace_features(
         &workspace_packages,
-        selection,
+        cli,
         &selectors,
         &exclusions,
         requested,
@@ -587,65 +499,52 @@ fn build_packages(
 
     let mut packages = Vec::with_capacity(workspace_packages.len());
     let mut enabled_features = BTreeMap::new();
+    let mut targets = Vec::new();
     for (package, features) in workspace_packages.iter().zip(resolved_features) {
-        let target_settings = TargetSettings::load(package.manifest_path.as_std_path())?;
+        let manifest = package.manifest_path.as_std_path();
+        let root = manifest.parent().unwrap_or(manifest).to_path_buf();
+        let target_settings = TargetSettings::load(manifest)?;
         enabled_features.insert(
             package.name.to_string(),
             features.enabled.iter().cloned().collect(),
         );
-        let manifest = package.manifest_path.as_std_path();
+        let selected = root_selected(&root, requested);
+        for target in package.targets.iter().filter(|_| selected) {
+            let enabled = target
+                .required_features
+                .iter()
+                .all(|feature| features.enabled.contains(feature));
+            let (role, reachability) =
+                target_context(target, target.test || target_settings.bench_enabled(target));
+            targets.push(TargetSeed {
+                path: target.src_path.as_std_path().to_path_buf(),
+                contexts: Contexts::seed(
+                    role,
+                    enabled
+                        .then_some(reachability)
+                        .unwrap_or(Reachability::NEVER),
+                ),
+            });
+        }
         packages.push(PackageInfo {
+            #[cfg(feature = "audit")]
             id: package.id.clone(),
             name: package.name.to_string(),
-            root: manifest.parent().unwrap_or(manifest).to_path_buf(),
+            root,
             edition: package.edition.to_string(),
             features,
+            #[cfg(feature = "audit")]
             targets: package
                 .targets
                 .iter()
                 .map(|target| PackageTargetInfo {
-                    #[cfg(feature = "audit")]
                     name: target.name.clone(),
                     kinds: target.kind.iter().map(ToString::to_string).collect(),
-                    #[cfg(feature = "audit")]
                     crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
                     source: target.src_path.as_std_path().to_path_buf(),
-                    required_features: target.required_features.clone(),
-                    test_reachable: target.test || target_settings.bench_enabled(target),
                 })
                 .collect(),
         });
-    }
-
-    let by_id = packages
-        .iter()
-        .enumerate()
-        .map(|(index, package)| (&package.id, index))
-        .collect::<HashMap<_, _>>();
-    let mut targets = Vec::new();
-    for package in workspace_packages {
-        let package_index = by_id[&package.id];
-        if !requested.iter().any(|input| {
-            input.starts_with(&packages[package_index].root)
-                || input.is_dir() && packages[package_index].root.starts_with(input)
-        }) {
-            continue;
-        }
-        for target in &packages[package_index].targets {
-            let path = target.source.clone();
-            let enabled = target
-                .required_features
-                .iter()
-                .all(|feature| packages[package_index].features.enabled.contains(feature));
-            let (role, mut reachability) = target_context(target);
-            if !enabled {
-                reachability = Reachability::NEVER;
-            }
-            targets.push(TargetSeed {
-                path,
-                contexts: Contexts::seed(role, reachability),
-            });
-        }
     }
 
     Ok(PackageBuild {
@@ -653,19 +552,6 @@ fn build_packages(
         targets,
         enabled_features,
     })
-}
-
-fn standalone_seeds(requested: &[PathBuf]) -> Vec<TargetSeed> {
-    requested
-        .iter()
-        .filter(|path| {
-            path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
-        })
-        .map(|path| TargetSeed {
-            path: path.clone(),
-            contexts: Contexts::seed(TargetRole::Production, Reachability::BOTH),
-        })
-        .collect()
 }
 
 struct TargetSettings {
@@ -686,92 +572,71 @@ impl TargetSettings {
     }
 
     fn bench_enabled(&self, target: &cargo_metadata::Target) -> bool {
-        let default = target.kind.iter().any(|kind| {
-            matches!(
-                kind.to_string().as_str(),
-                "lib" | "proc-macro" | "bin" | "bench"
-            )
-        });
         self.target_table(target)
             .and_then(|table| table.get("bench"))
             .and_then(toml::Value::as_bool)
-            .unwrap_or(default)
+            .unwrap_or_else(|| {
+                target.is_lib() || target.is_proc_macro() || target.is_bin() || target.is_bench()
+            })
     }
 
     fn target_table<'a>(
         &'a self,
         target: &cargo_metadata::Target,
     ) -> Option<&'a toml::map::Map<String, toml::Value>> {
-        let key = target
-            .kind
-            .iter()
-            .find_map(|kind| match kind.to_string().as_str() {
-                "lib" | "proc-macro" => Some("lib"),
-                "bin" => Some("bin"),
-                "example" => Some("example"),
-                "test" => Some("test"),
-                "bench" => Some("bench"),
-                _ => None,
-            })?;
+        let key = target.kind.iter().find_map(|kind| match kind {
+            TargetKind::Lib | TargetKind::ProcMacro => Some("lib"),
+            TargetKind::Bin => Some("bin"),
+            TargetKind::Example => Some("example"),
+            TargetKind::Test => Some("test"),
+            TargetKind::Bench => Some("bench"),
+            _ => None,
+        })?;
         let value = self.document.get(key)?;
         if key == "lib" {
             return value.as_table();
         }
         value.as_array()?.iter().find_map(|entry| {
             let table = entry.as_table()?;
-            let name_matches = table
-                .get("name")
-                .and_then(toml::Value::as_str)
-                .is_some_and(|name| name == target.name);
-            let path_matches = table
-                .get("path")
-                .and_then(toml::Value::as_str)
-                .map(|path| self.manifest_dir.join(path))
-                .is_some_and(|path| {
-                    canonical_path(&path) == canonical_path(target.src_path.as_std_path())
-                });
-            (name_matches || path_matches).then_some(table)
+            (table.get("name").and_then(toml::Value::as_str) == Some(target.name.as_str())
+                || table
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| self.manifest_dir.join(path))
+                    .is_some_and(|path| {
+                        canonical_or_original(&path)
+                            == canonical_or_original(target.src_path.as_std_path())
+                    }))
+            .then_some(table)
         })
     }
 }
 
-fn canonical_path(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn target_context(target: &PackageTargetInfo) -> (TargetRole, Reachability) {
-    if target.kinds.iter().any(|kind| kind == "test") {
-        return (TargetRole::Test, Reachability::TEST);
-    }
-    if target.kinds.iter().any(|kind| kind == "bench") {
-        return (TargetRole::Bench, Reachability::TEST);
-    }
-    if target.kinds.iter().any(|kind| kind == "example") {
-        return (
-            TargetRole::Example,
-            Reachability {
-                production: Activation::Always,
-                test: if target.test_reachable {
-                    Activation::Always
-                } else {
-                    Activation::Never
-                },
-            },
-        );
-    }
-    if target.kinds.iter().any(|kind| kind == "custom-build") {
-        return (TargetRole::Build, Reachability::PRODUCTION);
-    }
-
-    let reachability = Reachability {
-        production: Activation::Always,
-        test: if target.test_reachable {
-            Activation::Always
-        } else {
-            Activation::Never
+fn target_context(
+    target: &cargo_metadata::Target,
+    test_reachable: bool,
+) -> (TargetRole, Reachability) {
+    let role = match (
+        target.is_test(),
+        target.is_bench(),
+        target.is_example(),
+        target.is_custom_build(),
+    ) {
+        (true, _, _, _) => TargetRole::Test,
+        (_, true, _, _) => TargetRole::Bench,
+        (_, _, true, _) => TargetRole::Example,
+        (_, _, _, true) => TargetRole::Build,
+        _ => TargetRole::Production,
+    };
+    let reachability = match role {
+        TargetRole::Test | TargetRole::Bench => Reachability::TEST,
+        TargetRole::Build => Reachability::PRODUCTION,
+        TargetRole::Production | TargetRole::Example => Reachability {
+            production: Activation::Always,
+            test: test_reachable.into(),
         },
     };
-    (TargetRole::Production, reachability)
+    (role, reachability)
 }
 
 #[derive(Clone, Debug)]
@@ -818,7 +683,7 @@ struct QualifiedFeature {
 
 fn resolve_workspace_features(
     packages: &[&Package],
-    selection: FeatureSelection<'_>,
+    cli: &FastCli,
     selectors: &[FeatureSelector],
     exclusions: &[FeatureSelector],
     requested: &[PathBuf],
@@ -827,7 +692,10 @@ fn resolve_workspace_features(
     let dependencies = feature_dependencies(packages);
     let selected = packages
         .iter()
-        .map(|package| package_selected(package, requested))
+        .map(|package| {
+            let manifest = package.manifest_path.as_std_path();
+            root_selected(manifest.parent().unwrap_or(manifest), requested)
+        })
         .collect::<Vec<_>>();
     let selected_contexts = packages
         .iter()
@@ -840,38 +708,32 @@ fn resolve_workspace_features(
             }
         })
         .collect::<Vec<_>>();
-    validate_unqualified_selectors(packages, &selected, selectors, "--features")?;
-    validate_unqualified_selectors(packages, &selected, exclusions, "--exclude-feature")?;
-    let qualified_features = resolve_qualified_selectors(
-        packages,
-        &dependencies,
-        &selected_contexts,
-        selectors,
-        "--features",
-        platforms,
-    )?;
-    let qualified_exclusions = resolve_qualified_selectors(
-        packages,
-        &dependencies,
-        &selected_contexts,
-        exclusions,
-        "--exclude-feature",
-        platforms,
-    )?;
-    let mut states = (0..packages.len())
-        .map(|_| FeatureState::default())
-        .collect::<Vec<_>>();
+    let reachable = dependency_reachability(&dependencies, &selected_contexts, platforms);
+    let resolve = |selectors, option| {
+        resolve_qualified_selectors(
+            packages,
+            &dependencies,
+            &selected_contexts,
+            &reachable,
+            selectors,
+            option,
+            platforms,
+        )
+    };
+    let qualified_features = resolve(selectors, "--features")?;
+    let qualified_exclusions = resolve(exclusions, "--exclude-feature")?;
+    let mut states = vec![FeatureState::default(); packages.len()];
 
     for (index, package) in packages.iter().enumerate() {
         if selected[index] {
             for context in &selected_contexts[index] {
                 states[index].context_mut(*context).active = true;
             }
-            if selection.all_features {
+            if cli.all_features {
                 states[index]
                     .enabled
                     .extend(package.features.keys().cloned());
-            } else if !selection.no_default_features && package.features.contains_key("default") {
+            } else if !cli.no_default_features && package.features.contains_key("default") {
                 states[index].enabled.insert("default".to_owned());
             }
             states[index].enabled.extend(
@@ -903,35 +765,42 @@ fn resolve_workspace_features(
     }
 
     loop {
-        let mut activate_packages = BTreeSet::new();
-        let mut activate_dependencies = BTreeSet::new();
-        let mut enable_features = BTreeSet::new();
-
+        let previous = states.clone();
         for (index, package) in packages.iter().enumerate() {
             for context in COMPILATION_CONTEXTS {
-                let context_state = states[index].context(context);
+                let context_state = previous[index].context(context);
                 if !context_state.active {
                     continue;
                 }
 
-                for dependency in dependencies[index].iter().filter(|dependency| {
-                    !dependency.optional && dependency.matches(context, platforms, selected[index])
-                }) {
-                    activate_dependencies.insert((index, context, dependency.alias.clone()));
-                }
+                states[index]
+                    .context_mut(context)
+                    .active_dependencies
+                    .extend(
+                        dependencies[index]
+                            .iter()
+                            .filter(|dependency| {
+                                !dependency.optional
+                                    && dependency.matches(context, platforms, selected[index])
+                            })
+                            .map(|dependency| dependency.alias.clone()),
+                    );
 
-                for feature in &states[index].enabled {
+                for feature in &previous[index].enabled {
                     let Some(members) = package.features.get(feature) else {
                         continue;
                     };
                     for member in members {
                         if let Some(alias) = member.strip_prefix("dep:") {
-                            activate_dependencies.insert((index, context, alias.to_owned()));
+                            states[index]
+                                .context_mut(context)
+                                .active_dependencies
+                                .insert(alias.to_owned());
                             continue;
                         }
                         let Some((dependency, dependency_feature)) = member.split_once('/') else {
                             if package.features.contains_key(member) {
-                                enable_features.insert((index, member.clone()));
+                                states[index].enabled.insert(member.clone());
                             }
                             continue;
                         };
@@ -944,14 +813,14 @@ fn resolve_workspace_features(
                                     selected[index],
                                     alias,
                                     dependency_feature,
-                                    FeatureChanges {
-                                        activate_packages: &mut activate_packages,
-                                        enable_features: &mut enable_features,
-                                    },
+                                    &mut states,
                                 );
                             }
                         } else {
-                            activate_dependencies.insert((index, context, dependency.to_owned()));
+                            states[index]
+                                .context_mut(context)
+                                .active_dependencies
+                                .insert(dependency.to_owned());
                             if package.features.contains_key(dependency)
                                 && dependencies[index].iter().any(|candidate| {
                                     candidate.alias == dependency
@@ -959,7 +828,7 @@ fn resolve_workspace_features(
                                         && candidate.matches(context, platforms, selected[index])
                                 })
                             {
-                                enable_features.insert((index, dependency.to_owned()));
+                                states[index].enabled.insert(dependency.to_owned());
                             }
                             request_dependency_feature(
                                 &dependencies[index],
@@ -968,10 +837,7 @@ fn resolve_workspace_features(
                                 selected[index],
                                 dependency,
                                 dependency_feature,
-                                FeatureChanges {
-                                    activate_packages: &mut activate_packages,
-                                    enable_features: &mut enable_features,
-                                },
+                                &mut states,
                             );
                         }
                     }
@@ -991,222 +857,140 @@ fn resolve_workspace_features(
                     let Some(target) = dependency.target else {
                         continue;
                     };
-                    let child_context = dependency.child_context(context);
-                    activate_packages.insert((target, child_context));
+                    states[target]
+                        .context_mut(dependency.child_context(context))
+                        .active = true;
                     if dependency.uses_default_features
                         && packages[target].features.contains_key("default")
                     {
-                        enable_features.insert((target, "default".to_owned()));
+                        states[target].enabled.insert("default".to_owned());
                     }
-                    enable_features.extend(
-                        dependency
-                            .features
-                            .iter()
-                            .cloned()
-                            .map(|feature| (target, feature)),
-                    );
+                    states[target]
+                        .enabled
+                        .extend(dependency.features.iter().cloned());
                 }
             }
         }
-
-        let mut changed = false;
-        for (package, context) in activate_packages {
-            changed |= !std::mem::replace(&mut states[package].context_mut(context).active, true);
-        }
-        for (package, context, dependency) in activate_dependencies {
-            changed |= states[package]
-                .context_mut(context)
-                .active_dependencies
-                .insert(dependency);
-        }
-        for (package, feature) in enable_features {
-            changed |= states[package].enabled.insert(feature);
-        }
-        if !changed {
+        if states == previous {
             break;
         }
     }
 
-    validate_active_exclusions(packages, &states, exclusions, &qualified_exclusions)?;
-
-    let mut excluded_features = (0..packages.len())
-        .map(|_| BTreeSet::new())
-        .collect::<Vec<_>>();
-    for selector in exclusions
-        .iter()
-        .filter(|selector| selector.package.is_none())
-    {
-        for (index, package) in packages.iter().enumerate() {
-            if selected[index] && package.features.contains_key(&selector.feature) {
-                excluded_features[index].insert(selector.feature.clone());
-            }
-        }
-    }
     for (selector, resolution) in exclusions.iter().zip(&qualified_exclusions) {
         if let Some(resolution) = resolution {
-            excluded_features[resolution.target].insert(selector.feature.clone());
+            if !states[resolution.target].active() {
+                let rendered = selector.rendered();
+                bail!(
+                    "--exclude-feature selector {rendered:?} targets workspace package {:?}, which is not active in the selected feature profile; exclusions never activate dependencies",
+                    packages[resolution.target].name,
+                );
+            }
+            states[resolution.target]
+                .excluded
+                .insert(selector.feature.clone());
+        } else {
+            for (index, package) in packages.iter().enumerate() {
+                if selected[index] && package.features.contains_key(&selector.feature) {
+                    states[index].excluded.insert(selector.feature.clone());
+                }
+            }
         }
     }
 
-    Ok(packages
-        .iter()
-        .enumerate()
-        .zip(states)
-        .map(|((index, _package), mut state)| {
-            let excluded = std::mem::take(&mut excluded_features[index]);
-            for feature in &excluded {
-                state.enabled.remove(feature);
-            }
+    Ok(states
+        .into_iter()
+        .map(|mut state| {
+            state
+                .enabled
+                .retain(|feature| !state.excluded.contains(feature));
             PackageFeatures {
                 enabled: state.enabled,
-                excluded,
+                excluded: state.excluded,
             }
         })
         .collect())
-}
-
-fn validate_unqualified_selectors(
-    packages: &[&Package],
-    selected: &[bool],
-    selectors: &[FeatureSelector],
-    option: &str,
-) -> Result<()> {
-    for selector in selectors
-        .iter()
-        .filter(|selector| selector.package.is_none())
-    {
-        let matched = packages.iter().enumerate().any(|(index, package)| {
-            selected[index] && package.features.contains_key(&selector.feature)
-        });
-        if matched {
-            continue;
-        }
-        let rendered = selector.rendered();
-        bail!(
-            "{option} selector {rendered:?} does not match a selected PATH root feature; use QUALIFIER/FEATURE for a reachable workspace package or direct dependency"
-        );
-    }
-    Ok(())
 }
 
 fn resolve_qualified_selectors(
     packages: &[&Package],
     dependencies: &[Vec<FeatureDependency>],
     selected_contexts: &[BTreeSet<CompilationContext>],
+    reachable: &[BTreeSet<CompilationContext>],
     selectors: &[FeatureSelector],
     option: &str,
     platforms: &CargoPlatforms,
 ) -> Result<Vec<Option<QualifiedFeature>>> {
-    let reachable = dependency_reachability(dependencies, selected_contexts, platforms);
     selectors
         .iter()
         .map(|selector| {
+            let rendered = selector.rendered();
             let Some(qualifier) = selector.package.as_deref() else {
-                return Ok(None);
+                if packages.iter().enumerate().any(|(index, package)| {
+                    !selected_contexts[index].is_empty()
+                        && package.features.contains_key(&selector.feature)
+                }) {
+                    return Ok(None);
+                }
+                bail!(
+                    "{option} selector {rendered:?} does not match a selected PATH root feature; use QUALIFIER/FEATURE for a reachable workspace package or direct dependency"
+                );
             };
-            let package_target = packages.iter().enumerate().find_map(|(index, package)| {
-                (!reachable[index].is_empty()
+            let mut candidates = BTreeMap::<_, (BTreeSet<_>, Vec<_>)>::new();
+            for (target, _package) in packages.iter().enumerate().filter(|(target, package)| {
+                !reachable[*target].is_empty()
                     && package.name.as_str() == qualifier
-                    && package.features.contains_key(&selector.feature))
-                .then_some(index)
-            });
-            let dependency_aliases = selected_contexts
-                .iter()
-                .enumerate()
-                .flat_map(|(parent, contexts)| {
-                    contexts.iter().flat_map(move |context| {
-                        dependencies[parent]
-                            .iter()
-                            .filter(move |dependency| {
-                                dependency.alias == qualifier
-                                    && dependency.matches(*context, platforms, true)
-                            })
-                            .filter_map(move |dependency| {
-                                let target = dependency.target?;
-                                packages[target]
-                                    .features
-                                    .contains_key(&selector.feature)
-                                    .then(|| {
-                                        (
-                                            target,
-                                            dependency.child_context(*context),
-                                            (parent, *context, dependency.alias.clone()),
-                                        )
-                                    })
-                            })
-                        })
-                })
-                .collect::<Vec<_>>();
-            let targets = package_target
-                .into_iter()
-                .chain(
-                    dependency_aliases
-                        .iter()
-                        .map(|(target, _context, _activation)| *target),
-                )
-                .collect::<BTreeSet<_>>();
-            if targets.is_empty() {
-                let rendered = selector.rendered();
-                let workspace_match = packages.iter().any(|package| {
+                    && package.features.contains_key(&selector.feature)
+            }) {
+                candidates
+                    .entry(target)
+                    .or_default()
+                    .0
+                    .extend(&reachable[target]);
+            }
+            for (parent, contexts) in selected_contexts.iter().enumerate() {
+                for context in contexts {
+                    for dependency in dependencies[parent].iter().filter(|dependency| {
+                        dependency.alias == qualifier
+                            && dependency.matches(*context, platforms, true)
+                    }) {
+                        let Some(target) = dependency.target.filter(|target| {
+                            packages[*target].features.contains_key(&selector.feature)
+                        }) else {
+                            continue;
+                        };
+                        let candidate = candidates.entry(target).or_default();
+                        candidate.0.insert(dependency.child_context(*context));
+                        candidate
+                            .1
+                            .push((parent, *context, dependency.alias.clone()));
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                if packages.iter().any(|package| {
                     package.name.as_str() == qualifier
                         && package.features.contains_key(&selector.feature)
-                });
-                if workspace_match {
+                }) {
                     bail!(
                         "{option} selector {rendered:?} targets a workspace package that is not reachable from the selected PATH roots"
                     );
                 }
                 bail!("{option} selector {rendered:?} does not match a reachable workspace package feature or selected-root dependency feature");
             }
-            if targets.len() != 1 {
+            if candidates.len() != 1 {
                 bail!(
-                    "{option} selector {:?} is ambiguous between multiple reachable workspace packages",
-                    selector.rendered()
+                    "{option} selector {rendered:?} is ambiguous between multiple reachable workspace packages"
                 );
             }
-            let target = *targets.first().expect("one qualified target");
-            let contexts = package_target
-                .filter(|candidate| *candidate == target)
-                .into_iter()
-                .flat_map(|_| reachable[target].iter().copied())
-                .chain(dependency_aliases.iter().filter_map(
-                    |(candidate, context, _activation)| {
-                        (*candidate == target).then_some(*context)
-                    },
-                ))
-                .collect();
+            let (target, (contexts, dependency_aliases)) =
+                candidates.pop_first().expect("one qualified target");
             Ok(Some(QualifiedFeature {
                 target,
                 contexts,
-                dependency_aliases: dependency_aliases
-                    .into_iter()
-                    .filter_map(|(candidate, _context, activation)| {
-                        (candidate == target).then_some(activation)
-                    })
-                    .collect(),
+                dependency_aliases,
             }))
         })
         .collect()
-}
-
-fn validate_active_exclusions(
-    packages: &[&Package],
-    states: &[FeatureState],
-    selectors: &[FeatureSelector],
-    resolutions: &[Option<QualifiedFeature>],
-) -> Result<()> {
-    for (selector, resolution) in selectors.iter().zip(resolutions) {
-        if let Some(resolution) = resolution
-            && !states[resolution.target].active()
-        {
-            let rendered = selector.rendered();
-            bail!(
-                "--exclude-feature selector {rendered:?} targets workspace package {:?}, which is not active in the selected feature profile; exclusions never activate dependencies",
-                packages[resolution.target].name,
-            );
-        }
-    }
-    Ok(())
 }
 
 fn dependency_reachability(
@@ -1238,28 +1022,22 @@ fn dependency_reachability(
     visited
 }
 
-fn package_selected(package: &Package, requested: &[PathBuf]) -> bool {
-    let manifest = package.manifest_path.as_std_path();
-    let root = manifest.parent().unwrap_or(manifest);
+fn root_selected(root: &Path, requested: &[PathBuf]) -> bool {
     requested
         .iter()
         .any(|input| input.starts_with(root) || input.is_dir() && root.starts_with(input))
 }
 
+fn is_rust_file(path: &Path) -> bool {
+    path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+}
+
 fn package_root_contexts(package: &Package) -> BTreeSet<CompilationContext> {
     let mut contexts = BTreeSet::new();
     for target in &package.targets {
-        if target
-            .kind
-            .iter()
-            .any(|kind| kind.to_string() == "proc-macro")
-        {
+        if target.is_proc_macro() {
             contexts.insert(CompilationContext::Host);
-        } else if !target
-            .kind
-            .iter()
-            .any(|kind| kind.to_string() == "custom-build")
-        {
+        } else if !target.is_custom_build() {
             contexts.insert(CompilationContext::Target);
         }
     }
@@ -1270,12 +1048,7 @@ fn package_root_contexts(package: &Package) -> BTreeSet<CompilationContext> {
 }
 
 fn package_is_proc_macro(package: &Package) -> bool {
-    package.targets.iter().any(|target| {
-        target
-            .kind
-            .iter()
-            .any(|kind| kind.to_string() == "proc-macro")
-    })
+    package.targets.iter().any(|target| target.is_proc_macro())
 }
 
 fn feature_dependencies(packages: &[&Package]) -> Vec<Vec<FeatureDependency>> {
@@ -1284,7 +1057,10 @@ fn feature_dependencies(packages: &[&Package]) -> Vec<Vec<FeatureDependency>> {
         .enumerate()
         .map(|(index, package)| {
             let manifest = package.manifest_path.as_std_path();
-            (canonical_path(manifest.parent().unwrap_or(manifest)), index)
+            (
+                canonical_or_original(manifest.parent().unwrap_or(manifest)),
+                index,
+            )
         })
         .collect::<HashMap<_, _>>();
 
@@ -1295,10 +1071,11 @@ fn feature_dependencies(packages: &[&Package]) -> Vec<Vec<FeatureDependency>> {
                 .dependencies
                 .iter()
                 .map(|dependency| {
-                    let target = dependency
-                        .path
-                        .as_ref()
-                        .and_then(|path| by_root.get(&canonical_path(path.as_std_path())).copied());
+                    let target = dependency.path.as_ref().and_then(|path| {
+                        by_root
+                            .get(&canonical_or_original(path.as_std_path()))
+                            .copied()
+                    });
                     FeatureDependency {
                         alias: dependency
                             .rename
@@ -1319,11 +1096,6 @@ fn feature_dependencies(packages: &[&Package]) -> Vec<Vec<FeatureDependency>> {
         .collect()
 }
 
-struct FeatureChanges<'a> {
-    activate_packages: &'a mut BTreeSet<(usize, CompilationContext)>,
-    enable_features: &'a mut BTreeSet<(usize, String)>,
-}
-
 fn request_dependency_feature(
     dependencies: &[FeatureDependency],
     context: CompilationContext,
@@ -1331,42 +1103,32 @@ fn request_dependency_feature(
     parent_is_selected: bool,
     alias: &str,
     feature: &str,
-    changes: FeatureChanges<'_>,
+    states: &mut [FeatureState],
 ) {
     for dependency in dependencies.iter().filter(|dependency| {
         dependency.alias == alias && dependency.matches(context, platforms, parent_is_selected)
     }) {
         if let Some(target) = dependency.target {
-            changes
-                .activate_packages
-                .insert((target, dependency.child_context(context)));
-            changes.enable_features.insert((target, feature.to_owned()));
+            states[target]
+                .context_mut(dependency.child_context(context))
+                .active = true;
+            states[target].enabled.insert(feature.to_owned());
         }
     }
 }
 
 fn discover_sources(requested: &[PathBuf], cli: &FastCli) -> Result<BTreeSet<PathBuf>> {
-    let mut sources = BTreeSet::new();
-    for input in requested {
-        if input.is_file() && input.extension().is_some_and(|extension| extension == "rs") {
-            sources.insert(input.clone());
-        }
-    }
-
-    let directories = requested
+    let mut sources = requested
         .iter()
-        .filter(|input| input.is_dir())
+        .filter(|input| is_rust_file(input))
         .cloned()
-        .collect::<Vec<_>>();
-    if directories.is_empty() {
-        return Ok(sources);
-    }
+        .collect::<BTreeSet<_>>();
 
     // A positional directory is an explicit discovery boundary. WalkBuilder
     // never filters its depth-zero root, while `parents(false)` prevents
     // ignore files above that root from affecting its descendants.
-    for walk_root in directories {
-        let mut builder = WalkBuilder::new(&walk_root);
+    for walk_root in requested.iter().filter(|input| input.is_dir()) {
+        let mut builder = WalkBuilder::new(walk_root);
         builder
             .parents(false)
             .hidden(!cli.hidden)
@@ -1409,19 +1171,7 @@ fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
         bail!("cfg predicate {conflict:?} is both enabled and disabled explicitly");
     }
 
-    let mut version_command = rustc_command();
-    let version_output = version_command
-        .arg("-vV")
-        .output()
-        .context("failed to run rustc -vV")?;
-    if !version_output.status.success() {
-        return Err(anyhow!(
-            "rustc -vV failed: {}",
-            String::from_utf8_lossy(&version_output.stderr).trim()
-        ));
-    }
-    let verbose = String::from_utf8(version_output.stdout)
-        .context("rustc emitted non-UTF-8 version output")?;
+    let verbose = rustc_text(rustc_command().arg("-vV"), "rustc -vV", "version")?;
     let rustc = verbose
         .lines()
         .next()
@@ -1438,12 +1188,12 @@ fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
     } else {
         ("dev", "debug-assertions=yes")
     };
-    let source_cfg_text = rustc_print_cfg(Some(&target), Some(debug_assertions))?;
-    let target_cfg_text = rustc_print_cfg(Some(&target), None)?;
+    let source_cfg_text = rustc_print_cfg(&target, Some(debug_assertions))?;
+    let target_cfg_text = rustc_print_cfg(&target, None)?;
     let host_cfg_text = if target == host {
         target_cfg_text.clone()
     } else {
-        rustc_print_cfg(Some(&host), None)?
+        rustc_print_cfg(&host, None)?
     };
     let target_cfg = cargo_dependency_cfg(&target_cfg_text)?;
     let host_cfg = cargo_dependency_cfg(&host_cfg_text)?;
@@ -1468,7 +1218,6 @@ fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
         known_true,
         known_false: forced_false,
         closed_world_names,
-        target: target.clone(),
         version: rustc,
         preset,
         cargo_platforms: CargoPlatforms {
@@ -1480,25 +1229,27 @@ fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
     })
 }
 
-fn rustc_print_cfg(target: Option<&str>, debug_assertions: Option<&str>) -> Result<String> {
+fn rustc_print_cfg(target: &str, debug_assertions: Option<&str>) -> Result<String> {
     let mut command = rustc_command();
-    command.args(["--print", "cfg"]);
+    command.args(["--print", "cfg", "--target", target]);
     if let Some(debug_assertions) = debug_assertions {
         command.args(["-C", debug_assertions]);
     }
-    if let Some(target) = target {
-        command.args(["--target", target]);
-    }
+    rustc_text(&mut command, "rustc --print cfg", "cfg")
+}
+
+fn rustc_text(command: &mut Command, action: &str, output_name: &str) -> Result<String> {
     let output = command
         .output()
-        .context("failed to run rustc --print cfg")?;
+        .with_context(|| format!("failed to run {action}"))?;
     if !output.status.success() {
         bail!(
-            "rustc --print cfg failed: {}",
+            "{action} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    String::from_utf8(output.stdout).context("rustc emitted non-UTF-8 cfg output")
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("rustc emitted non-UTF-8 {output_name} output"))
 }
 
 fn cargo_dependency_cfg(output: &str) -> Result<Vec<Cfg>> {
@@ -1515,26 +1266,9 @@ fn rustc_command() -> Command {
     std::env::var_os("RUSTC").map_or_else(|| Command::new("rustc"), Command::new)
 }
 
-fn sorted(values: &HashSet<String>) -> Vec<String> {
-    let mut values = values.iter().cloned().collect::<Vec<_>>();
-    values.sort();
+fn sorted(values: impl IntoIterator<Item = String>) -> Vec<String> {
     values
-}
-
-fn sorted_normalized(values: &[String]) -> Vec<String> {
-    let mut values = values
-        .iter()
-        .map(|value| normalize_predicate(value))
-        .collect::<Vec<_>>();
-    values.sort();
-    values.dedup();
-    values
-}
-
-fn sorted_trimmed(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .map(|value| value.trim().to_owned())
+        .into_iter()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -1565,11 +1299,7 @@ fn common_root(paths: &[PathBuf]) -> PathBuf {
     let Some(first) = paths.first() else {
         return PathBuf::from(".");
     };
-    let first = if first.is_dir() {
-        first.clone()
-    } else {
-        first.parent().unwrap_or(first).to_path_buf()
-    };
+    let first = containing_directory(first).to_path_buf();
     first
         .ancestors()
         .find(|ancestor| paths.iter().all(|path| path.starts_with(ancestor)))
@@ -1579,6 +1309,8 @@ fn common_root(paths: &[PathBuf]) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     #[test]
@@ -1594,25 +1326,22 @@ mod tests {
     fn feature_exclusion_is_applied_after_feature_closure() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace");
         let metadata = ambient_metadata(&fixture).expect("load fixture metadata");
-        let workspace_members = metadata.workspace_members.iter().collect::<HashSet<_>>();
-        let packages = metadata
-            .packages
-            .iter()
-            .filter(|package| workspace_members.contains(&package.id))
-            .collect::<Vec<_>>();
-        let selected = ["strong_dependency_feature".to_owned()];
-        let excluded = ["strong_dependency_feature".to_owned()];
-        let selection = FeatureSelection {
-            features: &selected,
-            all_features: false,
-            no_default_features: true,
-            excluded_features: &excluded,
-        };
-        let selectors = selected
+        let packages = metadata.workspace_packages();
+        let cli = FastCli::parse_from([
+            "rot",
+            "--no-default-features",
+            "--features",
+            "strong_dependency_feature",
+            "--exclude-feature",
+            "strong_dependency_feature",
+        ]);
+        let selectors = cli
+            .features
             .iter()
             .map(|value| FeatureSelector::parse(value).unwrap())
             .collect::<Vec<_>>();
-        let exclusions = excluded
+        let exclusions = cli
+            .exclude_feature
             .iter()
             .map(|value| FeatureSelector::parse(value).unwrap())
             .collect::<Vec<_>>();
@@ -1625,7 +1354,7 @@ mod tests {
         };
         let features = resolve_workspace_features(
             &packages,
-            selection,
+            &cli,
             &selectors,
             &exclusions,
             &[fixture],
@@ -1646,21 +1375,14 @@ mod tests {
 
     #[test]
     fn all_features_with_exclusions_has_an_explicit_mode() {
-        let excluded = ["unstable".to_owned()];
-        let selection = FeatureSelection {
-            features: &[],
-            all_features: true,
-            no_default_features: false,
-            excluded_features: &excluded,
-        };
+        let cli = FastCli::parse_from(["rot", "--all-features", "--exclude-feature", "unstable"]);
 
-        assert_eq!(selection.mode(), "all_except");
+        assert_eq!(cli.feature_mode(true), "all_except");
         assert_eq!(
-            sorted_trimmed(&[
-                "crate_b/unstable".to_owned(),
-                " crate_a/unstable ".to_owned(),
-                "crate_b/unstable".to_owned(),
-            ]),
+            sorted(
+                ["crate_b/unstable", " crate_a/unstable ", "crate_b/unstable"]
+                    .map(|value| value.trim().to_owned()),
+            ),
             ["crate_a/unstable", "crate_b/unstable"]
         );
     }

@@ -26,42 +26,13 @@ impl CfgProfile {
         mut builtin_names: HashSet<String>,
         custom_test_attributes: &[String],
     ) -> Self {
-        builtin_names.extend(
-            [
-                "target_arch",
-                "target_endian",
-                "target_env",
-                "target_family",
-                "target_feature",
-                "target_has_atomic",
-                "target_has_atomic_equal_alignment",
-                "target_has_atomic_load_store",
-                "target_has_atomic_primitive_alignment",
-                "target_os",
-                "target_pointer_width",
-                "target_vendor",
-                "panic",
-                "debug_assertions",
-                "unix",
-                "windows",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        );
-
-        let mut test_attributes = [
-            "test",
-            "bench",
-            "tokio::test",
-            "async_std::test",
-            "actix_rt::test",
-            "rstest",
-            "test_case",
-            "wasm_bindgen_test",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<HashSet<_>>();
+        const BUILTIN_NAMES: &str = "target_arch target_endian target_env target_family target_feature target_has_atomic target_has_atomic_equal_alignment target_has_atomic_load_store target_has_atomic_primitive_alignment target_os target_pointer_width target_vendor panic debug_assertions unix windows";
+        const TEST_ATTRIBUTES: &str = "test bench tokio::test async_std::test actix_rt::test rstest test_case wasm_bindgen_test";
+        builtin_names.extend(BUILTIN_NAMES.split_whitespace().map(str::to_owned));
+        let mut test_attributes = TEST_ATTRIBUTES
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
         test_attributes.extend(custom_test_attributes.iter().cloned());
 
         Self {
@@ -215,20 +186,6 @@ impl CfgProfile {
         }
         Activation::Maybe
     }
-}
-
-pub fn reachability_for_node(
-    profile: &CfgProfile,
-    node: &SyntaxNode,
-    features: Option<&PackageFeatures>,
-) -> Reachability {
-    let mut ancestors = node.ancestors().collect::<Vec<_>>();
-    ancestors.reverse();
-    ancestors
-        .into_iter()
-        .fold(Reachability::BOTH, |reachability, ancestor| {
-            reachability.and(profile.node_gate(&ancestor, features))
-        })
 }
 
 #[cfg(test)]

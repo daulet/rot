@@ -5,7 +5,7 @@ use std::{
     process::{Command, Output},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tempfile::TempDir;
 
@@ -14,8 +14,9 @@ use crate::{
     cli::FastCli,
     model::{
         BucketReport, Diagnostic, FileReport, OutputRole, ProfileReport, Report, SelectedPathKind,
-        SelectedPathReport, SelectionReport,
+        SelectedPathReport, SelectionReport, SourceMetrics,
     },
+    paths::{containing_directory, portable},
 };
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -48,93 +49,84 @@ impl Change {
     }
 }
 
+macro_rules! source_metric_changes {
+    ($($field:ident => $($path:ident).+),+ $(,)?) => {
+        #[derive(Clone, Debug, Serialize)]
+        pub struct SourceMetricChanges {
+            $(pub $field: Change,)+
+        }
+
+        impl SourceMetricChanges {
+            fn between(before: MetricValues, after: MetricValues) -> Self {
+                Self {
+                    $($field: Change::new(before$(.$path)+, after$(.$path)+),)+
+                }
+            }
+
+            fn changed(&self) -> bool {
+                false $(|| self.$field.changed())+
+            }
+        }
+    };
+}
+
+#[rustfmt::skip]
+source_metric_changes! {
+    physical => source.lines.physical, code => source.lines.code, comments => source.lines.comments,
+    docs => source.lines.docs, blank => source.lines.blank, lexical_complexity => source.metrics.lexical_complexity,
+    cyclomatic_authored => source.metrics.cyclomatic_authored, cognitive_authored => source.metrics.cognitive_authored, declared_public => source.declared_public,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MetricChanges {
     pub files: Change,
-    pub bytes: Change,
-    pub physical: Change,
-    pub code: Change,
-    pub comments: Change,
-    pub docs: Change,
-    pub blank: Change,
-    pub lexical_complexity: Change,
-    pub cyclomatic_authored: Change,
-    pub cognitive_authored: Change,
-    pub declared_public: Change,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Change>,
+    #[serde(flatten)]
+    pub source: SourceMetricChanges,
 }
 
 impl MetricChanges {
-    fn between(before: Metrics, after: Metrics) -> Self {
+    fn between(before: MetricValues, after: MetricValues, include_bytes: bool) -> Self {
         Self {
             files: Change::new(before.files, after.files),
-            bytes: Change::new(before.bytes, after.bytes),
-            physical: Change::new(before.physical, after.physical),
-            code: Change::new(before.code, after.code),
-            comments: Change::new(before.comments, after.comments),
-            docs: Change::new(before.docs, after.docs),
-            blank: Change::new(before.blank, after.blank),
-            lexical_complexity: Change::new(before.lexical_complexity, after.lexical_complexity),
-            cyclomatic_authored: Change::new(before.cyclomatic_authored, after.cyclomatic_authored),
-            cognitive_authored: Change::new(before.cognitive_authored, after.cognitive_authored),
-            declared_public: Change::new(before.declared_public, after.declared_public),
+            bytes: include_bytes.then(|| Change::new(before.bytes, after.bytes)),
+            source: SourceMetricChanges::between(before, after),
         }
     }
 
     fn changed(&self) -> bool {
+        self.files.changed() || self.bytes.is_some_and(Change::changed) || self.source.changed()
+    }
+
+    pub fn bytes(&self) -> Change {
+        self.bytes.expect("bytes are present outside role metrics")
+    }
+
+    pub fn entries(&self) -> [(&'static str, Change); 11] {
         [
-            self.files,
-            self.bytes,
-            self.physical,
-            self.code,
-            self.comments,
-            self.docs,
-            self.blank,
-            self.lexical_complexity,
-            self.cyclomatic_authored,
-            self.cognitive_authored,
-            self.declared_public,
+            ("Files", self.files),
+            ("Bytes", self.bytes()),
+            ("Lines", self.physical),
+            ("Code", self.code),
+            ("Comments", self.comments),
+            ("Docs", self.docs),
+            ("Blank", self.blank),
+            ("Lexical", self.lexical_complexity),
+            ("Cyclomatic", self.cyclomatic_authored),
+            ("Cognitive", self.cognitive_authored),
+            ("Declared pub", self.declared_public),
         ]
-        .into_iter()
-        .any(Change::changed)
     }
 }
+
+deref_field!(MetricChanges => SourceMetricChanges, source);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RoleChanges {
-    pub role: String,
+    pub role: OutputRole,
     #[serde(flatten)]
-    pub metrics: RoleMetricChanges,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct RoleMetricChanges {
-    pub files: Change,
-    pub physical: Change,
-    pub code: Change,
-    pub comments: Change,
-    pub docs: Change,
-    pub blank: Change,
-    pub lexical_complexity: Change,
-    pub cyclomatic_authored: Change,
-    pub cognitive_authored: Change,
-    pub declared_public: Change,
-}
-
-impl RoleMetricChanges {
-    fn between(before: Metrics, after: Metrics) -> Self {
-        Self {
-            files: Change::new(before.files, after.files),
-            physical: Change::new(before.physical, after.physical),
-            code: Change::new(before.code, after.code),
-            comments: Change::new(before.comments, after.comments),
-            docs: Change::new(before.docs, after.docs),
-            blank: Change::new(before.blank, after.blank),
-            lexical_complexity: Change::new(before.lexical_complexity, after.lexical_complexity),
-            cyclomatic_authored: Change::new(before.cyclomatic_authored, after.cyclomatic_authored),
-            cognitive_authored: Change::new(before.cognitive_authored, after.cognitive_authored),
-            declared_public: Change::new(before.declared_public, after.declared_public),
-        }
-    }
+    pub metrics: MetricChanges,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -149,49 +141,17 @@ pub struct Endpoint {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileStatus {
-    Added,
-    Deleted,
-    Modified,
-}
-
-impl FileStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Deleted => "deleted",
-            Self::Modified => "modified",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct FileMetrics {
-    pub bytes: u64,
-    pub physical: u64,
-    pub code: u64,
-    pub comments: u64,
-    pub docs: u64,
-    pub blank: u64,
-    pub lexical_complexity: u64,
-    pub cyclomatic_authored: u64,
-    pub cognitive_authored: u64,
-    pub declared_public: u64,
-    pub production_code: u64,
-    pub test_code: u64,
-    pub other_code: u64,
-}
+#[rustfmt::skip]
+labelled_enum! { pub enum FileStatus { Added => "added", Deleted => "deleted", Modified => "modified" } }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FileChange {
     pub path: String,
     pub status: FileStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<FileMetrics>,
+    pub before: Option<MetricValues>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<FileMetrics>,
+    pub after: Option<MetricValues>,
     pub metrics: MetricChanges,
     pub production_code: Change,
     pub test_code: Change,
@@ -199,24 +159,16 @@ pub struct FileChange {
 }
 
 impl FileChange {
-    fn ranking_key(&self) -> [u128; 12] {
-        // Prefer role-aware authored-code churn, then fall back through the
-        // remaining semantic, line, and byte metrics in report order.
+    fn ranking_key(&self) -> [u128; 2] {
         [
             self.production_code.delta.unsigned_abs()
                 + self.test_code.delta.unsigned_abs()
                 + self.other_code.delta.unsigned_abs(),
-            self.metrics.code.delta.unsigned_abs(),
-            self.metrics.cyclomatic_authored.delta.unsigned_abs(),
-            self.metrics.cognitive_authored.delta.unsigned_abs(),
-            self.metrics.declared_public.delta.unsigned_abs(),
-            self.metrics.lexical_complexity.delta.unsigned_abs(),
-            self.metrics.physical.delta.unsigned_abs(),
-            self.metrics.comments.delta.unsigned_abs(),
-            self.metrics.docs.delta.unsigned_abs(),
-            self.metrics.blank.delta.unsigned_abs(),
-            self.metrics.bytes.delta.unsigned_abs(),
-            self.metrics.files.delta.unsigned_abs(),
+            self.metrics
+                .entries()
+                .iter()
+                .map(|(_, change)| change.delta.unsigned_abs())
+                .sum(),
         ]
     }
 }
@@ -237,6 +189,7 @@ pub struct Comparison {
     pub summary: MetricChanges,
     pub buckets: Vec<RoleChanges>,
     pub metric_changed_files: ChangedFileCounts,
+    #[serde(skip)]
     pub files: Vec<FileChange>,
 }
 
@@ -258,56 +211,53 @@ impl Comparison {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Metrics {
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct MetricValues {
+    #[serde(skip)]
     files: u64,
-    bytes: u64,
-    physical: u64,
-    code: u64,
-    comments: u64,
-    docs: u64,
-    blank: u64,
-    lexical_complexity: u64,
-    cyclomatic_authored: u64,
-    cognitive_authored: u64,
-    declared_public: u64,
+    pub bytes: u64,
+    #[serde(flatten)]
+    pub source: SourceMetrics,
+    pub production_code: u64,
+    pub test_code: u64,
+    pub other_code: u64,
 }
 
-impl Metrics {
+deref_field!(MetricValues => SourceMetrics, source);
+
+impl MetricValues {
     fn report(report: &Report) -> Self {
         Self {
             files: report.file_count,
             bytes: report.bytes,
-            physical: report.total.physical,
-            code: report.total.code,
-            comments: report.total.comments,
-            docs: report.total.docs,
-            blank: report.total.blank,
-            lexical_complexity: report.metrics.lexical_complexity,
-            cyclomatic_authored: report.metrics.cyclomatic_authored,
-            cognitive_authored: report.metrics.cognitive_authored,
-            declared_public: report
-                .buckets
-                .iter()
-                .map(|bucket| bucket.declared_public)
-                .sum(),
+            source: SourceMetrics::total(report.total, report.metrics, &report.buckets),
+            ..Self::default()
         }
     }
 
     fn bucket(bucket: Option<&BucketReport>) -> Self {
         bucket.map_or_else(Self::default, |bucket| Self {
             files: bucket.files,
-            physical: bucket.lines.physical,
-            code: bucket.lines.code,
-            comments: bucket.lines.comments,
-            docs: bucket.lines.docs,
-            blank: bucket.lines.blank,
-            lexical_complexity: bucket.metrics.lexical_complexity,
-            cyclomatic_authored: bucket.metrics.cyclomatic_authored,
-            cognitive_authored: bucket.metrics.cognitive_authored,
-            declared_public: bucket.declared_public,
+            source: bucket.source,
             ..Self::default()
         })
+    }
+
+    fn file(file: &FileReport) -> Self {
+        let production_code = file_role_code(file, OutputRole::Production);
+        let test_code = file_role_code(file, OutputRole::Test);
+        Self {
+            files: 1,
+            bytes: file.bytes,
+            source: SourceMetrics::total(file.total, file.metrics, &file.buckets),
+            production_code,
+            test_code,
+            other_code: file
+                .total
+                .code
+                .saturating_sub(production_code)
+                .saturating_sub(test_code),
+        }
     }
 }
 
@@ -323,43 +273,18 @@ pub fn compare(cli: &FastCli, baseline_ref: &str) -> Result<Comparison> {
     let current_commit = repository.resolve_commit("HEAD")?;
     let dirty = repository.dirty()?;
     let checkout = repository.materialize(&baseline_commit)?;
-    let baseline_paths = repository.baseline_paths(&cli.paths, checkout.root())?;
-    let current = analyze::analyze(cli)?;
+    let baseline_paths = repository.baseline_paths(&cli.paths, &checkout.root)?;
+    let mut current = analyze::analyze(cli)?;
     let mut baseline_cli = cli.clone();
     baseline_cli.cargo.paths = baseline_paths;
     baseline_cli.baseline = None;
-    let baseline = analyze::analyze(&baseline_cli)
+    let mut baseline = analyze::analyze(&baseline_cli)
         .with_context(|| format!("cannot analyze baseline {baseline_ref:?}"))?;
 
-    build_comparison(
-        &repository.root,
-        checkout.root(),
-        baseline_ref,
-        baseline_commit,
-        current_commit,
-        dirty,
-        selection,
-        baseline,
-        current,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_comparison(
-    repository_root: &Path,
-    baseline_root: &Path,
-    baseline_ref: &str,
-    baseline_commit: String,
-    current_commit: String,
-    dirty: bool,
-    selection: SelectionReport,
-    mut baseline: Report,
-    mut current: Report,
-) -> Result<Comparison> {
-    normalize_diagnostics(&mut baseline, baseline_root, repository_root);
-    normalize_diagnostics(&mut current, repository_root, repository_root);
-    let baseline_files = indexed_files(&baseline, baseline_root)?;
-    let current_files = indexed_files(&current, repository_root)?;
+    normalize_diagnostics(&mut baseline, &checkout.root, &repository.root);
+    normalize_diagnostics(&mut current, &repository.root, &repository.root);
+    let baseline_files = indexed_files(&baseline, &checkout.root)?;
+    let current_files = indexed_files(&current, &repository.root)?;
     let mut paths = baseline_files.keys().cloned().collect::<BTreeSet<_>>();
     paths.extend(current_files.keys().cloned());
 
@@ -368,12 +293,9 @@ fn build_comparison(
     for path in paths {
         let before = baseline_files.get(&path).copied();
         let after = current_files.get(&path).copied();
-        let before_metrics = before.map_or_else(FileMetrics::default, file_metrics);
-        let after_metrics = after.map_or_else(FileMetrics::default, file_metrics);
-        let metric_changes = MetricChanges::between(
-            file_metric_totals(before_metrics, before.is_some()),
-            file_metric_totals(after_metrics, after.is_some()),
-        );
+        let before_metrics = before.map_or_else(MetricValues::default, MetricValues::file);
+        let after_metrics = after.map_or_else(MetricValues::default, MetricValues::file);
+        let metric_changes = MetricChanges::between(before_metrics, after_metrics, true);
         let production_code = Change::new(
             before_metrics.production_code,
             after_metrics.production_code,
@@ -417,17 +339,22 @@ fn build_comparison(
     let buckets = OutputRole::ALL
         .into_iter()
         .map(|role| RoleChanges {
-            role: role.key().to_owned(),
-            metrics: RoleMetricChanges::between(
-                Metrics::bucket(find_bucket(&baseline, role)),
-                Metrics::bucket(find_bucket(&current, role)),
+            role,
+            metrics: MetricChanges::between(
+                MetricValues::bucket(role.bucket(&baseline.buckets)),
+                MetricValues::bucket(role.bucket(&current.buckets)),
+                false,
             ),
         })
         .collect();
-    let summary = MetricChanges::between(Metrics::report(&baseline), Metrics::report(&current));
+    let summary = MetricChanges::between(
+        MetricValues::report(&baseline),
+        MetricValues::report(&current),
+        true,
+    );
 
     Ok(Comparison {
-        root: repository_root.to_string_lossy().into_owned(),
+        root: repository.root.to_string_lossy().into_owned(),
         selection,
         before: Endpoint {
             kind: "git",
@@ -468,7 +395,7 @@ fn indexed_files<'a>(
                     physical_root.display()
                 )
             })?;
-            Ok((portable_path(relative), file))
+            Ok((portable(relative), file))
         })
         .collect()
 }
@@ -490,68 +417,15 @@ fn normalize_diagnostics(report: &mut Report, physical_root: &Path, logical_root
             Path::new(&report.root).join(path)
         };
         if let Ok(relative) = absolute.strip_prefix(physical_root) {
-            diagnostic.path = Some(portable_path(relative));
+            diagnostic.path = Some(portable(relative));
         } else if let Ok(relative) = absolute.strip_prefix(logical_root) {
-            diagnostic.path = Some(portable_path(relative));
+            diagnostic.path = Some(portable(relative));
         }
     }
 }
 
-fn find_bucket(report: &Report, role: OutputRole) -> Option<&BucketReport> {
-    report
-        .buckets
-        .iter()
-        .find(|bucket| bucket.role == role.key())
-}
-
-fn file_metrics(file: &FileReport) -> FileMetrics {
-    let production_code = file_role_code(file, OutputRole::Production);
-    let test_code = file_role_code(file, OutputRole::Test);
-    FileMetrics {
-        bytes: file.bytes,
-        physical: file.total.physical,
-        code: file.total.code,
-        comments: file.total.comments,
-        docs: file.total.docs,
-        blank: file.total.blank,
-        lexical_complexity: file.metrics.lexical_complexity,
-        cyclomatic_authored: file.metrics.cyclomatic_authored,
-        cognitive_authored: file.metrics.cognitive_authored,
-        declared_public: file
-            .buckets
-            .iter()
-            .map(|bucket| bucket.declared_public)
-            .sum(),
-        production_code,
-        test_code,
-        other_code: file
-            .total
-            .code
-            .saturating_sub(production_code)
-            .saturating_sub(test_code),
-    }
-}
-
-fn file_metric_totals(file: FileMetrics, present: bool) -> Metrics {
-    Metrics {
-        files: u64::from(present),
-        bytes: file.bytes,
-        physical: file.physical,
-        code: file.code,
-        comments: file.comments,
-        docs: file.docs,
-        blank: file.blank,
-        lexical_complexity: file.lexical_complexity,
-        cyclomatic_authored: file.cyclomatic_authored,
-        cognitive_authored: file.cognitive_authored,
-        declared_public: file.declared_public,
-    }
-}
-
 fn file_role_code(file: &FileReport, role: OutputRole) -> u64 {
-    file.buckets
-        .iter()
-        .find(|bucket| bucket.role == role.key())
+    role.bucket(&file.buckets)
         .map_or(0, |bucket| bucket.lines.code)
 }
 
@@ -564,16 +438,13 @@ impl Repository {
         let first = paths
             .first()
             .context("at least one input path is required")?;
-        let first = fs::canonicalize(first)
-            .with_context(|| format!("cannot resolve input path {}", first.display()))?;
-        let anchor = path_anchor(&first);
+        let first = resolve_path(first, "input path")?;
+        let anchor = containing_directory(&first);
         let root = git_text(anchor, ["rev-parse", "--show-toplevel"])
             .context("--baseline requires every input to be inside one Git repository")?;
-        let root = fs::canonicalize(root.trim())
-            .with_context(|| format!("cannot resolve Git root {}", root.trim()))?;
+        let root = resolve_path(Path::new(root.trim()), "Git root")?;
         for path in paths {
-            let path = fs::canonicalize(path)
-                .with_context(|| format!("cannot resolve input path {}", path.display()))?;
+            let path = resolve_path(path, "input path")?;
             if !path.starts_with(&root) {
                 bail!(
                     "input {} is outside Git repository {}; run one comparison per repository",
@@ -581,10 +452,12 @@ impl Repository {
                     root.display()
                 );
             }
-            let path_root = git_text(path_anchor(&path), ["rev-parse", "--show-toplevel"])
-                .with_context(|| format!("input {} is not in a Git repository", path.display()))?;
-            let path_root = fs::canonicalize(path_root.trim())
-                .with_context(|| format!("cannot resolve Git root {}", path_root.trim()))?;
+            let path_root = git_text(
+                containing_directory(&path),
+                ["rev-parse", "--show-toplevel"],
+            )
+            .with_context(|| format!("input {} is not in a Git repository", path.display()))?;
+            let path_root = resolve_path(Path::new(path_root.trim()), "Git root")?;
             if path_root != root {
                 bail!(
                     "inputs span Git repositories {} and {}; run one comparison per repository",
@@ -602,42 +475,33 @@ impl Repository {
         include_hidden: bool,
         respect_ignores: bool,
     ) -> Result<SelectionReport> {
-        let mut selected = paths
-            .iter()
-            .map(|path| {
-                let (relative, resolved) = self.relative_input(path)?;
-                Ok(SelectedPathReport {
-                    path: if relative.as_os_str().is_empty() {
-                        ".".to_owned()
-                    } else {
-                        portable_path(&relative)
-                    },
-                    kind: if resolved.is_dir() {
-                        SelectedPathKind::Directory
-                    } else {
-                        SelectedPathKind::File
-                    },
+        Ok(SelectionReport::new(
+            paths
+                .iter()
+                .map(|path| {
+                    let (relative, resolved) = self.relative_input(path)?;
+                    Ok(SelectedPathReport {
+                        path: if relative.as_os_str().is_empty() {
+                            ".".to_owned()
+                        } else {
+                            portable(&relative)
+                        },
+                        kind: if resolved.is_dir() {
+                            SelectedPathKind::Directory
+                        } else {
+                            SelectedPathKind::File
+                        },
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        selected.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.kind.cmp(&right.kind))
-        });
-        selected.dedup();
-        Ok(SelectionReport {
-            paths: selected,
+                .collect::<Result<_>>()?,
             include_hidden,
             respect_ignores,
-            ignore_boundary: "path",
-        })
+        ))
     }
 
     fn relative_input(&self, path: &Path) -> Result<(PathBuf, PathBuf)> {
         let lexical = lexical_absolute(path)?;
-        let resolved = fs::canonicalize(path)
-            .with_context(|| format!("cannot resolve input path {}", path.display()))?;
+        let resolved = resolve_path(path, "input path")?;
         let canonical_relative = resolved.strip_prefix(&self.root).with_context(|| {
             format!(
                 "input {} resolves outside Git repository {}",
@@ -673,34 +537,28 @@ impl Repository {
             bail!("--baseline requires a non-empty Git ref");
         }
         let expression = format!("{revision}^{{commit}}");
-        let output = git_output(
-            &self.root,
-            ["rev-parse", "--verify", "--end-of-options", &expression],
+        let stdout = checked_git(
+            git_output(
+                &self.root,
+                ["rev-parse", "--verify", "--end-of-options", &expression],
+            )?,
+            &format!("Git ref {revision:?} does not resolve to a commit"),
         )?;
-        if !output.status.success() {
-            bail!(
-                "Git ref {revision:?} does not resolve to a commit: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8(output.stdout)
+        Ok(String::from_utf8(stdout)
             .context("Git emitted a non-UTF-8 commit ID")?
             .trim()
             .to_owned())
     }
 
     fn dirty(&self) -> Result<bool> {
-        let output = git_output(
-            &self.root,
-            ["status", "--porcelain=v1", "--untracked-files=normal", "--"],
+        let stdout = checked_git(
+            git_output(
+                &self.root,
+                ["status", "--porcelain=v1", "--untracked-files=normal", "--"],
+            )?,
+            "cannot inspect working-tree status",
         )?;
-        if !output.status.success() {
-            bail!(
-                "cannot inspect working-tree status: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(!output.stdout.is_empty())
+        Ok(!stdout.is_empty())
     }
 
     fn materialize(&self, commit: &str) -> Result<Checkout> {
@@ -712,32 +570,26 @@ impl Repository {
         fs::create_dir(&root).context("cannot create baseline checkout root")?;
         let root = fs::canonicalize(&root).context("cannot resolve baseline checkout root")?;
         let index = temporary.path().join("index");
-        let read_tree = git_with_index(&self.root, &index, ["read-tree", "--reset", commit])?;
-        if !read_tree.status.success() {
-            bail!(
-                "cannot read baseline commit {commit}: {}",
-                String::from_utf8_lossy(&read_tree.stderr).trim()
-            );
-        }
+        checked_git(
+            git_with_index(&self.root, &index, ["read-tree", "--reset", commit])?,
+            &format!("cannot read baseline commit {commit}"),
+        )?;
         let mut prefix = root.as_os_str().to_os_string();
         prefix.push(std::path::MAIN_SEPARATOR.to_string());
-        let checkout = git_with_index_os(
-            &self.root,
-            &index,
-            [
-                "checkout-index".into(),
-                "--all".into(),
-                "--force".into(),
-                "--prefix".into(),
-                prefix,
-            ],
+        checked_git(
+            git_with_index(
+                &self.root,
+                &index,
+                [
+                    "checkout-index".into(),
+                    "--all".into(),
+                    "--force".into(),
+                    "--prefix".into(),
+                    prefix,
+                ],
+            )?,
+            &format!("cannot materialize baseline commit {commit}"),
         )?;
-        if !checkout.status.success() {
-            bail!(
-                "cannot materialize baseline commit {commit}: {}",
-                String::from_utf8_lossy(&checkout.stderr).trim()
-            );
-        }
         self.create_ignore_context(&root)?;
         Ok(Checkout {
             _temporary: temporary,
@@ -777,28 +629,23 @@ impl Repository {
                 if !baseline.exists() {
                     bail!(
                         "selected path {} does not exist in baseline; compare a containing directory to include additions",
-                        portable_path(&relative)
+                        portable(&relative)
                     );
                 }
-                let resolved = fs::canonicalize(&baseline).with_context(|| {
-                    format!("cannot resolve baseline path {}", baseline.display())
-                })?;
+                let resolved = resolve_path(&baseline, "baseline path")?;
                 if !resolved.starts_with(baseline_root) {
                     bail!(
                         "baseline path {} resolves outside the materialized commit",
-                        portable_path(&relative)
+                        portable(&relative)
                     );
                 }
                 if current.is_dir() != resolved.is_dir() {
-                    let current_kind = if current.is_dir() { "directory" } else { "file" };
-                    let baseline_kind = if resolved.is_dir() {
-                        "directory"
-                    } else {
-                        "file"
-                    };
+                    let kinds = ["file", "directory"];
+                    let current_kind = kinds[usize::from(current.is_dir())];
+                    let baseline_kind = kinds[usize::from(resolved.is_dir())];
                     bail!(
                         "selected path {} is a {current_kind} in the working tree but a {baseline_kind} in the baseline; compare a stable containing directory instead",
-                        portable_path(&relative),
+                        portable(&relative),
                     );
                 }
                 Ok(resolved)
@@ -812,21 +659,22 @@ struct Checkout {
     root: PathBuf,
 }
 
-impl Checkout {
-    fn root(&self) -> &Path {
-        &self.root
+fn checked_git(output: Output, action: &str) -> Result<Vec<u8>> {
+    if !output.status.success() {
+        bail!(
+            "{action}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
+    Ok(output.stdout)
 }
 
 fn git_text<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<String> {
-    let output = git_output(directory, arguments)?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).context("Git emitted non-UTF-8 output")
+    String::from_utf8(checked_git(
+        git_output(directory, arguments)?,
+        "git failed",
+    )?)
+    .context("Git emitted non-UTF-8 output")
 }
 
 fn git_output<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<Output> {
@@ -836,22 +684,10 @@ fn git_output<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<
         .context("cannot execute git")
 }
 
-fn git_with_index<const N: usize>(
+fn git_with_index(
     directory: &Path,
     index: &Path,
-    arguments: [&str; N],
-) -> Result<Output> {
-    git_command(directory)
-        .env("GIT_INDEX_FILE", index)
-        .args(arguments)
-        .output()
-        .context("cannot execute git")
-}
-
-fn git_with_index_os<const N: usize>(
-    directory: &Path,
-    index: &Path,
-    arguments: [std::ffi::OsString; N],
+    arguments: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
 ) -> Result<Output> {
     git_command(directory)
         .env("GIT_INDEX_FILE", index)
@@ -865,31 +701,14 @@ fn git_command(directory: &Path) -> Command {
     command.current_dir(directory);
     // Hooks and `git rebase --exec` export repository-local variables that
     // override `current_dir`. Baseline selection must always follow PATH.
-    for variable in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_PREFIX",
-    ] {
+    for variable in "GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX".split_whitespace() {
         command.env_remove(variable);
     }
     command
 }
 
-fn portable_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn path_anchor(path: &Path) -> &Path {
-    if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    }
+fn resolve_path(path: &Path, kind: &str) -> Result<PathBuf> {
+    fs::canonicalize(path).with_context(|| format!("cannot resolve {kind} {}", path.display()))
 }
 
 fn lexical_absolute(path: &Path) -> Result<PathBuf> {
@@ -902,16 +721,9 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf> {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if matches!(
-                    normalized.components().next_back(),
-                    Some(Component::Normal(_))
-                ) {
-                    normalized.pop();
-                }
+                normalized.pop();
             }
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
+            _ => normalized.push(component.as_os_str()),
         }
     }
     Ok(normalized)

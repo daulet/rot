@@ -1,0 +1,24 @@
+EXAMPLES:
+  rot .
+  rot . --files
+  rot . --format json --summary-only
+  rot . --baseline HEAD~1
+  rot . --all-features --exclude-feature testability --strict
+  rot . --release
+
+--files expands the human table; it does not select input files.
+Each directory PATH is an ignore boundary: parent .ignore/.gitignore files are not inherited.
+Ignore files inside that directory and below still apply; an explicit Rust file is always included.
+--baseline compares one Git commit with live Rust discovered under the same PATH-local ignore rules.
+Its dirty flag follows repository-wide Git status independently of discovered Rust metrics.
+Revision ranges are rejected.
+Baseline inputs must exist with the same file/directory kind and belong to one Git repository.
+If a selected path changed kind, select a stable containing directory instead.
+Unqualified features apply to PATH roots. PACKAGE/FEATURE addresses a forward member without waking its optional path.
+A selected root's direct dependency alias may replace PACKAGE and activates that dependency, including renamed aliases.
+Feature exclusions never activate dependencies. Dependency contexts propagate through target and host build/proc-macro units.
+Authored cfg is one requested-target-global approximation; cross-target host-unit source can differ from Cargo.
+Role file counts overlap; Total is the number of distinct Rust files.
+Lexical complexity is Rot's SCC-style token score, not a promise of numeric identity with scc.
+JSON records normalized PATH/ignore provenance, writes to stdout, and sends diagnostics to stderr.
+Metric changes do not change the exit status.
