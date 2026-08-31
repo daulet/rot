@@ -102,9 +102,38 @@ fn audit_help_teaches_exact_toolchain_pairing() {
         "does not guess a path",
         "Missing compiler",
         "evidence fails closed",
+        "--baseline",
+        "two isolated real builds",
+        "--explain",
+        "PATH selects complete",
+        "not signature or semver compatibility",
     ] {
         assert!(help.contains(text), "audit help omitted {text:?}\n{help}");
     }
+}
+
+#[test]
+fn audit_cli_validates_deep_queries_before_compilation() {
+    let malformed = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
+        .args(["--driver", "/definitely/not/a/rot-driver"])
+        .args(["--explain", "missing-separator"])
+        .arg(fixture())
+        .output()
+        .expect("run rot-audit");
+    assert!(!malformed.status.success());
+    let stderr = String::from_utf8_lossy(&malformed.stderr);
+    assert!(stderr.contains("PACKAGE:DEFINITION_PATH"), "{stderr}");
+    assert!(!stderr.contains("does not exist"), "{stderr}");
+
+    let conflicting = Command::new(env!("CARGO_BIN_EXE_rot-audit"))
+        .args(["--driver", "/definitely/not/a/rot-driver"])
+        .args(["--baseline", "HEAD", "--explain", "pkg:item"])
+        .arg(fixture())
+        .output()
+        .expect("run rot-audit");
+    assert!(!conflicting.status.success());
+    let stderr = String::from_utf8_lossy(&conflicting.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
-pub const DRIVER_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
+pub const DRIVER_VERSION: u32 = 5;
 pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const RUN_ID_ENV: &str = "ROT_COMPILER_RUN_ID";
@@ -74,6 +74,7 @@ pub enum Event {
     Profile(Profile),
     SourceFile(SourceFile),
     Definition(Definition),
+    PublicBinding(PublicBinding),
     Root(Root),
     Reference(Reference),
     ProductStatus(ProductStatus),
@@ -202,6 +203,38 @@ pub struct Definition {
     pub expansion_origin: ExpansionOrigin,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PublicBinding {
+    pub id: FactId,
+    pub parent: CompilerDefId,
+    pub target: CompilerDefId,
+    pub name: String,
+    pub namespace: Namespace,
+    pub exposure: Exposure,
+    pub exposing_import: Option<CompilerDefId>,
+    pub span: Option<SourceSpan>,
+    pub resolved_target_path: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Namespace {
+    Type,
+    Value,
+    Macro,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Exposure {
+    Direct,
+    SingleReexport,
+    GlobReexport,
+    ExternCrate,
+    MacroUse,
+    MacroExport,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefinitionKind {
@@ -292,7 +325,7 @@ pub struct ProductStatus {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Product {
-    VisibilityAudit,
+    SemanticGraph,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -351,7 +384,7 @@ mod tests {
             invocation_id: InvocationId("invocation".to_owned()),
             sequence: 4,
             event: Event::ProductStatus(ProductStatus {
-                product: Product::VisibilityAudit,
+                product: Product::SemanticGraph,
                 availability: Availability::Complete,
                 message: None,
             }),
@@ -360,8 +393,31 @@ mod tests {
         let encoded = serde_json::to_string(&record).unwrap();
         assert!(encoded.contains(&format!("\"protocol_version\":{PROTOCOL_VERSION}")));
         assert!(encoded.contains("\"event\":\"product_status\""));
-        assert!(encoded.contains("\"product\":\"visibility_audit\""));
+        assert!(encoded.contains("\"product\":\"semantic_graph\""));
         assert_eq!(serde_json::from_str::<Record>(&encoded).unwrap(), record);
+    }
+
+    #[test]
+    fn public_binding_is_one_finite_resolved_namespace_edge() {
+        let binding = PublicBinding {
+            id: FactId("binding-0".to_owned()),
+            parent: compiler_id(1, 2),
+            target: compiler_id(3, 4),
+            name: "Alias".to_owned(),
+            namespace: Namespace::Type,
+            exposure: Exposure::GlobReexport,
+            exposing_import: Some(compiler_id(1, 5)),
+            span: None,
+            resolved_target_path: "dependency::Original".to_owned(),
+        };
+
+        let encoded = serde_json::to_string(&binding).unwrap();
+        assert!(!encoded.contains("segments"));
+        assert!(encoded.contains("\"resolved_target_path\":\"dependency::Original\""));
+        assert_eq!(
+            serde_json::from_str::<PublicBinding>(&encoded).unwrap(),
+            binding
+        );
     }
 
     #[test]

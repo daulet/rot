@@ -258,6 +258,9 @@ fn keep_going_retains_good_facts_but_fails_the_partial_audit() {
 fn visibility_audit_correlates_all_cargo_target_roles() {
     let report = complete_report(&run_audit(&fixture("workspace"), &[]));
 
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["report_kind"], "snapshot");
+
     assert_eq!(
         report["expected_invocations"],
         report["correlated_invocations"]
@@ -268,6 +271,27 @@ fn visibility_audit_correlates_all_cargo_target_roles() {
             .unwrap()
             .iter()
             .all(|invocation| invocation["status"] == "complete")
+    );
+    assert_eq!(
+        report["api_surface"]["scope"],
+        "selected production library and proc-macro public-name topology"
+    );
+    assert!(
+        report["api_surface"]["units"]
+            .as_array()
+            .is_some_and(|units| !units.is_empty())
+    );
+    assert!(
+        report["api_surface"]["definitions"]
+            .as_array()
+            .is_some_and(|definitions| !definitions.is_empty())
+    );
+    assert!(
+        report["invocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|invocation| invocation["public_bindings"].is_number())
     );
     let roles = report["invocations"]
         .as_array()
@@ -336,6 +360,63 @@ fn visibility_audit_correlates_all_cargo_target_roles() {
     assert!(table.contains("dead_public_for_graph"));
     assert!(table.contains("unnecessary_public"));
     assert!(table.contains("dead_public"));
+}
+
+#[test]
+#[ignore = "requires the pinned nightly rustc-dev helper"]
+fn impact_query_explains_compiled_consumers_and_visibility() {
+    let report = complete_report(&run_audit(
+        &fixture("workspace"),
+        &["--explain", "rot-fixture:reachable_public_helper"],
+    ));
+    let impact = &report["impact"];
+    assert_eq!(impact["status"], "complete", "{impact:#}");
+    assert_eq!(impact["visibility_disposition"], "narrowable_public");
+    assert_eq!(
+        impact["selected"]["definition_path"],
+        "reachable_public_helper"
+    );
+    assert!(
+        impact["summary"]["direct_reference_relationships"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        impact["summary"]["transitive_consumers"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(impact["summary"]["production"].as_bool().unwrap());
+    assert!(
+        impact["direct_references"]
+            .as_array()
+            .is_some_and(|references| !references.is_empty())
+    );
+    assert!(
+        impact["witnesses"]
+            .as_array()
+            .is_some_and(|witnesses| !witnesses.is_empty())
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned nightly rustc-dev helper"]
+fn baseline_api_comparison_is_stable_across_checkout_paths() {
+    let report = complete_report(&run_audit(&fixture("workspace"), &["--baseline", "HEAD"]));
+
+    assert_eq!(report["report_kind"], "comparison");
+    assert_eq!(report["before"]["status"], "complete");
+    assert_eq!(report["after"]["status"], "complete");
+    assert_eq!(report["api_diff"]["summary"]["total_changes"], 0);
+    assert_eq!(
+        report["before"]["api_surface"],
+        report["after"]["api_surface"]
+    );
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains(".rot-baseline-")
+    );
 }
 
 #[test]

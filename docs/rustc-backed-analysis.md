@@ -1,13 +1,13 @@
-# Compiler-backed visibility audit
+# Compiler-backed refactoring audit
 
 `rot` and `rot-audit` answer different questions:
 
 - `rot` measures authored Rust source quickly. It owns line counts,
   production/test classification, authored complexity, and explicit unrestricted
   `pub` counts.
-- `rot-audit` compiles one concrete Cargo profile and determines which authored
-  public declarations are required, narrowable, or unreachable within the
-  selected compiled targets.
+- `rot-audit` compiles one concrete Cargo profile and resolves visibility
+  requirements, public-name topology, and dependency-impact explanations
+  within the selected compiled targets.
 
 The audit is an optional companion binary, not a mode of `rot`. Fast JSON never
 contains compiler output, and a compiler failure cannot turn an ordinary source
@@ -33,6 +33,15 @@ cargo build --release --features audit --bin rot-audit
 ./target/release/rot-audit path/to/workspace --locked --offline \
   --toolchain 1.98.0 \
   --driver compiler/rot-rustc-driver/target/1.98.0/release/rot-rustc-driver
+
+# Compare public API topology with a commit. This performs two real builds.
+./target/release/rot-audit path/to/workspace --baseline origin/main \
+  --locked --offline --toolchain 1.98.0 --driver PATH
+
+# Explain the selected compiled consumers of one exact definition.
+./target/release/rot-audit path/to/workspace \
+  --explain 'package-name:module::item' \
+  --toolchain 1.98.0 --driver PATH
 ```
 
 Stable rustc still gates `rustc_private`; `RUSTC_BOOTSTRAP=rot_rustc_driver`
@@ -40,7 +49,7 @@ opts out only for the named driver crate while building it. The default audit
 toolchain is `nightly-2026-08-27`, whose driver can be built without that
 variable.
 
-Protocol v4 is independent of a particular rustc, but each driver binary is
+Protocol v5 is independent of a particular rustc, but each driver binary is
 linked to one exact compiler. The handshake checks the protocol and driver
 versions plus the selected and linked rustc release, full commit, and host
 before any project build starts. A driver must be rebuilt for every rustc patch
@@ -62,12 +71,12 @@ days: 1.90.0, 1.91.0, 1.91.1, 1.92.0, 1.93.0, 1.93.1, 1.94.0, 1.94.1,
 nightly is recorded separately.
 
 Every listed stable compiler built the driver and passed all 12 driver unit
-tests and all 16 semantic visibility fixtures. `rot-audit` rejects a selected
-release, commit, or host absent from the ledger. A rolling update therefore has
-three atomic steps: derive the current stable list from Rust's release record,
-run the complete exact-toolchain matrix on each claimed host, and update the
-ledger only after every row passes. Building old-compatible source with a newer
-rustc does not establish support.
+tests and all 17 semantic-graph fixtures, including finite public bindings.
+`rot-audit` rejects a selected release, commit, or host absent from the ledger.
+A rolling update therefore has three atomic steps: derive the current stable
+list from Rust's release record, run the complete exact-toolchain matrix on each
+claimed host, and update the ledger only after every row passes. Building
+old-compatible source with a newer rustc does not establish support.
 
 ## Execution boundary
 
@@ -92,6 +101,14 @@ project `cargo check`, preventing either that preflight setting or the caller's
 process environment from leaking into the build. Explicit Cargo user/project
 configuration remains part of the build trust boundary and may deliberately set
 the variable.
+
+`--baseline REF` repeats that execution once for the exact Git commit and once
+for the live working tree. The committed tree is materialized as a temporary
+sibling of the repository, preserving ancestor Cargo configuration and `../`
+path-dependency topology without registering a Git worktree. Both endpoints use
+the same explicit target, Cargo/profile flags, driver, and exact compiler
+identity, but separate target/build directories. If either endpoint is
+incomplete, no API diff is produced.
 
 ## Concrete Cargo profiles
 
@@ -121,14 +138,16 @@ Cargo targets whose `required-features` are not active are not compiled. That
 absence is disclosed in every completed visibility report rather than treated as
 proof that their uses do not exist.
 
-## Visibility graph
+## Semantic graph
 
-The driver records the compiler-resolved facts needed for one audit product:
+The driver records the compiler-resolved facts needed for one atomic audit
+product:
 
 - definitions and their nominal/effective visibility;
 - source spans and whether a declaration is authored or generated;
 - runtime and public-interface roots;
 - resolved references between definitions;
+- finite public namespace bindings, including direct and reexported names;
 - Cargo unit, feature, target, test, host/target, and build-script identity.
 
 The aggregator keeps concrete invocation identity. A definition compiled once
@@ -146,7 +165,56 @@ Compiler expansion is used for resolution, not as a maintainability metric.
 Generated definitions can participate in reachability, while only authored,
 source-editable visibility is reported as a refactoring candidate.
 
-## Findings
+### Public API topology
+
+For selected production library and proc-macro units, the audit projects the
+complete graph into a deterministic API-topology snapshot:
+
+- named externally reachable definitions;
+- finite `(parent, exported name, namespace) -> resolved target` bindings.
+
+It never composes every possible public path through reexports; cycles would
+make that set unbounded. Cross-revision identity uses workspace-relative package
+root, Cargo target, definition path, exported name, and namespace. It never uses
+Cargo package IDs containing checkout paths, revision-local rustc definition
+hashes, source hashes, or line numbers.
+
+`--baseline REF` reports added and removed definitions/bindings plus bindings
+whose stable export slot now resolves to a different target. Exposure-route or
+source-location changes alone are provenance changes, not public-name topology
+changes. The full current snapshot is available in JSON; ordinary human output
+stays focused on actionable differences.
+
+This is intentionally not semver analysis. A parameter, return type, generic
+bound, ABI, or marker-trait implementation can change while retaining the same
+definition path. Anonymous implementation containers and unstable opaque-type
+identities remain graph evidence but are excluded from cross-revision API keys.
+
+### Dependency impact explanations
+
+`--explain PACKAGE:DEFINITION_PATH` selects an exact Cargo package name and
+rustc definition path. If multiple physical declarations match, add
+`--explain-at PATH:LINE:COLUMN`; Rot lists candidates rather than choosing one
+silently. Copy `definition_path` from audit JSON or a visibility finding; do not
+prepend the crate name unless rustc included it in that field.
+
+The result includes direct reference relationships, the exact unique transitive
+consumer count, and one shortest root-to-definition witness for each available
+provenance class: production, nonproduction, build-time, and public interface.
+Normal/test invocation state remains separate, and synthetic cross-profile
+visibility-equivalence edges are never presented as real consumers.
+
+Reference locations are representative sites, not an exhaustive list of call
+sites. The driver intentionally retains one canonical relationship for each
+resolved source-definition/target pair. Missing source spans do not erase a
+valid compiler-resolved relationship.
+
+Host build-script and proc-macro consumers are classified as build-time, not
+production. A query with no exact match or multiple physical matches leaves
+`impact.status` unavailable and exits unsuccessfully even when the underlying
+semantic graph remains complete.
+
+## Visibility findings
 
 The audit reports one atomic visibility result with two related views.
 
@@ -180,7 +248,8 @@ Human output prints each actionable finding directly. For example, the locked,
 default-feature Harness acceptance run reports:
 
 ```text
-Visibility audit: complete (4/4 Cargo invocations correlated)
+Compiler audit: complete (4/4 Cargo invocations correlated)
+Compiler: 1.100.0-nightly (bff8e12ff5e6bcd53dfb1dbccdcec80a60a856ed 2026-08-26 for aarch64-apple-darwin)
 Scope: selected-workspace compiled-target closed world
 Evidence excludes: doctests, Cargo targets skipped by the active feature profile
 Required public: 27
@@ -218,8 +287,8 @@ before narrowing a published library API.
 
 ## Fail-closed completeness
 
-Visibility results are emitted only when all selected semantic evidence is
-complete. The audit exits unsuccessfully when any of these conditions holds:
+Semantic results are emitted only when all selected evidence is complete. The
+audit exits unsuccessfully when any of these conditions holds:
 
 - the driver is missing, unsupported, mismatched, or fails its handshake;
 - Cargo metadata or the unit graph cannot be obtained;
@@ -227,6 +296,8 @@ complete. The audit exits unsuccessfully when any of these conditions holds:
 - an expected selected invocation is missing, duplicated, or ambiguously
   correlated;
 - a sidecar is malformed, incomplete, or violates its integrity constraints;
+- a public binding has an unknown endpoint, duplicate namespace slot, or
+  inconsistent resolved target;
 - build-script cfg, target, feature, or codegen evidence disagrees;
 - the reference graph cannot be closed safely.
 
@@ -237,7 +308,8 @@ declarations, and the process still exits nonzero.
 
 ## JSON contract
 
-`rot-audit --format json` emits a separate `schema_version: 2` report. Its main
+`rot-audit --format json` emits a separate `schema_version: 3` report. A normal
+snapshot declares `report_kind: "snapshot"`; its main
 fields are:
 
 ```text
@@ -251,6 +323,8 @@ correlated_invocations
 invocations
 required_visibility
 closed_world
+api_surface
+impact
 diagnostics
 ```
 
@@ -258,23 +332,31 @@ The top-level report retains invocation identity and observed target/profile
 facts, including the requested toolchain and exact rustc release, commit, date,
 and host, so a result can be audited later. Once the selected compiler validates,
 that exact identity is retained even when a later driver, Cargo, or correlation
-failure makes the audit unavailable. `required_visibility` and `closed_world`
-both repeat the scope and exclusions at the point where they qualify the data.
+failure makes the audit unavailable. `required_visibility`, `closed_world`, and
+`impact` repeat scope/exclusion details where they qualify data.
+
+Baseline output declares `report_kind: "comparison"` and contains stable Git
+endpoint identities, the shared requested profile/compiler identity, endpoint
+status/diagnostics, and `api_diff`. It deliberately omits raw invocation keys,
+Cargo package IDs, and baseline checkout paths. `api_diff` is absent—not an
+empty set—when either endpoint lacks complete evidence.
 
 Fast `rot --format json` uses schema version 3 and contains only source metrics,
-profile information, file/role buckets, and diagnostics. Snapshot and comparison
-documents declare `report_kind` and `detail`; it has no `compiler` field.
+profile information, file/role buckets, and diagnostics. Its snapshot and
+comparison documents declare `report_kind` and `detail`; fast JSON has no
+`compiler` field.
 
 ## Deliberate non-goals
 
 - The audit does not replace source line or authored-complexity measurement.
-- It does not inventory an abstract stable library API.
+- It does not judge signature, ABI, generic, implementation, or semver
+  compatibility at an unchanged public path.
 - It does not assign maintainability complexity to derive or procedural-macro
   output.
 - It does not enumerate the power set of Cargo features or target triples.
 - It does not observe arbitrary external consumers of a published library.
 - It does not compile doctests.
 
-Use `rot` routinely for fast source metrics and revision comparisons. Use
-`rot-audit` explicitly when aggressive visibility refactoring justifies a real
-Cargo/rustc build.
+Use `rot` routinely for fast source metrics and source-metric revision
+comparisons. Use `rot-audit` explicitly when aggressive cross-crate refactoring
+justifies compiler-resolved visibility, API-topology, or consumer evidence.

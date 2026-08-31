@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
     Definition, DefinitionKind, Diagnostic, Event, Handshake, InvocationFinished, InvocationId,
     InvocationStarted, MAX_SIDECAR_BYTES, PROTOCOL_VERSION, Product, ProductStatus, Profile,
-    Record, Reference, Root, RunId, SourceFile,
+    PublicBinding, Record, Reference, Root, RunId, SourceFile,
 };
 
 const MAX_SIDECARS: usize = 10_000;
@@ -24,6 +24,7 @@ pub struct Invocation {
     pub products: Vec<ProductStatus>,
     pub diagnostics: Vec<Diagnostic>,
     pub definitions: Vec<Definition>,
+    pub bindings: Vec<PublicBinding>,
     pub roots: Vec<Root>,
     pub references: Vec<Reference>,
     pub finished: InvocationFinished,
@@ -156,6 +157,7 @@ fn validate_records(
     let mut products = Vec::new();
     let mut diagnostics = Vec::new();
     let mut definitions = Vec::new();
+    let mut bindings = Vec::new();
     let mut roots = Vec::new();
     let mut references = Vec::new();
     let mut finished = None;
@@ -175,6 +177,7 @@ fn validate_records(
             Event::Diagnostic(value) => diagnostics.push(value),
             Event::InvocationFinished(value) => finished = Some(value),
             Event::Definition(value) => definitions.push(value),
+            Event::PublicBinding(value) => bindings.push(value),
             Event::Root(value) => roots.push(value),
             Event::Reference(value) => references.push(value),
         }
@@ -212,7 +215,7 @@ fn validate_records(
             bail!("duplicate product_status for {:?}", status.product);
         }
     }
-    let expected_products = BTreeSet::from([Product::VisibilityAudit]);
+    let expected_products = BTreeSet::from([Product::SemanticGraph]);
     if product_names != expected_products {
         bail!("sidecar does not report availability for every semantic product");
     }
@@ -224,12 +227,14 @@ fn validate_records(
         &definitions,
         !sources.is_empty()
             || !definitions.is_empty()
+            || !bindings.is_empty()
             || !references.is_empty()
             || !roots.is_empty(),
     )?;
     sources.sort_by(|left, right| left.key.cmp(&right.key));
     products.sort_by_key(|status| status.product);
     definitions.sort_by(|left, right| left.id.cmp(&right.id));
+    bindings.sort_by(|left, right| left.id.cmp(&right.id));
     roots.sort_by(|left, right| left.id.cmp(&right.id));
     references.sort_by(|left, right| left.id.cmp(&right.id));
     reject_duplicate("source file", sources.iter().map(|source| &source.key.0))?;
@@ -237,6 +242,7 @@ fn validate_records(
     for (kind, id) in definitions
         .iter()
         .map(|fact| ("definition", &fact.id.0))
+        .chain(bindings.iter().map(|fact| ("public binding", &fact.id.0)))
         .chain(roots.iter().map(|fact| ("root", &fact.id.0)))
         .chain(references.iter().map(|fact| ("reference", &fact.id.0)))
     {
@@ -251,6 +257,7 @@ fn validate_records(
     for span in definitions
         .iter()
         .flat_map(|fact| [fact.span.as_ref(), fact.attribution_callsite.as_ref()])
+        .chain(bindings.iter().map(|fact| fact.span.as_ref()))
         .chain(references.iter().map(|fact| fact.span.as_ref()))
         .flatten()
     {
@@ -271,6 +278,7 @@ fn validate_records(
             && !definitions_by_id.contains(definition)
     };
     validate_definition_boundaries(&definitions, &definitions_by_id)?;
+    validate_public_bindings(&bindings, &definitions, &definitions_by_id, &local_crates)?;
     if roots
         .iter()
         .any(|root| !definitions_by_id.contains(&root.definition))
@@ -289,6 +297,7 @@ fn validate_records(
         products,
         diagnostics,
         definitions,
+        bindings,
         roots,
         references,
         finished,
@@ -326,6 +335,56 @@ fn validate_definition_boundaries(
     });
     if unknown {
         bail!("semantic definition has an unknown local parent or visibility boundary");
+    }
+    Ok(())
+}
+
+fn validate_public_bindings(
+    bindings: &[PublicBinding],
+    definitions: &[Definition],
+    definition_ids: &BTreeSet<rot_compiler_protocol::CompilerDefId>,
+    local_crates: &BTreeSet<u64>,
+) -> Result<()> {
+    let definitions_by_id = definitions
+        .iter()
+        .map(|definition| (definition.compiler_id, definition))
+        .collect::<BTreeMap<_, _>>();
+    let mut slots = BTreeSet::new();
+    for binding in bindings {
+        if binding.name.is_empty() || binding.resolved_target_path.is_empty() {
+            bail!("public binding has an empty name or resolved target path");
+        }
+        let Some(parent) = definitions_by_id.get(&binding.parent) else {
+            bail!("public binding has an unknown local parent");
+        };
+        if !matches!(parent.kind, DefinitionKind::Crate | DefinitionKind::Module) {
+            bail!("public binding parent is not a crate or module");
+        }
+        if let Some(import) = binding.exposing_import {
+            let Some(import) = definitions_by_id.get(&import) else {
+                bail!("public binding has an unknown local exposing import");
+            };
+            if !matches!(
+                import.kind,
+                DefinitionKind::Import | DefinitionKind::ExternCrate
+            ) {
+                bail!("public binding exposing import is not an import or extern crate");
+            }
+        }
+        if local_crates.contains(&binding.target.stable_crate_id) {
+            if !definition_ids.contains(&binding.target) {
+                bail!("public binding has an unknown local target");
+            }
+            let target = definitions_by_id
+                .get(&binding.target)
+                .expect("validated local target has a definition");
+            if target.definition_path != binding.resolved_target_path {
+                bail!("public binding resolved target path does not match its local target");
+            }
+        }
+        if !slots.insert((binding.parent, binding.name.as_str(), binding.namespace)) {
+            bail!("duplicate public binding namespace slot");
+        }
     }
     Ok(())
 }
@@ -414,10 +473,10 @@ fn validate_product_facts(
 ) -> Result<()> {
     let status = products
         .iter()
-        .find(|status| status.product == Product::VisibilityAudit)
-        .context("visibility audit status is missing")?;
+        .find(|status| status.product == Product::SemanticGraph)
+        .context("semantic graph status is missing")?;
     if has_facts && status.availability == rot_compiler_protocol::Availability::Unavailable {
-        bail!("unavailable visibility audit contains facts");
+        bail!("unavailable semantic graph contains facts");
     }
     if status.availability != rot_compiler_protocol::Availability::Unavailable {
         let crate_definitions = definitions
@@ -426,7 +485,7 @@ fn validate_product_facts(
             .count();
         if crate_definitions != 1 {
             bail!(
-                "visibility audit facts contain {crate_definitions} crate definitions; expected exactly one"
+                "semantic graph facts contain {crate_definitions} crate definitions; expected exactly one"
             );
         }
     }
@@ -450,8 +509,9 @@ mod tests {
     use super::*;
     use rot_compiler_protocol::{
         ArtifactIdentity, Availability, CfgValue, CodegenProfile, CompilationContext,
-        CompilerDefId, CompilerIdentity, DRIVER_VERSION, DefinitionKind, ExpansionOrigin, FactId,
-        InvocationMergeKey, NominalVisibility, OptimizationLevel, PanicStrategy, ProductStatus,
+        CompilerDefId, CompilerIdentity, DRIVER_VERSION, DefinitionKind, ExpansionOrigin, Exposure,
+        FactId, InvocationMergeKey, Namespace, NominalVisibility, OptimizationLevel, PanicStrategy,
+        ProductStatus, SourceFileKey, SourceSpan,
     };
 
     fn handshake() -> Handshake {
@@ -557,6 +617,23 @@ mod tests {
         definition
     }
 
+    fn public_binding(target: CompilerDefId, resolved_target_path: &str) -> PublicBinding {
+        PublicBinding {
+            id: FactId("binding".to_owned()),
+            parent: CompilerDefId {
+                stable_crate_id: 1,
+                local_hash: 1,
+            },
+            target,
+            name: "Alias".to_owned(),
+            namespace: Namespace::Type,
+            exposure: Exposure::SingleReexport,
+            exposing_import: None,
+            span: None,
+            resolved_target_path: resolved_target_path.to_owned(),
+        }
+    }
+
     #[test]
     fn validates_complete_contiguous_sidecar() {
         let compiler = handshake().rustc.clone();
@@ -566,14 +643,24 @@ mod tests {
             record(2, Event::Definition(crate_definition())),
             record(
                 3,
+                Event::PublicBinding(public_binding(
+                    CompilerDefId {
+                        stable_crate_id: 2,
+                        local_hash: 1,
+                    },
+                    "dependency::Item",
+                )),
+            ),
+            record(
+                4,
                 Event::ProductStatus(ProductStatus {
-                    product: Product::VisibilityAudit,
+                    product: Product::SemanticGraph,
                     availability: Availability::Complete,
                     message: None,
                 }),
             ),
             record(
-                4,
+                5,
                 Event::InvocationFinished(InvocationFinished {
                     rustc_success: true,
                     analysis_reached: true,
@@ -583,17 +670,22 @@ mod tests {
         let invocation = validate_records(records, "run", &handshake()).unwrap();
         assert_eq!(invocation.started.merge_key.0, "merge");
         assert!(invocation.finished.rustc_success);
+        assert_eq!(invocation.bindings.len(), 1);
+        assert_eq!(
+            invocation.bindings[0].resolved_target_path,
+            "dependency::Item"
+        );
     }
 
     #[test]
-    fn rejects_complete_visibility_audit_without_crate_definition() {
+    fn rejects_complete_semantic_graph_without_crate_definition() {
         let records = vec![
             record(0, started(handshake().rustc.clone())),
             record(1, profile()),
             record(
                 2,
                 Event::ProductStatus(ProductStatus {
-                    product: Product::VisibilityAudit,
+                    product: Product::SemanticGraph,
                     availability: Availability::Complete,
                     message: None,
                 }),
@@ -628,7 +720,7 @@ mod tests {
             record(
                 1,
                 Event::ProductStatus(ProductStatus {
-                    product: Product::VisibilityAudit,
+                    product: Product::SemanticGraph,
                     availability: Availability::Complete,
                     message: None,
                 }),
@@ -732,6 +824,188 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("visibility boundary")
+        );
+    }
+
+    #[test]
+    fn validates_public_binding_endpoints_and_unique_slots() {
+        let crate_id = CompilerDefId {
+            stable_crate_id: 1,
+            local_hash: 1,
+        };
+        let target_id = CompilerDefId {
+            stable_crate_id: 1,
+            local_hash: 2,
+        };
+        let import_id = CompilerDefId {
+            stable_crate_id: 1,
+            local_hash: 3,
+        };
+        let mut target = definition(target_id, NominalVisibility::Public);
+        target.definition_path = "crate::Item".to_owned();
+        target.kind = DefinitionKind::Struct;
+        let mut import = definition(import_id, NominalVisibility::Public);
+        import.definition_path = "crate::{use#0}".to_owned();
+        import.kind = DefinitionKind::Import;
+        let definitions = vec![crate_definition(), target, import];
+        let ids = definition_ids(&definitions).unwrap();
+        let local_crates = BTreeSet::from([crate_id.stable_crate_id]);
+        let mut binding = public_binding(target_id, "crate::Item");
+        binding.exposing_import = Some(import_id);
+
+        validate_public_bindings(&[binding.clone()], &definitions, &ids, &local_crates).unwrap();
+
+        let missing_id = CompilerDefId {
+            stable_crate_id: 1,
+            local_hash: 99,
+        };
+        let mut missing_parent = binding.clone();
+        missing_parent.parent = missing_id;
+        assert!(
+            validate_public_bindings(&[missing_parent], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown local parent")
+        );
+
+        let mut missing_target = binding.clone();
+        missing_target.target = missing_id;
+        assert!(
+            validate_public_bindings(&[missing_target], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown local target")
+        );
+
+        let mut missing_import = binding.clone();
+        missing_import.exposing_import = Some(missing_id);
+        assert!(
+            validate_public_bindings(&[missing_import], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown local exposing import")
+        );
+
+        let mut wrong_parent = binding.clone();
+        wrong_parent.parent = target_id;
+        assert!(
+            validate_public_bindings(&[wrong_parent], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("not a crate or module")
+        );
+
+        let mut wrong_import = binding.clone();
+        wrong_import.exposing_import = Some(target_id);
+        assert!(
+            validate_public_bindings(&[wrong_import], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("not an import or extern crate")
+        );
+
+        let mut mismatched_path = binding.clone();
+        mismatched_path.resolved_target_path = "crate::Other".to_owned();
+        assert!(
+            validate_public_bindings(&[mismatched_path], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+
+        let mut duplicate = binding.clone();
+        duplicate.id = FactId("other-binding".to_owned());
+        assert!(
+            validate_public_bindings(&[binding, duplicate], &definitions, &ids, &local_crates)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate public binding namespace slot")
+        );
+    }
+
+    #[test]
+    fn rejects_public_binding_fact_id_collision() {
+        let mut binding = public_binding(
+            CompilerDefId {
+                stable_crate_id: 2,
+                local_hash: 1,
+            },
+            "dependency::Item",
+        );
+        binding.id = crate_definition().id;
+        let records = vec![
+            record(0, started(handshake().rustc.clone())),
+            record(1, profile()),
+            record(2, Event::Definition(crate_definition())),
+            record(3, Event::PublicBinding(binding)),
+            record(
+                4,
+                Event::ProductStatus(ProductStatus {
+                    product: Product::SemanticGraph,
+                    availability: Availability::Complete,
+                    message: None,
+                }),
+            ),
+            record(
+                5,
+                Event::InvocationFinished(InvocationFinished {
+                    rustc_success: true,
+                    analysis_reached: true,
+                }),
+            ),
+        ];
+
+        assert!(
+            validate_records(records, "run", &handshake())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate semantic fact identity")
+        );
+    }
+
+    #[test]
+    fn rejects_public_binding_span_without_its_source_record() {
+        let mut binding = public_binding(
+            CompilerDefId {
+                stable_crate_id: 2,
+                local_hash: 1,
+            },
+            "dependency::Item",
+        );
+        binding.span = Some(SourceSpan {
+            file: SourceFileKey("missing".to_owned()),
+            start: 0,
+            end: 1,
+            line: 1,
+            column: 1,
+        });
+        let records = vec![
+            record(0, started(handshake().rustc.clone())),
+            record(1, profile()),
+            record(2, Event::Definition(crate_definition())),
+            record(3, Event::PublicBinding(binding)),
+            record(
+                4,
+                Event::ProductStatus(ProductStatus {
+                    product: Product::SemanticGraph,
+                    availability: Availability::Complete,
+                    message: None,
+                }),
+            ),
+            record(
+                5,
+                Event::InvocationFinished(InvocationFinished {
+                    rustc_success: true,
+                    analysis_reached: true,
+                }),
+            ),
+        ];
+
+        assert!(
+            validate_records(records, "run", &handshake())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown source file")
         );
     }
 }

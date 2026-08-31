@@ -520,9 +520,11 @@ fn build_packages(
                 path: target.src_path.as_std_path().to_path_buf(),
                 contexts: Contexts::seed(
                     role,
-                    enabled
-                        .then_some(reachability)
-                        .unwrap_or(Reachability::NEVER),
+                    if enabled {
+                        reachability
+                    } else {
+                        Reachability::NEVER
+                    },
                 ),
             });
         }

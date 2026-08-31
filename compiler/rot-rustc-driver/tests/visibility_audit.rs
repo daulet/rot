@@ -7,8 +7,9 @@ use std::{
 };
 
 use rot_compiler_protocol::{
-    Availability, CompilationContext, Definition, DefinitionKind, Event, ExpansionOrigin, Product,
-    RUN_ID_ENV, Record, ReferenceKind, RootKind, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV,
+    Availability, CompilationContext, Definition, DefinitionKind, Event, ExpansionOrigin, Exposure,
+    Namespace, Product, RUN_ID_ENV, Record, ReferenceKind, RootKind, SELECTED_MANIFEST_DIRS_ENV,
+    SIDECAR_DIR_ENV,
 };
 
 static NEXT_TEMPORARY_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -152,7 +153,118 @@ fn visibility_definitions_are_complete_and_source_honest() {
         ),
         b"pub struct Named"
     );
-    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
+    assert_product(&records, Product::SemanticGraph, Availability::Complete);
+}
+
+#[test]
+fn public_bindings_are_finite_resolved_and_source_attributed() {
+    let records = collect_fixture("public_bindings");
+    let definitions = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::Definition(definition) => Some(definition),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let paths = definitions
+        .iter()
+        .map(|definition| (definition.compiler_id, definition.definition_path.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let local_crates = definitions
+        .iter()
+        .map(|definition| definition.compiler_id.stable_crate_id)
+        .collect::<BTreeSet<_>>();
+    let bindings = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::PublicBinding(binding) => Some(binding),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!bindings.is_empty());
+    assert!(bindings.len() < 40, "reexport cycles must stay finite");
+    assert!(bindings.iter().all(|binding| binding.name != "_"));
+    for (index, binding) in bindings.iter().enumerate() {
+        assert_eq!(binding.id.0, format!("binding-{index}"));
+    }
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| (binding.parent, binding.name.as_str(), binding.namespace))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        bindings.len(),
+        "one resolved child occupies each parent/name/namespace slot"
+    );
+    for binding in &bindings {
+        assert!(paths.contains_key(&binding.parent));
+        assert!(!binding.resolved_target_path.is_empty());
+        if local_crates.contains(&binding.target.stable_crate_id) {
+            assert_eq!(
+                paths.get(&binding.target).copied(),
+                Some(binding.resolved_target_path.as_str())
+            );
+        }
+    }
+
+    let renamed = bindings
+        .iter()
+        .find(|binding| binding.name == "Renamed" && binding.namespace == Namespace::Type)
+        .expect("named reexport binding");
+    assert_eq!(renamed.exposure, Exposure::SingleReexport);
+    assert!(renamed.exposing_import.is_some());
+    assert_eq!(renamed.resolved_target_path, "hidden::Named");
+    assert!(renamed.span.is_some());
+
+    let globbed = bindings
+        .iter()
+        .find(|binding| binding.name == "Globbed" && binding.namespace == Namespace::Type)
+        .expect("glob reexport binding");
+    assert_eq!(globbed.exposure, Exposure::GlobReexport);
+    assert!(globbed.exposing_import.is_some());
+    assert_eq!(globbed.resolved_target_path, "hidden::globbed::Globbed");
+
+    let external = bindings
+        .iter()
+        .find(|binding| binding.name == "ExternalDebug" && binding.namespace == Namespace::Type)
+        .expect("external reexport binding");
+    assert_eq!(external.exposure, Exposure::SingleReexport);
+    assert!(!local_crates.contains(&external.target.stable_crate_id));
+    assert!(external.resolved_target_path.ends_with("::fmt::Debug"));
+
+    assert_eq!(
+        bindings
+            .iter()
+            .filter(|binding| binding.name == "RootType")
+            .map(|binding| binding.namespace)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([Namespace::Type, Namespace::Value, Namespace::Macro])
+    );
+    assert!(bindings.iter().any(|binding| {
+        binding.name == "RootType"
+            && binding.namespace == Namespace::Macro
+            && binding.exposure == Exposure::MacroExport
+    }));
+
+    let generated = bindings
+        .iter()
+        .find(|binding| binding.name == "Generated" && binding.namespace == Namespace::Type)
+        .expect("macro-generated binding");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public_bindings.rs");
+    let source = fs::read(fixture).unwrap();
+    assert!(
+        matches!(
+            source_bytes(
+                &source,
+                generated.span.as_ref().expect("generated attribution")
+            ),
+            b"Generated" | b"emit_api!()"
+        ),
+        "rustc must attribute a generated binding to its macro definition or callsite"
+    );
+
+    assert_product(&records, Product::SemanticGraph, Availability::Complete);
 }
 
 #[test]
@@ -466,7 +578,7 @@ fn references_cover_typed_bodies_interfaces_visibility_and_roots() {
         "async_block_only",
         ReferenceKind::Body,
     );
-    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
+    assert_product(&records, Product::SemanticGraph, Availability::Complete);
 }
 
 #[test]
@@ -761,7 +873,7 @@ fn test_harness_entry_reaches_selected_tests_without_rooting_unrelated_code() {
     assert!(reachable_paths.contains("selected_test"));
     assert!(reachable_paths.contains("helper"));
     assert!(!reachable_paths.contains("unrelated_dead"));
-    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
+    assert_product(&records, Product::SemanticGraph, Availability::Complete);
 }
 
 #[test]
@@ -831,18 +943,14 @@ fn entry_roots_are_complete_reference_facts_after_edge_collection() {
         &record.event,
         Event::Root(root) if root.kind == RootKind::EntryPoint
     )));
-    assert_product(&records, Product::VisibilityAudit, Availability::Complete);
+    assert_product(&records, Product::SemanticGraph, Availability::Complete);
 }
 
 #[test]
-fn compiler_failure_never_reports_complete_visibility_audit() {
+fn compiler_failure_never_reports_complete_semantic_graph() {
     let records = collect_failing_source("broken_references", b"pub fn broken( {\n");
 
-    assert_product(
-        &records,
-        Product::VisibilityAudit,
-        Availability::Unavailable,
-    );
+    assert_product(&records, Product::SemanticGraph, Availability::Unavailable);
     assert!(
         !records
             .iter()
@@ -970,7 +1078,7 @@ fn assert_product(records: &[Record], product: Product, availability: Availabili
     assert_eq!(
         statuses.len(),
         1,
-        "one visibility audit must have exactly one atomic product status"
+        "one semantic graph must have exactly one atomic product status"
     );
     assert_eq!(statuses[0].product, product);
     assert_eq!(statuses[0].availability, availability);

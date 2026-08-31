@@ -1,3 +1,4 @@
+pub(crate) mod api_surface;
 mod cargo;
 mod closed_world;
 mod correlation;
@@ -335,11 +336,47 @@ fn build_outcome(
             })
         })
         .collect::<Vec<_>>();
-    let graph_aggregation = closed_world::aggregate(&inventory.root, status, &graph_invocations);
+    let impact_query =
+        cli.explain
+            .as_ref()
+            .map(|selector| closed_world::ImpactQuery {
+                package: selector.package.clone(),
+                definition_path: selector.definition_path.clone(),
+                location: cli.explain_at.as_ref().map(|location| {
+                    closed_world::ImpactLocationQuery {
+                        path: location.path.clone(),
+                        line: location.line,
+                        column: location.column,
+                    }
+                }),
+            });
+    let mut graph_aggregation = closed_world::aggregate_with_query(
+        &inventory.root,
+        status,
+        &graph_invocations,
+        impact_query.as_ref(),
+    );
     status = graph_aggregation.status;
     if graph_aggregation.reason.is_some() {
         reason = graph_aggregation.reason.clone();
     }
+    let api_surface = if status == SemanticStatus::Complete {
+        match api_surface::aggregate(&inventory.root, inventory, &graph_invocations) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                let message = format!("API topology unavailable: {error}");
+                status = SemanticStatus::Partial;
+                reason = Some(message.clone());
+                diagnostics.push(warning(message));
+                graph_aggregation.required_visibility = None;
+                graph_aggregation.closed_world = None;
+                graph_aggregation.impact = None;
+                None
+            }
+        }
+    } else {
+        None
+    };
     invocation_reports.sort_by(|left, right| left.key.cmp(&right.key));
     diagnostics
         .sort_by(|left, right| (&left.path, &left.message).cmp(&(&right.path, &right.message)));
@@ -361,6 +398,8 @@ fn build_outcome(
             reason,
             required_visibility: graph_aggregation.required_visibility,
             closed_world: graph_aggregation.closed_world,
+            api_surface,
+            impact: graph_aggregation.impact,
         },
         diagnostics,
     }
@@ -386,7 +425,7 @@ fn invocation_report(
     let raw = invocation
         .products
         .first()
-        .expect("validated sidecars contain visibility audit status");
+        .expect("validated sidecars contain semantic graph status");
     let raw_status = availability(raw.availability);
     let status = if issues.is_empty() || raw_status == SemanticStatus::Unavailable {
         raw_status
@@ -423,6 +462,7 @@ fn invocation_report(
         ),
         cfg: observed_cfg,
         definitions: invocation.definitions.len() as u64,
+        public_bindings: invocation.bindings.len() as u64,
         roots: invocation.roots.len() as u64,
         references: invocation.references.len() as u64,
         status,
@@ -432,9 +472,10 @@ fn invocation_report(
 
 fn product_has_facts(invocation: &Invocation, product: Product) -> bool {
     match product {
-        Product::VisibilityAudit => {
+        Product::SemanticGraph => {
             !invocation.sources.is_empty()
                 || !invocation.definitions.is_empty()
+                || !invocation.bindings.is_empty()
                 || !invocation.references.is_empty()
                 || !invocation.roots.is_empty()
         }
@@ -726,6 +767,8 @@ fn unavailable(inventory: &Inventory, reason: String) -> Outcome {
             reason: Some(reason.clone()),
             required_visibility: None,
             closed_world: None,
+            api_surface: None,
+            impact: None,
         },
         diagnostics: vec![warning(reason)],
     }

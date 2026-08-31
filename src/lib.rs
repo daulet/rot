@@ -35,6 +35,7 @@ mod diff;
 mod model;
 mod paths;
 mod report;
+mod revision;
 mod source;
 mod workspace;
 

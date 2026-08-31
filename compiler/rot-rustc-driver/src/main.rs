@@ -24,12 +24,12 @@ use std::{
 use rot_compiler_protocol::{
     ArtifactIdentity, Availability, BUILD_DIR_ENV, CfgValue, CodegenProfile, CompilationContext,
     CompilerDefId, CompilerIdentity, DRIVER_VERSION, Definition, DefinitionKind, Diagnostic,
-    DiagnosticPhase, DiagnosticSeverity, Event, ExpansionOrigin, FactId, HANDSHAKE_ARG, Handshake,
-    InvocationFinished, InvocationId, InvocationMergeKey, InvocationStarted, MAX_SIDECAR_BYTES,
-    NominalVisibility, OptimizationLevel, PROTOCOL_VERSION, PanicStrategy, Product, ProductStatus,
-    Profile, RUN_ID_ENV, Record, Reference, ReferenceKind, Root, RootKind, RunId,
-    SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile, SourceFileKey, SourceSpan,
-    TARGET_DIR_ENV,
+    DiagnosticPhase, DiagnosticSeverity, Event, ExpansionOrigin, Exposure, FactId, HANDSHAKE_ARG,
+    Handshake, InvocationFinished, InvocationId, InvocationMergeKey, InvocationStarted,
+    MAX_SIDECAR_BYTES, Namespace, NominalVisibility, OptimizationLevel, PROTOCOL_VERSION,
+    PanicStrategy, Product, ProductStatus, Profile, PublicBinding, RUN_ID_ENV, Record, Reference,
+    ReferenceKind, Root, RootKind, RunId, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile,
+    SourceFileKey, SourceSpan, TARGET_DIR_ENV,
 };
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::{
@@ -381,7 +381,7 @@ struct Collection {
     roots: Vec<GeneratedRoot>,
     records: RecordBuffer,
     analysis_reached: bool,
-    visibility_audit: ProductProgress,
+    semantic_graph: ProductProgress,
 }
 
 #[derive(Default)]
@@ -469,42 +469,47 @@ impl Collection {
             roots,
             records,
             analysis_reached: false,
-            visibility_audit: ProductProgress::default(),
+            semantic_graph: ProductProgress::default(),
         })
     }
 
     fn collect<'tcx>(&mut self, tcx: TyCtxt<'tcx>) {
         self.analysis_reached = true;
-        self.visibility_audit.start();
+        self.semantic_graph.start();
         if self.records.truncated {
-            self.visibility_audit.reject();
+            self.semantic_graph.reject();
         }
         if !self.records.push(Event::Profile(profile(tcx))) {
-            self.visibility_audit.reject();
+            self.semantic_graph.reject();
         }
 
         let facts = collect_facts(tcx, &self.roots);
         for source in facts.sources.into_values() {
             if !self.records.push(Event::SourceFile(source)) {
-                self.visibility_audit.reject();
+                self.semantic_graph.reject();
             }
         }
         for definition in facts.definitions {
             if !self.records.push(Event::Definition(definition)) {
-                self.visibility_audit.reject();
+                self.semantic_graph.reject();
+            }
+        }
+        for binding in facts.bindings {
+            if !self.records.push(Event::PublicBinding(binding)) {
+                self.semantic_graph.reject();
             }
         }
         if self.records.truncated {
-            self.visibility_audit.reject();
+            self.semantic_graph.reject();
         }
         for root in facts.roots {
             if !self.records.push(Event::Root(root)) {
-                self.visibility_audit.reject();
+                self.semantic_graph.reject();
             }
         }
         for reference in facts.references {
             if !self.records.push(Event::Reference(reference)) {
-                self.visibility_audit.reject();
+                self.semantic_graph.reject();
             }
         }
     }
@@ -523,9 +528,9 @@ impl Collection {
         }
         self.records
             .push_mandatory(Event::ProductStatus(ProductStatus {
-                product: Product::VisibilityAudit,
-                availability: self.visibility_audit.availability(),
-                message: product_message(&self.visibility_audit),
+                product: Product::SemanticGraph,
+                availability: self.semantic_graph.availability(),
+                message: product_message(&self.semantic_graph),
             }));
         self.records
             .push_mandatory(Event::InvocationFinished(InvocationFinished {
@@ -552,34 +557,9 @@ fn product_message(progress: &ProductProgress) -> Option<String> {
 struct CollectedFacts {
     sources: BTreeMap<SourceFileKey, SourceFile>,
     definitions: Vec<Definition>,
-    bindings: Vec<VisibilityBinding>,
+    bindings: Vec<PublicBinding>,
     roots: Vec<Root>,
     references: Vec<Reference>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum BindingNamespace {
-    Type,
-    Value,
-    Macro,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum BindingExposure {
-    Direct,
-    SingleReexport,
-    GlobReexport,
-    ExternCrate,
-    MacroUse,
-    MacroExport,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct VisibilityBinding {
-    target: CompilerDefId,
-    namespace: BindingNamespace,
-    exposure: BindingExposure,
-    exposing_import: Option<CompilerDefId>,
 }
 
 impl CollectedFacts {
@@ -680,7 +660,7 @@ fn collect_facts(tcx: TyCtxt<'_>, generated_roots: &[GeneratedRoot]) -> Collecte
         });
     }
 
-    collect_visibility_bindings(tcx, &local_definitions, &mut facts);
+    collect_visibility_bindings(tcx, generated_roots, &local_definitions, &mut facts);
     collect_references(
         tcx,
         generated_roots,
@@ -1233,8 +1213,7 @@ fn collect_reference_roots(
         .bindings
         .iter()
         .filter(|binding| {
-            binding.namespace == BindingNamespace::Macro
-                && binding.exposure == BindingExposure::Direct
+            binding.namespace == Namespace::Macro && binding.exposure == Exposure::Direct
         })
         .filter_map(|binding| local_by_id.get(&binding.target).copied())
         .filter(|local_def_id| matches!(tcx.def_kind(*local_def_id), DefKind::Macro(..)))
@@ -1369,10 +1348,10 @@ fn collect_reference_roots(
                 .is_some_and(|import| public_import_ids.contains(&import))
                 && matches!(
                     binding.exposure,
-                    BindingExposure::SingleReexport
-                        | BindingExposure::ExternCrate
-                        | BindingExposure::MacroUse
-                        | BindingExposure::MacroExport
+                    Exposure::SingleReexport
+                        | Exposure::ExternCrate
+                        | Exposure::MacroUse
+                        | Exposure::MacroExport
                 )
         })
         .filter_map(|binding| local_by_id.get(&binding.target).copied())
@@ -1472,6 +1451,42 @@ fn sort_and_identify_facts(facts: &mut CollectedFacts) {
         definition.id = FactId(format!("definition-{index}"));
     }
 
+    facts.bindings.sort_by(|left, right| {
+        (
+            left.parent,
+            &left.name,
+            left.namespace,
+            left.target,
+            left.exposure,
+            left.exposing_import,
+            &left.resolved_target_path,
+            &left.span,
+        )
+            .cmp(&(
+                right.parent,
+                &right.name,
+                right.namespace,
+                right.target,
+                right.exposure,
+                right.exposing_import,
+                &right.resolved_target_path,
+                &right.span,
+            ))
+    });
+    facts.bindings.dedup_by(|left, right| {
+        left.parent == right.parent
+            && left.target == right.target
+            && left.name == right.name
+            && left.namespace == right.namespace
+            && left.exposure == right.exposure
+            && left.exposing_import == right.exposing_import
+            && left.span == right.span
+            && left.resolved_target_path == right.resolved_target_path
+    });
+    for (index, binding) in facts.bindings.iter_mut().enumerate() {
+        binding.id = FactId(format!("binding-{index}"));
+    }
+
     facts.roots.sort_by(|left, right| {
         (left.definition, left.kind, &left.reason).cmp(&(
             right.definition,
@@ -1514,6 +1529,7 @@ fn sort_and_identify_facts(facts: &mut CollectedFacts) {
 
 fn collect_visibility_bindings(
     tcx: TyCtxt<'_>,
+    generated_roots: &[GeneratedRoot],
     local_definitions: &[LocalDefId],
     facts: &mut CollectedFacts,
 ) {
@@ -1521,8 +1537,13 @@ fn collect_visibility_bindings(
         tcx.def_kind(*definition) == DefKind::Mod
             && (*definition == CRATE_DEF_ID || externally_reachable(tcx, *definition))
     }) {
+        let parent = compiler_id(tcx, module.to_def_id());
         for child in tcx.module_children_local(module) {
             if !child.vis.is_public() {
+                continue;
+            }
+            let name = child.ident.name.to_string();
+            if name == "_" {
                 continue;
             }
             let Res::Def(kind, target) = child.res else {
@@ -1538,11 +1559,23 @@ fn collect_visibility_bindings(
                 continue;
             };
             let (exposure, exposing_import) = binding_exposure(tcx, child.reexport_chain.first());
-            facts.bindings.push(VisibilityBinding {
+            let attribution = span_attribution(tcx, child.ident.span, generated_roots);
+            facts.remember_attribution(&attribution);
+            let span = attribution
+                .span
+                .as_ref()
+                .or(attribution.callsite.as_ref())
+                .map(|located| located.span.clone());
+            facts.bindings.push(PublicBinding {
+                id: FactId(String::new()),
+                parent,
                 target: compiler_id(tcx, target),
+                name,
                 namespace,
                 exposure,
                 exposing_import,
+                span,
+                resolved_target_path: tcx.def_path_str(target),
             });
         }
     }
@@ -1652,15 +1685,15 @@ fn externally_reachable(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> bool {
         .is_some()
 }
 
-fn binding_namespace(kind: DefKind) -> Option<BindingNamespace> {
+fn binding_namespace(kind: DefKind) -> Option<Namespace> {
     match kind {
-        DefKind::Macro(..) => Some(BindingNamespace::Macro),
+        DefKind::Macro(..) => Some(Namespace::Macro),
         DefKind::Fn
         | DefKind::Const { .. }
         | DefKind::Static { .. }
         | DefKind::Ctor(..)
         | DefKind::AssocFn
-        | DefKind::AssocConst { .. } => Some(BindingNamespace::Value),
+        | DefKind::AssocConst { .. } => Some(Namespace::Value),
         DefKind::Mod
         | DefKind::Struct
         | DefKind::Union
@@ -1673,7 +1706,7 @@ fn binding_namespace(kind: DefKind) -> Option<BindingNamespace> {
         | DefKind::AssocTy
         | DefKind::ExternCrate
         | DefKind::ForeignMod
-        | DefKind::OpaqueTy => Some(BindingNamespace::Type),
+        | DefKind::OpaqueTy => Some(Namespace::Type),
         DefKind::TyParam
         | DefKind::ConstParam
         | DefKind::Use
@@ -1694,23 +1727,18 @@ fn binding_namespace(kind: DefKind) -> Option<BindingNamespace> {
 fn binding_exposure(
     tcx: TyCtxt<'_>,
     reexport: Option<&Reexport>,
-) -> (BindingExposure, Option<CompilerDefId>) {
+) -> (Exposure, Option<CompilerDefId>) {
     match reexport {
-        None => (BindingExposure::Direct, None),
-        Some(Reexport::Single(import)) => (
-            BindingExposure::SingleReexport,
-            Some(compiler_id(tcx, *import)),
-        ),
-        Some(Reexport::Glob(import)) => (
-            BindingExposure::GlobReexport,
-            Some(compiler_id(tcx, *import)),
-        ),
-        Some(Reexport::ExternCrate(import)) => (
-            BindingExposure::ExternCrate,
-            Some(compiler_id(tcx, *import)),
-        ),
-        Some(Reexport::MacroUse) => (BindingExposure::MacroUse, None),
-        Some(Reexport::MacroExport) => (BindingExposure::MacroExport, None),
+        None => (Exposure::Direct, None),
+        Some(Reexport::Single(import)) => {
+            (Exposure::SingleReexport, Some(compiler_id(tcx, *import)))
+        }
+        Some(Reexport::Glob(import)) => (Exposure::GlobReexport, Some(compiler_id(tcx, *import))),
+        Some(Reexport::ExternCrate(import)) => {
+            (Exposure::ExternCrate, Some(compiler_id(tcx, *import)))
+        }
+        Some(Reexport::MacroUse) => (Exposure::MacroUse, None),
+        Some(Reexport::MacroExport) => (Exposure::MacroExport, None),
     }
 }
 
@@ -2290,17 +2318,17 @@ mod tests {
     }
 
     #[test]
-    fn visibility_audit_progress_is_atomic() {
-        let mut audit = ProductProgress::default();
+    fn semantic_graph_progress_is_atomic() {
+        let mut graph = ProductProgress::default();
 
-        assert_eq!(audit.availability(), Availability::Unavailable);
-        audit.start();
-        assert_eq!(audit.availability(), Availability::Complete);
-        audit.reject();
+        assert_eq!(graph.availability(), Availability::Unavailable);
+        graph.start();
+        assert_eq!(graph.availability(), Availability::Complete);
+        graph.reject();
 
-        assert_eq!(audit.availability(), Availability::Partial);
+        assert_eq!(graph.availability(), Availability::Partial);
         assert_eq!(
-            product_message(&audit).as_deref(),
+            product_message(&graph).as_deref(),
             Some("compiler facts were truncated by the sidecar limit")
         );
     }

@@ -316,7 +316,7 @@ pub struct CompilerDefinitionIdReport {
 }
 
 #[cfg(feature = "audit")]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CompilerSourceSpanReport {
     pub path: String,
     pub source_hash: String,
@@ -395,6 +395,127 @@ pub struct ClosedWorldReport {
 }
 
 #[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactQueryReport {
+    pub package: String,
+    pub definition_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u64>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactDefinitionReport {
+    pub package_id: String,
+    pub package_name: String,
+    pub crate_name: String,
+    pub target_name: String,
+    pub definition_path: String,
+    pub definition_kind: String,
+    pub expansion_origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<CompilerSourceSpanReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution_callsite: Option<CompilerSourceSpanReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactProvenanceClass {
+    Production,
+    Nonproduction,
+    BuildTime,
+    PublicInterface,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactProvenanceReport {
+    pub class: ImpactProvenanceClass,
+    pub package_id: String,
+    pub target_name: String,
+    pub target_role: String,
+    pub compilation_context: String,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactVisibilityDisposition {
+    RequiredPublic,
+    NarrowablePublic,
+    DeadPublic,
+    NotPublicCandidate,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactReferenceReport {
+    pub consumer: ImpactDefinitionReport,
+    pub dependency: ImpactDefinitionReport,
+    pub reference_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub representative_span: Option<CompilerSourceSpanReport>,
+    pub provenance: ImpactProvenanceReport,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactReferenceStepReport {
+    pub from: ImpactDefinitionReport,
+    pub to: ImpactDefinitionReport,
+    pub reference_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub representative_span: Option<CompilerSourceSpanReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactWitnessReport {
+    pub provenance: ImpactProvenanceReport,
+    pub root: ImpactDefinitionReport,
+    pub root_reason: String,
+    pub steps: Vec<ImpactReferenceStepReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactSummaryReport {
+    pub direct_reference_relationships: u64,
+    pub transitive_consumers: u64,
+    pub production: bool,
+    pub nonproduction: bool,
+    pub build_time: bool,
+    pub public_interface: bool,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImpactReport {
+    pub status: SemanticStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub scope: String,
+    pub evidence_exclusions: Vec<String>,
+    pub query: ImpactQueryReport,
+    pub candidates: Vec<ImpactDefinitionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<ImpactDefinitionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility_disposition: Option<ImpactVisibilityDisposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ImpactSummaryReport>,
+    pub direct_references: Vec<ImpactReferenceReport>,
+    pub witnesses: Vec<ImpactWitnessReport>,
+    pub reference_site_note: String,
+}
+
+#[cfg(feature = "audit")]
 #[derive(Clone, Debug, Serialize)]
 pub struct CompilerInvocationReport {
     pub key: String,
@@ -407,6 +528,7 @@ pub struct CompilerInvocationReport {
     pub features: Vec<String>,
     pub cfg: Vec<String>,
     pub definitions: u64,
+    pub public_bindings: u64,
     pub roots: u64,
     pub references: u64,
     pub status: SemanticStatus,
@@ -434,6 +556,10 @@ pub struct CompilerReport {
     pub required_visibility: Option<RequiredVisibilityReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_world: Option<ClosedWorldReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_surface: Option<crate::compiler::api_surface::ApiSurfaceReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impact: Option<ImpactReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]

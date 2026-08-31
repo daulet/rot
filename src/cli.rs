@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "audit")]
+use std::str::FromStr;
+
 use clap::{Args, Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -11,7 +14,7 @@ pub enum OutputFormat {
 
 #[derive(Clone, Debug, Args)]
 pub struct CargoSelection {
-    /// Rust file or directory to analyze (repeatable; this selects input files)
+    /// Rust file or directory scope (repeatable)
     #[arg(value_name = "PATH", default_value = ".")]
     pub paths: Vec<PathBuf>,
 
@@ -125,15 +128,18 @@ pub struct FastCli {
 deref_field!(FastCli => CargoSelection, cargo);
 
 #[cfg(feature = "audit")]
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(
     name = "rot-audit",
     version,
-    about = "Compiler-proven Rust visibility audit",
-    long_about = "Compiler-proven visibility findings for deliberate refactoring.\n\
-                  This is a real Cargo/rustc build, not a source-metrics mode.",
+    about = "Compiler-proven Rust API and dependency audit",
+    long_about = "Compiler-proven visibility, public-API topology, and dependency-impact evidence for deliberate refactoring.\n\
+                  This is a real Cargo/rustc build, not a source-metrics mode. PATH selects complete\n\
+                  Cargo packages; it does not restrict analysis to declarations in one source file.",
     after_help = "EXAMPLES:\n  \
                   rot-audit . --locked --offline --driver PATH\n  \
+                  rot-audit . --baseline HEAD~1 --locked --offline --driver PATH\n  \
+                  rot-audit . --explain 'rot-compiler-protocol:PublicBinding' --driver PATH\n  \
                   rot-audit . --all-features --format json --driver PATH\n  \
                   rot-audit . --toolchain 1.98.0 --driver PATH --locked --offline\n\n\
                   --driver is required; Rot does not guess a path or read an environment fallback.\n\
@@ -144,7 +150,10 @@ deref_field!(FastCli => CargoSelection, cargo);
                   evidence fails closed and is never reported as zero findings. Build scripts and\n\
                   procedural macros execute under the selected exact toolchain. Rot removes ambient\n\
                   RUSTC_BOOTSTRAP before that build; explicit Cargo user/project configuration remains\n\
-                  trusted. JSON is written to stdout and diagnostics to stderr."
+                  trusted. --baseline performs two isolated real builds. API comparison covers public\n\
+                  name/topology changes, not signature or semver compatibility. --explain accepts an\n\
+                  exact Cargo package and rustc definition path. JSON is written to stdout and\n\
+                  diagnostics to stderr."
 )]
 pub struct AuditCli {
     #[command(flatten)]
@@ -153,6 +162,33 @@ pub struct AuditCli {
     /// Emit actionable text or versioned JSON
     #[arg(long, value_enum, default_value_t, help_heading = "OUTPUT")]
     pub format: OutputFormat,
+
+    /// Compare public API topology at one Git commit with the live working tree
+    #[arg(
+        long,
+        value_name = "REF",
+        conflicts_with = "explain",
+        help_heading = "DEEP ANALYSIS"
+    )]
+    pub baseline: Option<String>,
+
+    /// Explain consumers of one exact PACKAGE:DEFINITION_PATH
+    #[arg(
+        long,
+        value_name = "PACKAGE:DEFINITION_PATH",
+        conflicts_with = "baseline",
+        help_heading = "DEEP ANALYSIS"
+    )]
+    pub explain: Option<ExplainSelector>,
+
+    /// Disambiguate --explain with an exact PATH:LINE:COLUMN start location
+    #[arg(
+        long,
+        value_name = "PATH:LINE:COLUMN",
+        requires = "explain",
+        help_heading = "DEEP ANALYSIS"
+    )]
+    pub explain_at: Option<ExplainLocation>,
 
     /// Path to a rot driver built with the exact selected toolchain
     #[arg(long, value_name = "PATH", help_heading = "COMPILER")]
@@ -178,6 +214,72 @@ pub struct AuditCli {
     /// Parent for the temporary isolated Cargo target and build directories
     #[arg(long, value_name = "DIR", help_heading = "COMPILER")]
     pub scratch_dir: Option<PathBuf>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplainSelector {
+    pub package: String,
+    pub definition_path: String,
+}
+
+#[cfg(feature = "audit")]
+impl FromStr for ExplainSelector {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (package, definition_path) = value.split_once(':').ok_or_else(|| {
+            "expected PACKAGE:DEFINITION_PATH, for example rot:rot::compiler::collect".to_owned()
+        })?;
+        if package.trim().is_empty() || definition_path.trim().is_empty() {
+            return Err("package and definition path must both be non-empty".to_owned());
+        }
+        if package != package.trim() || definition_path != definition_path.trim() {
+            return Err(
+                "package and definition path must not have surrounding whitespace".to_owned(),
+            );
+        }
+        Ok(Self {
+            package: package.to_owned(),
+            definition_path: definition_path.to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplainLocation {
+    pub path: String,
+    pub line: u64,
+    pub column: u64,
+}
+
+#[cfg(feature = "audit")]
+impl FromStr for ExplainLocation {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (path_and_line, column) = value
+            .rsplit_once(':')
+            .ok_or_else(|| "expected PATH:LINE:COLUMN".to_owned())?;
+        let (path, line) = path_and_line
+            .rsplit_once(':')
+            .ok_or_else(|| "expected PATH:LINE:COLUMN".to_owned())?;
+        let line = line
+            .parse::<u64>()
+            .map_err(|_| "LINE must be a positive integer".to_owned())?;
+        let column = column
+            .parse::<u64>()
+            .map_err(|_| "COLUMN must be a positive integer".to_owned())?;
+        if path.is_empty() || line == 0 || column == 0 {
+            return Err("PATH must be non-empty and LINE/COLUMN must be positive".to_owned());
+        }
+        Ok(Self {
+            path: path.replace('\\', "/"),
+            line,
+            column,
+        })
+    }
 }
 
 #[cfg(feature = "audit")]
