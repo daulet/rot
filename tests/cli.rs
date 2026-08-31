@@ -20,12 +20,16 @@ fn run_json(arguments: &[&str]) -> (Vec<u8>, Value) {
         .args(["--format", "json"])
         .output()
         .expect("run rot");
-    assert!(
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse rot JSON");
+    let diagnostics = json["diagnostics"]
+        .as_array()
+        .expect("snapshot diagnostics array");
+    assert_eq!(
         output.status.success(),
-        "rot failed: {}",
+        diagnostics.is_empty(),
+        "exit status disagreed with diagnostics: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let json = serde_json::from_slice(&output.stdout).expect("parse rot JSON");
     (output.stdout, json)
 }
 
@@ -300,19 +304,18 @@ fn feature_exclusion_is_a_visible_synthetic_profile() {
 
     let clean_fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compiler-features");
-    let strict = run(&[
+    let clean = run(&[
         clean_fixture.to_str().unwrap(),
         "--all-features",
         "--exclude-feature",
         "b/foo",
-        "--strict",
         "--format",
         "json",
     ]);
     assert!(
-        strict.status.success(),
-        "intentional exclusion failed strict mode: {}",
-        String::from_utf8_lossy(&strict.stderr)
+        clean.status.success(),
+        "intentional exclusion produced diagnostics: {}",
+        String::from_utf8_lossy(&clean.stderr)
     );
 }
 
@@ -443,7 +446,7 @@ fn workspace_dependency_features_resolve_before_synthetic_exclusion() {
             .contains("selected PATH root feature")
     );
 
-    let excluded = run_path_json(&workspace, &["--exclude-feature", "b/foo", "--strict"]);
+    let excluded = run_path_json(&workspace, &["--exclude-feature", "b/foo"]);
     assert_eq!(excluded["profile"]["synthetic"], true);
     assert_eq!(
         excluded["profile"]["excluded_features"],
@@ -981,9 +984,15 @@ fn help_is_agent_oriented_and_output_flags_are_not_silent() {
         "Role file counts overlap",
         "not a promise of numeric identity with scc",
         "diagnostics to stderr",
+        "diagnostic makes the command unsuccessful",
     ] {
         assert!(help.contains(text), "help omitted {text:?}\n{help}");
     }
+    assert!(!help.contains("--strict"), "obsolete flag remained in help");
+
+    let obsolete_strict = run(&["--strict"]);
+    assert_eq!(obsolete_strict.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&obsolete_strict.stderr).contains("unexpected argument"));
 
     let conflict = run(&[fixture().to_str().unwrap(), "--files", "--summary-only"]);
     assert_eq!(conflict.status.code(), Some(2));
@@ -1097,18 +1106,17 @@ fn baseline_compares_staged_unstaged_and_untracked_rust_metrics() {
     assert_eq!(text.as_bytes(), parallel.stdout);
 
     fs::write(directory.path().join("src/lib.rs"), "pub fn broken( {\n").unwrap();
-    let strict = run(&[
+    let diagnostic = run(&[
         directory.path().to_str().unwrap(),
         "--baseline",
         &baseline,
         "--format",
         "json",
         "--summary-only",
-        "--strict",
     ]);
-    assert!(!strict.status.success());
-    assert!(serde_json::from_slice::<Value>(&strict.stdout).is_ok());
-    assert!(String::from_utf8_lossy(&strict.stderr).contains("working tree"));
+    assert!(!diagnostic.status.success());
+    assert!(serde_json::from_slice::<Value>(&diagnostic.stdout).is_ok());
+    assert!(String::from_utf8_lossy(&diagnostic.stderr).contains("working tree"));
 }
 
 #[test]

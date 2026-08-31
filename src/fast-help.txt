@@ -3,7 +3,7 @@ EXAMPLES:
   rot . --files
   rot . --format json --summary-only
   rot . --baseline HEAD~1
-  rot . --all-features --exclude-feature testability --strict
+  rot . --all-features --exclude-feature testability
   rot . --release
 
 --files expands the human table; it does not select input files.
@@ -21,4 +21,5 @@ Authored cfg is one requested-target-global approximation; cross-target host-uni
 Role file counts overlap; Total is the number of distinct Rust files.
 Lexical complexity is Rot's SCC-style token score, not a promise of numeric identity with scc.
 JSON records normalized PATH/ignore provenance, writes to stdout, and sends diagnostics to stderr.
+Any remaining analysis diagnostic makes the command unsuccessful after the report is emitted.
 Metric changes do not change the exit status.

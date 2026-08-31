@@ -70,8 +70,8 @@ fn run_fast(cli: cli::FastCli) -> ExitCode {
         }),
     };
     match result {
-        Ok(has_diagnostics) if cli.strict && has_diagnostics => ExitCode::FAILURE,
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::FAILURE,
+        Ok(false) => ExitCode::SUCCESS,
         Err(error) if report::is_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rot: error: {error:#}");

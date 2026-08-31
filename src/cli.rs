@@ -119,10 +119,6 @@ pub struct FastCli {
     /// Ignore .gitignore and related ignore files
     #[arg(long, help_heading = "DISCOVERY")]
     pub no_ignore: bool,
-
-    /// Exit unsuccessfully when analysis diagnostics remain (profile controls are not diagnostics)
-    #[arg(long, help_heading = "AUTOMATION")]
-    pub strict: bool,
 }
 
 deref_field!(FastCli => CargoSelection, cargo);

@@ -25,8 +25,8 @@ source evidence and compiler evidence.
   changes, changed-file counts, and the ten largest role-aware contributors;
   `--files` expands the complete list.
 - [x] Clean intentional feature exclusion: exclusion happens after feature
-  closure, remains marked `synthetic` provenance, emits no warning, and works
-  with `--strict`; unknown selectors remain errors.
+  closure, remains marked `synthetic` provenance, emits no diagnostic, and
+  unknown selectors remain errors.
 - [x] PATH-rooted Cargo feature closure: forward workspace dependencies,
   package-versus-alias selectors, optional/default/dependency features, and
   target-versus-host platform edges have Cargo-backed controls.
