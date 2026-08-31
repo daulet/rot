@@ -1,6 +1,14 @@
 # rot
 
-`rot` is a Rust-only LOC counter, complexity measuring tool, primarily to guide agents in refactor goals.
+`rot` is a Rust-only LOC, complexity measuring tool, primarily to guide agents in refactoring goals.
+
+## Prompt
+
+Give a prompt like below to get rid of slop, DTOs, ceremony in your project:
+
+```
+refactor the repo. identify increasingly larger pieces for simplification and reuse (but dont reuse for the sake of it) and act on it. after each round of simplification, repeat the same exercise. use native codex subagents whenever needed. the goal is reducing code base prod LOC by 30% and complexity by 20%, use rot CLI to measure it.
+```
 
 ## Features
 
