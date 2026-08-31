@@ -8,5 +8,5 @@ publish = false
 [workspace]
 
 [dependencies]
-rot-compiler-protocol = { path = "../../crates/rot-compiler-protocol" }
+rot-compiler-protocol = { path = "../../crates/rot-compiler-protocol", version = "=0.1.0" }
 serde_json = "1.0.151"

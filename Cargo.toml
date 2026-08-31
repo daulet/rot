@@ -5,14 +5,31 @@ exclude = ["compiler/rot-rustc-driver"]
 resolver = "3"
 
 [package]
-name = "rot"
+name = "rot-metrics"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 default-run = "rot"
 description = "Fast, Rust-aware source metrics"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/daulet/rot"
+homepage = "https://github.com/daulet/rot"
+readme = "README.md"
+keywords = ["complexity", "metrics", "rust", "source-code"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**",
+    "compiler/supported-rustc.toml",
+    "docs/releases.md",
+    "docs/rustc-backed-analysis.md",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
+
+[lib]
+name = "rot"
+path = "src/lib.rs"
 
 [features]
 default = []
@@ -48,7 +65,7 @@ ignore = "0.4.33"
 ra_ap_cfg = { version = "=0.0.349", features = ["syntax"] }
 ra_ap_syntax = "=0.0.349"
 rayon = "1.12.0"
-rot-compiler-protocol = { path = "crates/rot-compiler-protocol", optional = true }
+rot-compiler-protocol = { path = "crates/rot-compiler-protocol", version = "=0.1.0", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.23.0"

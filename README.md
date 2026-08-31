@@ -39,7 +39,19 @@ regressions, and use native Codex subagents where useful.
 
 ## Quick start
 
-Rot is currently built from a repository checkout:
+Install the fast `rot` command from crates.io or Homebrew:
+
+```console
+cargo install rot-metrics
+brew install daulet/tap/rot
+```
+
+Ubuntu amd64 and arm64 releases also include a static tarball and a `.deb` on
+the matching GitHub release. The crates.io package is named `rot-metrics`
+because the `rot` package name belongs to an unrelated project; the installed
+command is still `rot`.
+
+To build from a repository checkout:
 
 ```console
 cargo build --release
@@ -117,9 +129,22 @@ code across a workspace. `--baseline` performs two isolated real builds.
 
 The evidence is closed-world: it covers only the selected compiled targets, not
 inactive feature profiles, doctests, or unknown external consumers. The audit
-also requires a driver built for the exact selected rustc. Its API comparison
-tracks public names and binding topology; it is not a semver checker and does
-not detect a same-path signature or ABI change.
+also requires a driver built for the exact selected rustc from a Git checkout;
+the rustc-private driver source is intentionally not shipped in the Cargo
+package. Its API comparison tracks public names and binding topology; it is not
+a semver checker and does not detect a same-path signature or ABI change.
 
 See [Compiler-backed refactoring audit](docs/rustc-backed-analysis.md) for
 setup, supported compilers, safety boundaries, and the full evidence contract.
+
+## Releases
+
+Merges to `main` drive releases after CI succeeds. Any unreleased conventional
+`feat:` commit advances the minor version; every other commit advances patch.
+The workflow then creates the version commit and tag, publishes the two Cargo
+packages, builds macOS and Ubuntu artifacts, creates the GitHub release, and
+updates `daulet/homebrew-tap`. Tags are outputs of this process, not triggers or
+version inputs.
+
+See [Release automation](docs/releases.md) for the exact policy, one-time
+repository setup, recovery procedure, and artifact support boundary.

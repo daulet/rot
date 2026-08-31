@@ -17,8 +17,10 @@ measurement into a slow or partial operation.
 
 The stable orchestration binary is gated by the `audit` Cargo feature. The
 rustc-private driver is a separate workspace compiled once for each exact
-compiler identity. This stable example uses a version-specific target directory
-so its binary cannot be confused with another compiler's driver:
+compiler identity. The published `rot-metrics` crate intentionally omits that
+rustc-private workspace, so building a driver requires a Git checkout. This
+stable checkout example uses a version-specific target directory so its binary
+cannot be confused with another compiler's driver:
 
 ```console
 rustup toolchain install 1.98.0 \

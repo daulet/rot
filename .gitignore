@@ -1,2 +1,4 @@
 target/
 /.memory/
+__pycache__/
+*.pyc
