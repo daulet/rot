@@ -63,29 +63,16 @@ stderr.
 
 Run `rot --help` for the complete option list and profile controls.
 
-## Deeper visibility analysis
+## Deeper compiler analysis
 
-Fast `rot` deliberately stays at the source level. It can count explicit `pub`
-declarations, but it cannot prove whether another crate or public interface
-actually requires that visibility.
+`rot-audit` runs a real Cargo/rustc build to find public declarations that must
+remain public, can be narrowed, or are dead. It can also compare public API
+topology with a Git revision and explain a definition's compiled consumers.
 
-`rot-audit` is the slower, compiler-backed companion for aggressive
-refactoring. It runs a real Cargo/rustc build for one target and feature profile,
-correlates the selected Cargo units, and turns the raw `pub` count into an
-actionable list:
+```console
+rot-audit . --locked --offline --driver PATH
+```
 
-- **Required public:** must remain `pub` for a selected cross-crate use or
-  public interface.
-- **Can narrow:** reachable, but unrestricted `pub` is unnecessary.
-- **Dead public:** unreachable from every selected compiled target.
-
-Use `rot` for routine measurement and revision diffs. Use `rot-audit` when you
-want to reduce visibility across a workspace and need source locations and
-compiler-backed reasons for each candidate.
-
-The evidence is closed-world: it covers only the selected compiled targets, not
-inactive feature profiles, doctests, or unknown external consumers. The audit
-also requires a driver built for the exact selected rustc.
-
-See [Compiler-backed visibility audit](docs/rustc-backed-analysis.md) for setup,
-supported compilers, safety boundaries, and the full evidence contract.
+Results cover only the selected targets and feature profile. See
+[Compiler-backed audit](docs/rustc-backed-analysis.md) for setup and full
+commands.
