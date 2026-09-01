@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Compiler evidence protocol shared by rot and its rustc driver"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/daulet/rot"
 homepage = "https://github.com/daulet/rot"
-include = ["src/**", "LICENSE-APACHE", "LICENSE-MIT"]
+include = ["src/**", "LICENSE-APACHE"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }

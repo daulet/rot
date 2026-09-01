@@ -11,7 +11,7 @@ edition = "2024"
 rust-version = "1.98"
 default-run = "rot"
 description = "Fast, Rust-aware source metrics"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/daulet/rot"
 homepage = "https://github.com/daulet/rot"
 readme = "README.md"
@@ -24,7 +24,6 @@ include = [
     "docs/rustc-backed-analysis.md",
     "README.md",
     "LICENSE-APACHE",
-    "LICENSE-MIT",
 ]
 
 [lib]

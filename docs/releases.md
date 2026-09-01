@@ -104,7 +104,7 @@ GitHub builds the fast `rot` command natively:
 | `ubuntu-24.04` | `x86_64-unknown-linux-musl` | static tarball, amd64 `.deb` |
 
 Every archive includes `rot`, the README, linked release/audit documentation,
-and both license texts. The release also contains `SHA256SUMS`; GitHub
+and the Apache 2.0 license text. The release also contains `SHA256SUMS`; GitHub
 provenance attestations cover the canonical archives, Debian packages, and
 checksum file from the exact CI-proven release commit. Linux jobs install,
 execute, and uninstall their `.deb` before publishing it.

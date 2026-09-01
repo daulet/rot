@@ -482,7 +482,7 @@ def render_homebrew(
   desc "Fast, configuration-aware Rust source metrics"
   homepage "https://github.com/{repository}"
   version "{version}"
-  license "MIT OR Apache-2.0"
+  license "Apache-2.0"
   depends_on :macos
 
   on_macos do
@@ -548,7 +548,6 @@ def write_archive(
         (binary, "rot", 0o755),
         (root / "README.md", "README.md", 0o644),
         (root / "LICENSE-APACHE", "LICENSE-APACHE", 0o644),
-        (root / "LICENSE-MIT", "LICENSE-MIT", 0o644),
         (root / "docs/releases.md", "docs/releases.md", 0o644),
         (
             root / "docs/rustc-backed-analysis.md",

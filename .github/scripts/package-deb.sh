@@ -61,17 +61,14 @@ trap 'rm -rf "$package_root"' EXIT
 
 mkdir -p "$package_root/usr/bin" "$package_root/usr/share/doc/rot"
 install -m 755 "$binary" "$package_root/usr/bin/rot"
-install -m 644 LICENSE-MIT "$package_root/usr/share/doc/rot/LICENSE-MIT"
 install -m 644 LICENSE-APACHE "$package_root/usr/share/doc/rot/LICENSE-APACHE"
 copyright="$package_root/usr/share/doc/rot/copyright"
 {
 	printf '%s\n\n' \
 		'Copyright (c) 2026 Rot contributors' \
 		'Source: https://github.com/daulet/rot' \
-		'Rot is distributed under the MIT or Apache License 2.0, at your option.' \
-		'The complete MIT terms follow:'
-	cat LICENSE-MIT
-	printf '\n%s\n' 'The complete Apache License 2.0 terms follow:'
+		'Rot is distributed under the Apache License 2.0.' \
+		'The complete Apache License 2.0 terms follow:'
 	cat LICENSE-APACHE
 } >"$copyright"
 chmod 0644 "$copyright"

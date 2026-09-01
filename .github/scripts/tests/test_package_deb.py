@@ -32,7 +32,6 @@ class DebianPackageScriptTests(unittest.TestCase):
             '"$3/usr/share/doc/rot/copyright" >/dev/null\n'
             'grep -F "Source: https://github.com/daulet/rot" '
             '"$3/usr/share/doc/rot/copyright" >/dev/null\n'
-            'grep -F "MIT License" "$3/usr/share/doc/rot/copyright" >/dev/null\n'
             'grep -F "Apache License" "$3/usr/share/doc/rot/copyright" >/dev/null\n'
             'cp "$3/DEBIAN/control" "$4"\n',
             encoding="utf-8",

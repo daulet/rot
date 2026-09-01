@@ -303,7 +303,6 @@ class MaterializationTests(RepositoryFixture):
         for path in (
             "README.md",
             "LICENSE-APACHE",
-            "LICENSE-MIT",
             "docs/releases.md",
             "docs/rustc-backed-analysis.md",
         ):
@@ -328,7 +327,6 @@ class MaterializationTests(RepositoryFixture):
                     "rot",
                     "README.md",
                     "LICENSE-APACHE",
-                    "LICENSE-MIT",
                     "docs/releases.md",
                     "docs/rustc-backed-analysis.md",
                 ],

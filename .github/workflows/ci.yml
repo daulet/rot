@@ -45,14 +45,12 @@ jobs:
         run: |
           cargo package -p rot-compiler-protocol --list >target/protocol-package-files.txt
           grep -Fx LICENSE-APACHE target/protocol-package-files.txt
-          grep -Fx LICENSE-MIT target/protocol-package-files.txt
           cargo package -p rot-compiler-protocol --locked
           cargo package -p rot-metrics --list >target/rot-metrics-package-files.txt
           grep -Fx compiler/supported-rustc.toml target/rot-metrics-package-files.txt
           grep -Fx docs/releases.md target/rot-metrics-package-files.txt
           grep -Fx docs/rustc-backed-analysis.md target/rot-metrics-package-files.txt
           grep -Fx LICENSE-APACHE target/rot-metrics-package-files.txt
-          grep -Fx LICENSE-MIT target/rot-metrics-package-files.txt
           cargo package -p rot-metrics --locked \
             --config 'patch.crates-io.rot-compiler-protocol.path="crates/rot-compiler-protocol"'
 
