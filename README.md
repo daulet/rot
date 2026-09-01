@@ -1,7 +1,26 @@
 # rot
 
-`rot` is a fast Rust source-metrics CLI for line counts, authored complexity,
-Cargo roles, and API analysis.
+`rot` is a Rust-only LOC, complexity measuring tool, primarily to guide agents in refactoring goals.
+
+## Prompt
+
+Give an agent a fixed baseline and acceptance contract:
+
+```text
+Refactor this repository in iterative, reviewable rounds. Before editing, start
+from a clean worktree and record `git rev-parse HEAD` as BASE_COMMIT. Keep that
+exact commit, the Rot binary, selected paths, and Cargo profile fixed for the
+entire campaign.
+
+After each round, run
+`rot . --baseline "$BASE_COMMIT" --format json --summary-only` with the same
+profile flags. Reduce production LOC by at least 30%, and require production
+authored cognitive complexity to fall at least proportionally. Do not claim
+gains by moving code into test, inactive, or orphan roles, changing
+discovery/configuration, weakening behavior, or deleting tests. Keep relevant
+tests and performance gates passing. Use per-file output to investigate
+regressions, and use native Codex subagents where useful.
+```
 
 ## Features
 
@@ -15,8 +34,8 @@ Cargo roles, and API analysis.
 - Emits deterministic human tables or versioned JSON, with project and per-file
   detail.
 - Compares a committed Git baseline with the live working tree.
-- Includes an optional compiler-backed companion for visibility, API topology,
-  and dependency impact.
+- Includes optional compiler-backed visibility analysis for aggressive
+  refactoring.
 
 ## Quick start
 
@@ -36,36 +55,39 @@ To build from a repository checkout:
 
 ```console
 cargo build --release
-./target/release/rot path/to/workspace
+ROT=./target/release/rot
+"$ROT" path/to/workspace
 ```
 
 Common workflows:
 
 ```console
+ROT=./target/release/rot
+
 # Project summary
-rot .
+"$ROT" .
 
 # Include every file row
-rot . --files
+"$ROT" . --files
 
 # Compact JSON for automation
-rot . --format json --summary-only
+"$ROT" . --format json --summary-only
 
-# Capture a fixed comparison baseline
+# Capture once in a clean worktree, before an iterative refactor
 BASE_COMMIT="$(git rev-parse HEAD)"
 
 # Compare that fixed commit with staged, unstaged, and untracked Rust
-rot . --baseline "$BASE_COMMIT" --format json --summary-only
+"$ROT" . --baseline "$BASE_COMMIT" --format json --summary-only
 
 # Select a Cargo/configuration profile
-rot . --features serde,cli
-rot . --all-features --exclude-feature unstable
-rot . --target aarch64-unknown-linux-gnu --release
+"$ROT" . --features serde,cli
+"$ROT" . --all-features --exclude-feature unstable
+"$ROT" . --target aarch64-unknown-linux-gnu --release
 ```
 
-Keep `BASE_COMMIT` fixed across comparisons; names such as `HEAD~1` and
+Keep `BASE_COMMIT` fixed across the campaign; names such as `HEAD~1` and
 `origin/main` are resolved again on every invocation. Reuse the same path,
-profile, discovery flags, and Rot binary when comparing results.
+profile, discovery flags, and Rot binary when comparing rounds.
 
 Positional `PATH` arguments select input; `--files` only changes table detail.
 Each selected directory is its own ignore boundary. Use `--hidden` or
