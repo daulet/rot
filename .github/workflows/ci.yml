@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 env:
+  AUDIT_RUST_VERSION: nightly-2026-08-27
   CARGO_TERM_COLOR: always
   RUST_VERSION: 1.98.0
 
@@ -27,6 +28,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
+
+      - name: Install selected audit toolchain
+        run: rustup toolchain install "$AUDIT_RUST_VERSION" --profile minimal
 
       - name: Format
         run: cargo fmt --all --check
@@ -61,7 +65,7 @@ jobs:
 
       - name: Install pinned compiler toolchain
         run: >-
-          rustup toolchain install nightly-2026-08-27
+          rustup toolchain install "$AUDIT_RUST_VERSION"
           --profile minimal
           --component rustc-dev
           --component rust-src
@@ -69,7 +73,7 @@ jobs:
 
       - name: Test driver
         working-directory: compiler/rot-rustc-driver
-        run: cargo +nightly-2026-08-27 test --locked
+        run: rustup run "$AUDIT_RUST_VERSION" cargo test --locked
 
   release_scripts:
     name: Release scripts
