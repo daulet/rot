@@ -69,10 +69,19 @@ Run `rot --help` for the complete option list and profile controls.
 remain public, can be narrowed, or are dead. It can also compare public API
 topology with a Git revision and explain a definition's compiled consumers.
 
+Use `rot` for routine source metrics and revision diffs. Use `rot-audit` when
+you need compiler evidence before narrowing, deleting, or reexporting code
+across a workspace.
+
 ```console
 rot-audit . --locked --offline --driver PATH
+rot-audit . --baseline origin/main --locked --offline --driver PATH
+rot-audit . --explain 'my-package:module::item' --driver PATH
 ```
 
-Results cover only the selected targets and feature profile. See
-[Compiler-backed audit](docs/rustc-backed-analysis.md) for setup and full
-commands.
+Building the required driver needs a Git checkout. It must match the selected
+rustc release, commit, and host, and must be rebuilt for each rustc patch.
+
+Evidence is closed-world: selected targets and feature profile only, excluding
+doctests and unknown external consumers. See
+[Compiler-backed audit](docs/rustc-backed-analysis.md) for full setup.
