@@ -25,14 +25,24 @@ refactor the repo. identify increasingly larger pieces for simplification and re
 - Includes optional compiler-backed visibility analysis for aggressive
   refactoring.
 
-## Quick start
-
-Rot is currently built from a repository checkout:
+## Install
 
 ```console
-cargo build --release
-./target/release/rot path/to/workspace
+# macOS
+brew install daulet/tap/rot
+
+# Cargo (installs the `rot` executable)
+cargo install rot-metrics
 ```
+
+Prebuilt macOS and Linux archives and Debian packages are available from
+[GitHub Releases](https://github.com/daulet/rot/releases/latest). Install
+`rot-audit` with `cargo install rot-metrics --features audit`; it also requires
+the matching driver described below.
+
+## Quick start
+
+Run `rot` against any Rust package or workspace.
 
 Common workflows:
 
