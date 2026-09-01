@@ -193,6 +193,21 @@ fn metric_table_row(output: &str, label: &str) -> [u64; 10] {
     values.try_into().unwrap()
 }
 
+fn ordered_cell_starts(line: &str, cells: &[&str]) -> Vec<usize> {
+    let mut cursor = 0;
+    cells
+        .iter()
+        .map(|cell| {
+            let offset = line[cursor..]
+                .find(cell)
+                .unwrap_or_else(|| panic!("missing cell {cell:?} after column {cursor}: {line:?}"));
+            let start = cursor + offset;
+            cursor = start + cell.len();
+            start
+        })
+        .collect()
+}
+
 #[test]
 fn cargo_roles_cfg_modules_and_declared_visibility_are_distinct() {
     let (_, report) = run_json(&[]);
@@ -1152,6 +1167,7 @@ fn human_baseline_rows_explain_and_rank_non_code_only_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let human = String::from_utf8(output.stdout).unwrap();
+    assert!(!human.contains('\t'), "comparison retained tab separators");
     assert!(human.contains("Metric-changing files: 0 added, 2 modified, 0 deleted"));
     assert!(human.contains("Largest metric changes (top 2)"));
 
@@ -1199,6 +1215,7 @@ fn human_file_rows_preserve_full_unambiguous_paths() {
     ]);
     assert!(output.status.success());
     let output = String::from_utf8(output.stdout).unwrap();
+    assert!(!output.contains('\t'), "file table retained tab separators");
     assert!(
         output.contains(&alpha),
         "missing full alpha path:\n{output}"
@@ -1688,6 +1705,51 @@ fn outer() {
     assert!(files.contains("Cognitive"));
     assert!(files.contains("Prod pub"));
     assert!(!files.contains("Surface"));
+
+    fs::remove_dir_all(directory).expect("remove source fixture directory");
+}
+
+#[test]
+fn human_summary_uses_space_aligned_columns() {
+    const HEADERS: [&str; 11] = [
+        "Role",
+        "Files",
+        "Lines",
+        "Code",
+        "Comments",
+        "Docs",
+        "Blank",
+        "Lexical",
+        "Cyclomatic",
+        "Cognitive",
+        "Declared pub",
+    ];
+
+    let (directory, path) = temporary_source("pub fn answer() -> usize { 42 }\n");
+    let output = run(&[path.to_str().unwrap()]);
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !output.contains('\t'),
+        "human table retained tab separators"
+    );
+
+    let mut lines = output.lines();
+    let header = lines.next().expect("summary header");
+    let production = lines
+        .find(|line| line.starts_with("Production"))
+        .expect("production row");
+    let row_cells = production.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(row_cells.len(), HEADERS.len());
+
+    let header_starts = ordered_cell_starts(header, &HEADERS);
+    let row_starts = ordered_cell_starts(production, &row_cells);
+    for column in 0..HEADERS.len() {
+        assert_eq!(
+            header_starts[column], row_starts[column],
+            "column {column} is not aligned:\n{header}\n{production}",
+        );
+    }
 
     fs::remove_dir_all(directory).expect("remove source fixture directory");
 }

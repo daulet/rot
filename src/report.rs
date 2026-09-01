@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use tabwriter::TabWriter;
 
 use crate::{
     cli::{FastCli, OutputFormat},
@@ -85,7 +86,7 @@ fn render_diagnostic_list(prefix: &str, diagnostics: &[crate::model::Diagnostic]
 
 fn render_table(report: &Report, by_file: bool) -> Result<()> {
     let stdout = io::stdout();
-    let mut output = stdout.lock();
+    let mut output = TabWriter::new(stdout.lock()).padding(2);
     writeln!(
         output,
         "Role\tFiles\tLines\tCode\tComments\tDocs\tBlank\tLexical\tCyclomatic\tCognitive\tDeclared pub"
@@ -132,12 +133,13 @@ fn render_table(report: &Report, by_file: bool) -> Result<()> {
             )?;
         }
     }
+    output.flush()?;
     Ok(())
 }
 
 fn render_comparison_table(comparison: &Comparison, all_files: bool) -> Result<()> {
     let stdout = io::stdout();
-    let mut output = stdout.lock();
+    let mut output = TabWriter::new(stdout.lock()).padding(2);
     let revision = comparison.before.revision.as_deref().unwrap_or("baseline");
     let state = ["clean", "dirty"][usize::from(comparison.after.dirty == Some(true))];
     writeln!(
@@ -209,6 +211,7 @@ fn render_comparison_table(comparison: &Comparison, all_files: bool) -> Result<(
     }
     if contributors.is_empty() {
         writeln!(output, "No metric changes.")?;
+        output.flush()?;
         return Ok(());
     }
     writeln!(output, "File\tStatus\tMetric deltas")?;
@@ -225,6 +228,7 @@ fn render_comparison_table(comparison: &Comparison, all_files: bool) -> Result<(
         output,
         "Metric diff is not textual Git churn; renames appear as one deletion and one addition."
     )?;
+    output.flush()?;
     Ok(())
 }
 
