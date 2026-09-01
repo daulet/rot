@@ -279,6 +279,29 @@ class MaterializationTests(RepositoryFixture):
         self.assertIn(f'sha256 "{arm}"', formula)
         self.assertIn("depends_on :macos", formula)
         self.assertIn('bin.install "rot"', formula)
+        self.assertNotRegex(formula, r"(?m)^\s*version ")
+        self.assertEqual(
+            release.homebrew_formula_release(formula),
+            ("daulet/rot", release.Version.parse("1.2.3")),
+        )
+
+    def test_homebrew_formula_rejects_mixed_archive_versions(self) -> None:
+        formula = self.root / "rot.rb"
+        content = release.render_homebrew(
+            "daulet/rot", release.Version.parse("1.2.3"), "1" * 64, "2" * 64
+        ).replace(
+            "v1.2.3/rot-aarch64-apple-darwin.tar.gz",
+            "v1.2.4/rot-aarch64-apple-darwin.tar.gz",
+        )
+        formula.write_text(content, encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "one GitHub release"):
+            release.write_homebrew_formula(
+                formula,
+                "daulet/rot",
+                release.Version.parse("1.2.3"),
+                "1" * 64,
+                "2" * 64,
+            )
 
     def test_older_recovery_cannot_downgrade_homebrew(self) -> None:
         formula = self.root / "rot.rb"

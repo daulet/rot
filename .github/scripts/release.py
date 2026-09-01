@@ -34,8 +34,12 @@ FEATURE_SUBJECT = re.compile(r"^feat(?:\([^()]+\))?!?:")
 RELEASE_SUBJECT = re.compile(r"^chore\(release\): v(?P<version>\d+\.\d+\.\d+)$")
 GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-FORMULA_VERSION = re.compile(
-    r'^\s*version "(?P<version>\d+\.\d+\.\d+)"\s*$', re.MULTILINE
+FORMULA_ARCHIVE_URL = re.compile(
+    r'^\s*url "https://github\.com/(?P<repository>[A-Za-z0-9_.-]+/'
+    r'[A-Za-z0-9_.-]+)/releases/download/v'
+    r'(?P<version>\d+\.\d+\.\d+)/rot-'
+    r'(?P<architecture>x86_64|aarch64)-apple-darwin\.tar\.gz"\s*$',
+    re.MULTILINE,
 )
 FORMULA_HOMEPAGE = re.compile(r'^\s*homepage "(?P<homepage>[^"]+)"\s*$', re.MULTILINE)
 
@@ -481,7 +485,6 @@ def render_homebrew(
     return f'''class Rot < Formula
   desc "Fast, configuration-aware Rust source metrics"
   homepage "https://github.com/{repository}"
-  version "{version}"
   license "Apache-2.0"
   depends_on :macos
 
@@ -506,6 +509,24 @@ end
 '''
 
 
+def homebrew_formula_release(content: str) -> tuple[str, Version]:
+    matches = tuple(FORMULA_ARCHIVE_URL.finditer(content))
+    repositories = {match.group("repository") for match in matches}
+    versions = {match.group("version") for match in matches}
+    architectures = {match.group("architecture") for match in matches}
+    if (
+        len(matches) != 2
+        or len(repositories) != 1
+        or len(versions) != 1
+        or architectures != {"x86_64", "aarch64"}
+    ):
+        raise ReleaseError(
+            "Homebrew formula must contain one Intel and one Apple Silicon "
+            "archive URL for one GitHub release"
+        )
+    return repositories.pop(), Version.parse(versions.pop())
+
+
 def write_homebrew_formula(
     output: Path,
     repository: str,
@@ -515,19 +536,19 @@ def write_homebrew_formula(
 ) -> bool:
     if output.exists():
         existing = output.read_text(encoding="utf-8")
-        version_match = FORMULA_VERSION.search(existing)
         homepage_match = FORMULA_HOMEPAGE.search(existing)
-        if version_match is None or homepage_match is None:
+        if homepage_match is None:
             raise ReleaseError(
                 f"existing formula is not a recognizable Rot formula: {output}"
             )
-        existing_version = Version.parse(version_match.group("version"))
+        existing_repository, existing_version = homebrew_formula_release(existing)
         expected_homepage = f"https://github.com/{repository}"
+        if (
+            existing_repository != repository
+            or homepage_match.group("homepage") != expected_homepage
+        ):
+            raise ReleaseError(f"existing formula at {output} belongs to another project")
         if existing_version > version:
-            if homepage_match.group("homepage") != expected_homepage:
-                raise ReleaseError(
-                    f"newer formula at {output} belongs to another project"
-                )
             return False
 
     content = render_homebrew(repository, version, intel_sha, arm_sha)
