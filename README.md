@@ -4,22 +4,10 @@
 
 ## Prompt
 
-Give an agent a fixed baseline and acceptance contract:
+Give a prompt like below to get rid of slop, DTOs, ceremony in your project:
 
-```text
-Refactor this repository in iterative, reviewable rounds. Before editing, start
-from a clean worktree and record `git rev-parse HEAD` as BASE_COMMIT. Keep that
-exact commit, the Rot binary, selected paths, and Cargo profile fixed for the
-entire campaign.
-
-After each round, run
-`rot . --baseline "$BASE_COMMIT" --format json --summary-only` with the same
-profile flags. Reduce production LOC by at least 30%, and require production
-authored cognitive complexity to fall at least proportionally. Do not claim
-gains by moving code into test, inactive, or orphan roles, changing
-discovery/configuration, weakening behavior, or deleting tests. Keep relevant
-tests and performance gates passing. Use per-file output to investigate
-regressions, and use native Codex subagents where useful.
+```
+refactor the repo. identify increasingly larger pieces for simplification and reuse (but dont reuse for the sake of it) and act on it. after each round of simplification, repeat the same exercise. use native codex subagents whenever needed. the goal is reducing code base prod LOC by 30% and complexity by 20%, use rot CLI to measure it.
 ```
 
 ## Features
@@ -39,112 +27,65 @@ regressions, and use native Codex subagents where useful.
 
 ## Quick start
 
-Install the fast `rot` command from crates.io or Homebrew:
-
-```console
-cargo install rot-metrics
-brew install daulet/tap/rot
-```
-
-Ubuntu amd64 and arm64 releases also include a static tarball and a `.deb` on
-the matching GitHub release. The crates.io package is named `rot-metrics`
-because the `rot` package name belongs to an unrelated project; the installed
-command is still `rot`.
-
-To build from a repository checkout:
+Rot is currently built from a repository checkout:
 
 ```console
 cargo build --release
-ROT=./target/release/rot
-"$ROT" path/to/workspace
+./target/release/rot path/to/workspace
 ```
 
 Common workflows:
 
 ```console
-ROT=./target/release/rot
-
 # Project summary
-"$ROT" .
+rot .
 
 # Include every file row
-"$ROT" . --files
+rot . --files
 
 # Compact JSON for automation
-"$ROT" . --format json --summary-only
+rot . --format json --summary-only
 
-# Capture once in a clean worktree, before an iterative refactor
-BASE_COMMIT="$(git rev-parse HEAD)"
-
-# Compare that fixed commit with staged, unstaged, and untracked Rust
-"$ROT" . --baseline "$BASE_COMMIT" --format json --summary-only
+# Compare a commit with staged, unstaged, and untracked Rust
+rot . --baseline HEAD~1
+rot . --baseline origin/main --format json --summary-only
 
 # Select a Cargo/configuration profile
-"$ROT" . --features serde,cli
-"$ROT" . --all-features --exclude-feature unstable
-"$ROT" . --target aarch64-unknown-linux-gnu --release
+rot . --features serde,cli
+rot . --all-features --exclude-feature unstable
+rot . --target aarch64-unknown-linux-gnu --release
 ```
-
-Keep `BASE_COMMIT` fixed across the campaign; names such as `HEAD~1` and
-`origin/main` are resolved again on every invocation. Reuse the same path,
-profile, discovery flags, and Rot binary when comparing rounds.
 
 Positional `PATH` arguments select input; `--files` only changes table detail.
 Each selected directory is its own ignore boundary. Use `--hidden` or
 `--no-ignore` to broaden discovery. JSON goes to stdout and diagnostics go to
 stderr.
 
-Fast `rot` emits the requested report and then exits unsuccessfully if analysis
-diagnostics remain. Operational errors also fail. Metric changes never determine
-exit status, so the caller must evaluate the reported deltas.
-
 Run `rot --help` for the complete option list and profile controls.
 
-## Deeper compiler analysis
+## Deeper visibility analysis
 
 Fast `rot` deliberately stays at the source level. It can count explicit `pub`
-declarations, but it cannot resolve cross-crate uses, public reexports, or the
-concrete consumers of a declaration.
+declarations, but it cannot prove whether another crate or public interface
+actually requires that visibility.
 
 `rot-audit` is the slower, compiler-backed companion for aggressive
 refactoring. It runs a real Cargo/rustc build for one target and feature profile,
-correlates the selected Cargo units, and provides three deeper views:
+correlates the selected Cargo units, and turns the raw `pub` count into an
+actionable list:
 
-- Visibility safety: declarations that must remain public, can be narrowed, or
-  are unreachable in the selected compiled targets.
-- API topology diffs: public definitions and namespace bindings added, removed,
-  or retargeted since a Git revision.
-- Impact explanations: direct and transitive consumers of one exact definition,
-  with production, test, build-time, and public-interface provenance.
+- **Required public:** must remain `pub` for a selected cross-crate use or
+  public interface.
+- **Can narrow:** reachable, but unrestricted `pub` is unnecessary.
+- **Dead public:** unreachable from every selected compiled target.
 
-```console
-rot-audit . --locked --offline --driver PATH
-rot-audit . --baseline origin/main --locked --offline --driver PATH
-rot-audit . --explain 'my-package:module::item' --driver PATH
-```
-
-Use `rot` for routine measurement and source-metric diffs. Use `rot-audit` when
-you need compiler evidence before moving, deleting, narrowing, or reexporting
-code across a workspace. `--baseline` performs two isolated real builds.
+Use `rot` for routine measurement and revision diffs. Use `rot-audit` when you
+want to reduce visibility across a workspace and need source locations and
+compiler-backed reasons for each candidate.
 
 The evidence is closed-world: it covers only the selected compiled targets, not
 inactive feature profiles, doctests, or unknown external consumers. The audit
-also requires a driver built for the exact selected rustc from a Git checkout;
-the rustc-private driver source is intentionally not shipped in the Cargo
-package. Its API comparison tracks public names and binding topology; it is not
-a semver checker and does not detect a same-path signature or ABI change.
+also requires a driver built for the exact selected rustc.
 
-See [Compiler-backed refactoring audit](docs/rustc-backed-analysis.md) for
-setup, supported compilers, safety boundaries, and the full evidence contract.
-
-## Releases
-
-Merges to `main` drive releases after CI succeeds. Any unreleased conventional
-`feat:` commit advances the minor version; every other commit advances patch.
-The workflow then creates the version commit and tag, publishes the two Cargo
-packages, builds macOS and Ubuntu artifacts, creates the GitHub release, and
-updates `daulet/homebrew-tap`. Tags are outputs of this process, not triggers or
-version inputs.
-
-See [Release automation](docs/releases.md) for the exact policy, one-time
-repository setup, recovery procedure, and artifact support boundary.
+See [Compiler-backed visibility audit](docs/rustc-backed-analysis.md) for setup,
+supported compilers, safety boundaries, and the full evidence contract.
