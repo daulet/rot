@@ -8,12 +8,33 @@ tag, build artifacts, and publish channels.
 
 ## Version policy
 
-The authoritative input is the first-parent commit history after the last
-generated release commit:
+The release/no-release gate compares the exact source tree with the last tagged
+release tree. The baseline object is discovered from the provenance-marked
+release commit rather than from a tag name, so a manual or moved tag cannot
+change planning:
+
+- no net tree change is `unchanged` and does not release;
+- a non-empty net diff containing only `.md` paths is `markdown-only` and does
+  not release;
+- a net diff confined to release infrastructure, documentation, licenses,
+  examples, benches, or tests is `release-neutral` and does not release;
+- any other net diff is release-relevant.
+
+This is a source fingerprint for Rot's shipped product surface. It deliberately
+does not hash one host binary: that would miss target-specific code, the
+compiler protocol, and the rustc driver. Unknown paths remain release-relevant,
+so adding a new product input cannot silently bypass publication. Neutral files
+still ride with the next product release when they are part of a crate or
+archive.
+
+For a release-relevant range, the authoritative version input is the
+first-parent commit history after that release commit:
 
 - `feat: ...`, `feat(scope): ...`, and `feat!: ...` advance `MINOR` and reset
   `PATCH`;
-- every other non-generated commit advances `PATCH`;
+- every other non-generated commit with a release-relevant path advances
+  `PATCH`;
+- release-neutral commits are excluded from version classification;
 - if a batch contains any feature commit, the minor bump wins;
 - major bumps are intentionally absent while Rot is greenfield;
 - `chore(release): vX.Y.Z` is trusted only with the workflow's
@@ -33,10 +54,16 @@ Examples from a released `0.4.2` baseline:
 | `refactor: simplify walker` | `0.4.3` |
 | `feat(cli): add threshold` | `0.5.0` |
 | `fix: ...` and `feat: ...` | `0.5.0` |
+| `docs: ...` changing only Markdown | no release |
+| release workflow or test changes only | no release |
+| add and then fully revert code | no release |
 
-Commit subjects on `main` are literal inputs. Prefer squash merges whose title
-is a conventional commit; a generic `Merge pull request ...` subject is, by
-definition, a patch.
+Release-relevant commit subjects on `main` are literal inputs. Prefer squash
+merges whose title is a conventional commit; a generic `Merge pull request ...`
+subject is, by definition, a patch. The release gate is range-scoped; subject
+classification remains commit-scoped so `feat(docs)` or `feat(release)` cannot
+promote a real fix to a minor release. Path checks are case-insensitive, and a
+mixed neutral/product commit still counts.
 
 ## State machine and recovery
 
@@ -81,12 +108,13 @@ canonical artifact retained for seven days by the release run.
 
 A deterministic failure does not wedge later releases. A follow-up commit uses
 the failed generated version as its baseline and creates the next semantic
-version; the failed version is burned. Once that successor release commit
-exists, the older workflow is explicitly superseded and cannot publish on a
-retry. Published crates are accepted on recovery only when their repository,
-crate checksum, and configured crates.io owner all match. Homebrew refuses to
-downgrade a newer formula. There is intentionally no manual publish dispatch
-that could attest a different `GITHUB_SHA`.
+version; the failed version is burned. The release-change diff remains anchored
+at the newest valid annotated tag until a successor is tagged. Once that
+successor release commit exists, the older workflow is explicitly superseded
+and cannot publish on a retry. Published crates are accepted on recovery only
+when their repository, crate checksum, and configured crates.io owner all
+match. Homebrew refuses to downgrade a newer formula. There is intentionally no
+manual publish dispatch that could attest a different `GITHUB_SHA`.
 
 ## Published channels
 

@@ -90,6 +90,9 @@ class RepositoryFixture(unittest.TestCase):
         self.git(*command)
         return self.git("rev-parse", "HEAD")
 
+    def tag_release(self, commit: str, version: str) -> None:
+        self.git("tag", "-a", f"v{version}", commit, "-m", f"Rot v{version}")
+
     def _write_version_files(self, version: str) -> None:
         (self.root / "Cargo.toml").write_text(
             f'''[package]
@@ -151,10 +154,237 @@ class ReleasePlanTests(RepositoryFixture):
             f"Release-Source: {source}",
             f"Release-Automation: {release.AUTOMATION_MARKER}",
         )
+        (self.root / "release.py").write_text("fixed = True\n", encoding="utf-8")
         next_source = self.commit("fix: correct total")
         plan = release.plan_release(self.root, next_source, "HEAD")
         self.assertEqual(plan["version"], "0.1.1")
         self.assertEqual(plan["previous_tag"], "v0.1.0")
+
+    def test_markdown_only_commits_are_a_no_op(self) -> None:
+        source = self.commit("feat: initial product")
+        self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        (self.root / "README.md").write_text("install rot\n", encoding="utf-8")
+        (self.root / "GUIDE.MD").write_text("use rot\n", encoding="utf-8")
+        docs_source = self.commit("docs: add installation guide")
+
+        plan = release.plan_release(self.root, docs_source, "HEAD")
+
+        self.assertEqual(
+            plan,
+            {
+                "state": "markdown-only",
+                "source": docs_source,
+                "previous_tag": "v0.1.0",
+                "commit_count": "0",
+            },
+        )
+
+    def test_markdown_only_merge_is_a_no_op_from_release_boundary(self) -> None:
+        source = self.commit("feat: initial product")
+        self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.git("checkout", "-b", "docs")
+        (self.root / "README.md").write_text("install rot\n", encoding="utf-8")
+        self.commit("docs: add installation guide")
+        self.git("checkout", "main")
+        self.git("merge", "--no-ff", "docs", "-m", "docs: merge installation guide")
+        merge_source = self.git("rev-parse", "HEAD")
+
+        plan = release.plan_release(self.root, merge_source, "HEAD")
+
+        self.assertEqual(plan["state"], "markdown-only")
+        self.assertEqual(plan["commit_count"], "0")
+
+    def test_release_automation_and_docs_are_release_neutral(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(released, "0.1.0")
+        (self.root / ".github/scripts").mkdir(parents=True)
+        (self.root / ".github/scripts/release.py").write_text(
+            "fixed = True\n", encoding="utf-8"
+        )
+        (self.root / "docs").mkdir()
+        (self.root / "docs/releases.md").write_text(
+            "release policy\n", encoding="utf-8"
+        )
+        final_source = self.commit("feat(release): improve automation")
+
+        plan = release.plan_release(self.root, final_source, "HEAD")
+
+        self.assertEqual(
+            plan,
+            {
+                "state": "release-neutral",
+                "source": final_source,
+                "previous_tag": "v0.1.0",
+                "commit_count": "0",
+            },
+        )
+
+    def test_release_neutral_feature_does_not_promote_a_code_fix(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(released, "0.1.0")
+        (self.root / ".github/scripts").mkdir(parents=True)
+        (self.root / ".github/scripts/release.py").write_text(
+            "fixed = True\n", encoding="utf-8"
+        )
+        self.commit("feat(release): improve automation")
+        (self.root / "src").mkdir()
+        (self.root / "src/main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        final_source = self.commit("fix: correct output")
+
+        plan = release.plan_release(self.root, final_source, "HEAD")
+
+        self.assertEqual(plan["state"], "new")
+        self.assertEqual(plan["version"], "0.1.1")
+        self.assertEqual(plan["bump"], "patch")
+        self.assertEqual(plan["commit_count"], "1")
+
+    def test_test_only_commit_is_release_neutral(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(released, "0.1.0")
+        (self.root / "tests").mkdir()
+        (self.root / "tests/cli.rs").write_text(
+            "#[test]\nfn cli() {}\n", encoding="utf-8"
+        )
+        final_source = self.commit("test: cover CLI")
+
+        plan = release.plan_release(self.root, final_source, "HEAD")
+
+        self.assertEqual(plan["state"], "release-neutral")
+        self.assertEqual(plan["commit_count"], "0")
+
+    def test_release_gate_uses_net_diff_from_previous_release(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(released, "0.1.0")
+        (self.root / "README.md").write_text("install rot\n", encoding="utf-8")
+        (self.root / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        self.commit("feat: stage documented feature")
+        (self.root / "feature.py").unlink()
+        final_source = self.commit("revert: drop staged feature")
+
+        plan = release.plan_release(self.root, final_source, "HEAD")
+
+        self.assertEqual(plan["state"], "markdown-only")
+        self.assertEqual(plan["commit_count"], "0")
+
+    def test_reverted_code_is_unchanged_since_previous_release(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(released, "0.1.0")
+        (self.root / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        self.commit("feat: stage feature")
+        (self.root / "feature.py").unlink()
+        final_source = self.commit("revert: drop staged feature")
+
+        plan = release.plan_release(self.root, final_source, "HEAD")
+
+        self.assertEqual(
+            plan,
+            {
+                "state": "unchanged",
+                "source": final_source,
+                "previous_tag": "v0.1.0",
+                "commit_count": "0",
+            },
+        )
+
+    def test_generated_release_requires_a_net_release_change(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(released, "0.1.0")
+        (self.root / "README.md").write_text("install rot\n", encoding="utf-8")
+        docs_source = self.commit("docs: add installation guide")
+        self._write_version_files("0.1.1")
+        generated = self.commit(
+            "chore(release): v0.1.1",
+            f"Release-Source: {docs_source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+
+        with self.assertRaisesRegex(
+            release.ReleaseError, "no release-relevant changes"
+        ):
+            release.plan_release(self.root, generated, "HEAD")
+
+    def test_markdown_feature_does_not_raise_a_code_fix_to_minor(self) -> None:
+        source = self.commit("feat: initial product")
+        self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        (self.root / "README.md").write_text("new feature docs\n", encoding="utf-8")
+        self.commit("feat(docs): explain future work")
+        (self.root / "release.py").write_text("fixed = True\n", encoding="utf-8")
+        fix_source = self.commit("fix: repair release")
+
+        plan = release.plan_release(self.root, fix_source, "HEAD")
+
+        self.assertEqual(plan["version"], "0.1.1")
+        self.assertEqual(plan["bump"], "patch")
+        self.assertEqual(plan["commit_count"], "1")
+
+        self._write_version_files("0.1.1")
+        release_commit = self.commit(
+            "chore(release): v0.1.1",
+            f"Release-Source: {fix_source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        recovered = release.plan_release(self.root, fix_source, "HEAD")
+        self.assertEqual(recovered["state"], "pending")
+        self.assertEqual(recovered["release_sha"], release_commit)
+
+    def test_mixed_markdown_and_code_commit_is_release_relevant(self) -> None:
+        source = self.commit("feat: initial product")
+        self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        (self.root / "README.md").write_text("new feature docs\n", encoding="utf-8")
+        (self.root / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        mixed_source = self.commit("feat: add documented feature")
+
+        plan = release.plan_release(self.root, mixed_source, "HEAD")
+
+        self.assertEqual(plan["version"], "0.2.0")
+        self.assertEqual(plan["bump"], "minor")
+        self.assertEqual(plan["commit_count"], "1")
 
     def test_existing_release_is_recovered_by_source(self) -> None:
         source = self.commit("feat: initial product")
@@ -174,6 +404,34 @@ class ReleasePlanTests(RepositoryFixture):
         plan = release.plan_release(self.root, source, "HEAD")
         self.assertEqual(plan["version"], "0.1.0")
 
+    def test_release_boundary_tag_must_be_annotated(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.git("tag", "v0.1.0", released)
+        docs_source = self.commit("docs: explain installation")
+
+        with self.assertRaisesRegex(release.ReleaseError, "not annotated"):
+            release.plan_release(self.root, docs_source, "HEAD")
+
+    def test_release_boundary_tag_must_target_its_generated_commit(self) -> None:
+        source = self.commit("feat: initial product")
+        released = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        docs_source = self.commit("docs: explain installation")
+        self.tag_release(docs_source, "0.1.0")
+
+        with self.assertRaisesRegex(
+            release.ReleaseError, f"not {released}"
+        ):
+            release.plan_release(self.root, docs_source, "HEAD")
+
     def test_recovered_release_keeps_generated_notes_baseline(self) -> None:
         first_source = self.commit("feat: initial product")
         self.commit(
@@ -181,6 +439,7 @@ class ReleasePlanTests(RepositoryFixture):
             f"Release-Source: {first_source}",
             f"Release-Automation: {release.AUTOMATION_MARKER}",
         )
+        (self.root / "release.py").write_text("fixed = True\n", encoding="utf-8")
         second_source = self.commit("fix: correct total")
         self._write_version_files("0.1.1")
         self.git("add", ".")
@@ -199,6 +458,7 @@ class ReleasePlanTests(RepositoryFixture):
             f"Release-Source: {first_source}",
             f"Release-Automation: {release.AUTOMATION_MARKER}",
         )
+        (self.root / "release.py").write_text("fixed = True\n", encoding="utf-8")
         second_source = self.commit("fix: repair packaging")
         self._write_version_files("0.1.1")
         second_release = self.commit(
@@ -212,6 +472,31 @@ class ReleasePlanTests(RepositoryFixture):
         self.assertEqual(plan["tag"], "v0.1.0")
         self.assertEqual(plan["superseded_by"], second_release)
         self.assertEqual(plan["superseded_by_tag"], "v0.1.1")
+
+    def test_untagged_release_does_not_move_the_diff_boundary(self) -> None:
+        first_source = self.commit("feat: initial product")
+        first_release = self.commit(
+            "chore(release): v0.1.0",
+            f"Release-Source: {first_source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        self.tag_release(first_release, "0.1.0")
+        (self.root / "release.py").write_text("fixed = True\n", encoding="utf-8")
+        second_source = self.commit("fix: repair packaging")
+        self._write_version_files("0.1.1")
+        self.commit(
+            "chore(release): v0.1.1",
+            f"Release-Source: {second_source}",
+            f"Release-Automation: {release.AUTOMATION_MARKER}",
+        )
+        retry_source = self.commit("fix: retry publication")
+
+        plan = release.plan_release(self.root, retry_source, "HEAD")
+
+        self.assertEqual(plan["state"], "new")
+        self.assertEqual(plan["version"], "0.1.2")
+        self.assertEqual(plan["previous_tag"], "v0.1.1")
+        self.assertEqual(plan["commit_count"], "1")
 
     def test_old_unreleased_source_is_stale(self) -> None:
         old_source = self.commit("fix: old")

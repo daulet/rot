@@ -30,6 +30,20 @@ VERSION_PATHS = frozenset(
         "crates/rot-compiler-protocol/Cargo.toml",
     }
 )
+RELEASE_NEUTRAL_ROOTS = frozenset({".github", "docs"})
+RELEASE_NEUTRAL_COMPONENTS = frozenset({"benches", "examples", "tests"})
+RELEASE_NEUTRAL_FILES = frozenset(
+    {
+        ".editorconfig",
+        ".gitattributes",
+        ".gitignore",
+        ".rustfmt.toml",
+        "clippy.toml",
+        "license-apache",
+        "license-mit",
+        "rustfmt.toml",
+    }
+)
 FEATURE_SUBJECT = re.compile(r"^feat(?:\([^()]+\))?!?:")
 RELEASE_SUBJECT = re.compile(r"^chore\(release\): v(?P<version>\d+\.\d+\.\d+)$")
 GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
@@ -148,6 +162,100 @@ def commit_subject(root: Path, commit: str) -> str:
     return run_git(root, "show", "-s", "--format=%s", commit)
 
 
+def changed_paths(root: Path, before: str, after: str) -> tuple[str, ...]:
+    output = run_git(
+        root,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        before,
+        after,
+        "--",
+    )
+    return tuple(path for path in output.split("\0") if path)
+
+
+def first_parent_changed_paths(root: Path, commit: str) -> tuple[str, ...]:
+    ancestry = run_git(root, "rev-list", "--parents", "-n", "1", commit).split()
+    if not ancestry or ancestry[0] != commit:
+        raise ReleaseError(f"could not resolve first-parent ancestry for {commit}")
+    if len(ancestry) == 1:
+        output = run_git(
+            root,
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            "-z",
+            commit,
+            "--",
+        )
+        return tuple(path for path in output.split("\0") if path)
+    return changed_paths(root, ancestry[1], commit)
+
+
+def markdown_path(path: str) -> bool:
+    return path.casefold().endswith(".md")
+
+
+def release_neutral_path(path: str) -> bool:
+    components = tuple(component.casefold() for component in path.split("/"))
+    return (
+        markdown_path(path)
+        or components[0] in RELEASE_NEUTRAL_ROOTS
+        or any(component in RELEASE_NEUTRAL_COMPONENTS for component in components)
+        or components[-1] in RELEASE_NEUTRAL_FILES
+    )
+
+
+def release_neutral_commit(root: Path, commit: str) -> bool:
+    paths = first_parent_changed_paths(root, commit)
+    return bool(paths) and all(release_neutral_path(path) for path in paths)
+
+
+def no_release_change_state(root: Path, baseline: str, source: str) -> str | None:
+    paths = changed_paths(root, baseline, source)
+    if not paths:
+        return "unchanged"
+    if all(markdown_path(path) for path in paths):
+        return "markdown-only"
+    if all(release_neutral_path(path) for path in paths):
+        return "release-neutral"
+    return None
+
+
+def release_subjects(root: Path, commits: Iterable[str]) -> list[str]:
+    subjects = []
+    for commit in commits:
+        if generated_release(commit_message(root, commit)) is not None:
+            continue
+        if release_neutral_commit(root, commit):
+            continue
+        subjects.append(commit_subject(root, commit))
+    return subjects
+
+
+def latest_tagged_release_commit(root: Path, commits: Iterable[str]) -> str | None:
+    for commit in commits:
+        release = generated_release(commit_message(root, commit))
+        if release is None:
+            continue
+        tag = f"v{release.version}"
+        if not run_git(root, "tag", "--list", tag):
+            continue
+        tag_ref = f"refs/tags/{tag}"
+        if run_git(root, "cat-file", "-t", tag_ref) != "tag":
+            raise ReleaseError(f"release tag {tag} is not annotated")
+        target = resolve_commit(root, tag_ref)
+        if target != commit:
+            raise ReleaseError(f"release tag {tag} points to {target}, not {commit}")
+        return commit
+    return None
+
+
 def package_version(manifest: Path, expected_name: str) -> Version:
     with manifest.open("rb") as source:
         package = tomllib.load(source).get("package", {})
@@ -208,11 +316,17 @@ def validate_generated_commit(
             f"{previous_commit}..{generated.source}",
         )
         unreleased = output.splitlines() if output else []
-    subjects = [
-        commit_subject(root, candidate)
-        for candidate in unreleased
-        if generated_release(commit_message(root, candidate)) is None
-    ]
+        tagged_boundary = latest_tagged_release_commit(root, source_history)
+        if tagged_boundary is not None:
+            no_release_state = no_release_change_state(
+                root, tagged_boundary, generated.source
+            )
+            if no_release_state is not None:
+                raise ReleaseError(
+                    f"generated release {commit} has no release-relevant changes "
+                    f"since {tagged_boundary}: {no_release_state}"
+                )
+    subjects = release_subjects(root, unreleased)
     expected_version = baseline.bump(bump_kind(subjects))
     if generated.version != expected_version:
         raise ReleaseError(
@@ -370,11 +484,26 @@ def plan_release(root: Path, source_revision: str, remote_ref: str) -> dict[str,
         )
         unreleased = range_output.splitlines() if range_output else []
 
-    subjects = []
-    for commit in unreleased:
-        message = commit_message(root, commit)
-        if generated_release(message) is None:
-            subjects.append(commit_subject(root, commit))
+    previous_tag = "" if previous_release is None else f"v{baseline}"
+    tagged_boundary = latest_tagged_release_commit(root, source_history)
+    if tagged_boundary is not None:
+        no_release_state = no_release_change_state(root, tagged_boundary, source)
+        if no_release_state is not None:
+            return {
+                "state": no_release_state,
+                "source": source,
+                "previous_tag": previous_tag,
+                "commit_count": "0",
+            }
+
+    subjects = release_subjects(root, unreleased)
+    if not subjects:
+        return {
+            "state": "markdown-only",
+            "source": source,
+            "previous_tag": previous_tag,
+            "commit_count": "0",
+        }
 
     kind = bump_kind(subjects)
     version = baseline.bump(kind)
@@ -387,7 +516,7 @@ def plan_release(root: Path, source_revision: str, remote_ref: str) -> dict[str,
     return {
         "state": "new",
         "source": source,
-        "previous_tag": "" if previous_release is None else f"v{baseline}",
+        "previous_tag": previous_tag,
         "bump": kind,
         "version": str(version),
         "tag": f"v{version}",
