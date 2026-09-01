@@ -1,0 +1,116 @@
+name: Publish Homebrew formula
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Update Homebrew tap
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Require tap credential
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: test -n "$TAP_TOKEN"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: daulet/homebrew-tap
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download generated formula
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: artifacts-*
+          path: generated
+          merge-multiple: true
+
+      - name: Guard formula update
+        id: formula
+        env:
+          PLAN: ${{ inputs.plan }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -c generated/rot.rb >/dev/null
+          ruby <<'RUBY'
+          require "fileutils"
+          require "json"
+
+          version_pattern = /\A(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\z/
+          parse_version = lambda do |raw|
+            match = raw.is_a?(String) && version_pattern.match(raw)
+            abort "invalid release version #{raw.inspect}" unless match
+            match.captures.map { |part| Integer(part, 10) }
+          end
+
+          formula_version = lambda do |path|
+            content = File.read(path)
+            versions = content.scan(%r{/releases/download/v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))/}).flatten
+            versions.concat(content.scan(/^\s*version\s+"((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))"\s*$/).flatten)
+            versions.uniq!
+            abort "expected exactly one version in #{path}, found #{versions.inspect}" unless versions.one?
+            [versions.first, parse_version.call(versions.first)]
+          end
+
+          plan = JSON.parse(ENV.fetch("PLAN"))
+          formulae = plan.fetch("releases").flat_map do |release|
+            release.fetch("artifacts").select { |artifact| artifact.end_with?(".rb") }.map do |artifact|
+              [artifact, release.fetch("app_version")]
+            end
+          end
+          unless formulae.length == 1 && formulae.first.first == "rot.rb"
+            abort "expected exactly one planned formula at Formula/rot.rb, found #{formulae.inspect}"
+          end
+
+          candidate = "generated/rot.rb"
+          target = "Formula/rot.rb"
+          downloaded = Dir.glob("generated/**/*.rb").sort
+          abort "expected only #{candidate}, found #{downloaded.inspect}" unless downloaded == [candidate]
+          abort "missing current #{target}" unless File.file?(target)
+
+          planned_raw = formulae.first.last
+          planned = parse_version.call(planned_raw)
+          embedded_raw, embedded = formula_version.call(candidate)
+          abort "formula version #{embedded_raw} does not match plan #{planned_raw}" unless embedded == planned
+
+          current_raw, current = formula_version.call(target)
+          comparison = planned <=> current
+          if comparison.negative?
+            abort "refusing to downgrade Homebrew from #{current_raw} to #{planned_raw}"
+          elsif comparison.zero?
+            abort "Homebrew #{planned_raw} content differs from the published formula" unless File.binread(candidate) == File.binread(target)
+            File.open(ENV.fetch("GITHUB_OUTPUT"), "a") { |output| output << "changed=false\n" }
+            puts "Homebrew #{planned_raw} is already current."
+            exit
+          end
+
+          FileUtils.cp(candidate, target)
+          File.open(ENV.fetch("GITHUB_OUTPUT"), "a") do |output|
+            output << "changed=true\nversion=#{planned_raw}\n"
+          end
+          RUBY
+
+      - name: Commit tap upgrade
+        if: steps.formula.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.formula.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- Formula/rot.rb
+          git diff --cached --check
+          ! git diff --cached --quiet -- Formula/rot.rb
+          git commit -m "rot ${VERSION}"
+          git push origin HEAD:main

@@ -4,9 +4,15 @@ default-members = ["."]
 exclude = ["compiler/rot-rustc-driver"]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+rot-compiler-protocol = { path = "crates/rot-compiler-protocol", version = "=0.1.0" }
+
 [package]
 name = "rot-metrics"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.98"
 default-run = "rot"
@@ -64,7 +70,7 @@ ignore = "0.4.33"
 ra_ap_cfg = { version = "=0.0.349", features = ["syntax"] }
 ra_ap_syntax = "=0.0.349"
 rayon = "1.12.0"
-rot-compiler-protocol = { path = "crates/rot-compiler-protocol", version = "=0.1.0", optional = true }
+rot-compiler-protocol = { workspace = true, optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tempfile = "3.23.0"
@@ -74,3 +80,32 @@ toml = "1.1.4"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.dist]
+inherits = "release"
+
+[package.metadata.dist]
+formula = "rot"
+display-name = "rot"
+unix-archive = ".tar.gz"
+include = ["docs/releases.md", "docs/rustc-backed-analysis.md"]
+
+[package.metadata.dist.binaries]
+aarch64-apple-darwin = ["rot"]
+x86_64-apple-darwin = ["rot"]
+aarch64-unknown-linux-musl = ["rot"]
+x86_64-unknown-linux-musl = ["rot"]
+
+[package.metadata.deb]
+name = "rot"
+maintainer = "Rot contributors <daulet@users.noreply.github.com>"
+copyright = "2026, Daulet Zhanguzin"
+license-file = ["LICENSE-APACHE", "0"]
+extended-description = "Fast, Rust-aware source metrics"
+section = "utils"
+priority = "optional"
+revision = ""
+assets = [
+    ["target/release/rot", "usr/bin/", "755"],
+    ["LICENSE-APACHE", "usr/share/doc/rot/LICENSE-APACHE", "644"],
+]

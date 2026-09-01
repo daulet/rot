@@ -1,204 +1,110 @@
 # Release automation
 
-Rot releases from accepted commits, not from manually created tags. CI proves
-one exact `main` commit and the release workflow computes and pushes the next
-version commit with a dedicated release credential. That push receives its own
-CI run. Only successful CI for the generated commit may create its annotated
-tag, build artifacts, and publish channels.
+Rot releases accepted `main` commits. Tags are generated identities, not
+release triggers or version inputs.
 
 ## Version policy
 
-The release/no-release gate compares the exact source tree with the last tagged
-release tree. The baseline object is discovered from the provenance-marked
-release commit rather than from a tag name, so a manual or moved tag cannot
-change planning:
+The Rust planner in `.github/rot-release` compares the selected source tree
+with the newest valid tagged release commit:
 
-- no net tree change is `unchanged` and does not release;
-- a non-empty net diff containing only `.md` paths is `markdown-only` and does
-  not release;
-- a net diff confined to release infrastructure, documentation, licenses,
-  examples, benches, or tests is `release-neutral` and does not release;
-- any other net diff is release-relevant.
+- no net change is `unchanged`;
+- a net diff containing only Markdown is `markdown-only`;
+- a net diff confined to `.github`, `docs`, licenses, repository config,
+  examples, benches, or tests is `release-neutral`;
+- every other or unknown path is release-relevant.
 
-This is a source fingerprint for Rot's shipped product surface. It deliberately
-does not hash one host binary: that would miss target-specific code, the
-compiler protocol, and the rustc driver. Unknown paths remain release-relevant,
-so adding a new product input cannot silently bypass publication. Neutral files
-still ride with the next product release when they are part of a crate or
-archive.
+The first three states do not release. For a release-relevant range, each
+first-parent commit is classified separately. A release-neutral commit is
+excluded from versioning; `feat:`, `feat(scope):`, and their breaking forms
+bump `MINOR`; every other included commit bumps `PATCH`. Any feature wins for
+the range. Major bumps are intentionally absent while Rot is greenfield.
 
-For a release-relevant range, the authoritative version input is the
-first-parent commit history after that release commit:
+Examples from `0.4.2`:
 
-- `feat: ...`, `feat(scope): ...`, and `feat!: ...` advance `MINOR` and reset
-  `PATCH`;
-- every other non-generated commit with a release-relevant path advances
-  `PATCH`;
-- release-neutral commits are excluded from version classification;
-- if a batch contains any feature commit, the minor bump wins;
-- major bumps are intentionally absent while Rot is greenfield;
-- `chore(release): vX.Y.Z` is trusted only with the workflow's
-  `Release-Source` and `Release-Automation: rot-v1` trailers.
-
-The first run uses virtual version `0.0.0` and the complete first-parent
-history. Rot's existing feature history therefore bootstraps `v0.1.0`, which
-must match the checked-in package version. After that, the version in all three
-manifests and both relevant lockfiles must match the last generated release.
-Manual version drift fails closed.
-
-Examples from a released `0.4.2` baseline:
-
-| Unreleased subjects | Next version |
+| Unreleased changes | Result |
 | --- | --- |
 | `fix: correct cfg accounting` | `0.4.3` |
 | `refactor: simplify walker` | `0.4.3` |
 | `feat(cli): add threshold` | `0.5.0` |
-| `fix: ...` and `feat: ...` | `0.5.0` |
-| `docs: ...` changing only Markdown | no release |
-| release workflow or test changes only | no release |
-| add and then fully revert code | no release |
+| product fix plus docs-only `feat` | `0.4.3` |
+| Markdown, tests, or release tooling only | no release |
+| code added and fully reverted | no release |
 
-Release-relevant commit subjects on `main` are literal inputs. Prefer squash
-merges whose title is a conventional commit; a generic `Merge pull request ...`
-subject is, by definition, a patch. The release gate is range-scoped; subject
-classification remains commit-scoped so `feat(docs)` or `feat(release)` cannot
-promote a real fix to a minor release. Path checks are case-insensitive, and a
-mixed neutral/product commit still counts.
+This split is deliberate: the gate uses the net tree, while the bump uses the
+surviving commit history. Unknown and mixed paths fail toward releasing.
 
-## State machine and recovery
+## Release flow
 
-`.github/workflows/ci.yml` runs for pull requests and `main`. A successful
-normal push CI run lets `.github/workflows/release.yml` create the version
-commit. CI runs again for that credentialed push and calls the reusable
-`.github/workflows/publish.yml` only after the exact release commit passes every
-CI job. The planner/publisher pair:
+After normal CI succeeds, `.github/workflows/plan-release.yml`:
 
-1. scans complete first-parent history and finds the last provenance-marked
-   release commit;
-2. coalesces queued pushes by exiting when its source is no longer `main`;
-3. updates package and lock versions and pushes a generated commit with
-   `RELEASE_TOKEN`, which starts ordinary CI for that exact child commit;
-4. resumes only from that successful exact-commit CI, validates the release
-   commit's parent, committer, diff, manifests, dependencies, and locks, then
-   creates the annotated tag;
-5. builds all native artifacts from the proven release commit and attaches a
-   deterministic canonical set to a draft GitHub release;
-6. publishes crates.io, then makes the attested GitHub assets public;
-7. installs and tests the Homebrew formula against those public URLs before
-   updating the tap. The workflow's successful conclusion is the all-channel
-   completion marker.
+1. plans from complete first-parent history;
+2. exits if a newer `main` commit already owns the range;
+3. updates the workspace version and exact protocol dependency in
+   `Cargo.toml`, plus the root and rustc-driver lockfiles;
+4. pushes a provenance-marked `chore(release)` commit with `[skip ci]` and an
+   annotated tag;
+5. dispatches `.github/workflows/release.yml` for that exact tagged `main`
+   commit and follows it to completion.
 
-The workflow has one FIFO concurrency group with GitHub's maximum pending queue,
-so planners and exact-commit publishers are never silently replaced. If a newer
-commit lands before the version-commit push, the older run exits cleanly and
-the newer run includes the whole unreleased range. If a channel fails
-transiently, rerun the failed jobs before merging another commit. Recovery
-stays attached to that exact release-commit CI identity, validates the
-annotated tag, and accepts attached assets only when their exact names and
-bytes match the current deterministic build.
+The generated cargo-dist workflow verifies the tag and commit, builds four
+native fast-mode archives, uses cargo-deb for amd64 and arm64 Debian packages,
+publishes `rot-compiler-protocol` then `rot-metrics`, attests the release files,
+creates the GitHub release, and finally updates Homebrew. The
+private rustc driver is never published.
 
-Immediately before publication, the workflow byte-compares every draft asset
-with the canonical Actions artifact and verifies its build-provenance
-attestation. Homebrew checks the exact public asset set, checksum manifest, and
-build-provenance attestation for every downloaded file before testing the
-formula. This checks workflow provenance independently of GitHub's
-release-level immutability attestation and does not depend on short-lived
-Actions artifacts. A retry before GitHub publication still requires the
-canonical artifact retained for seven days by the release run.
-
-A deterministic failure does not wedge later releases. A follow-up commit uses
-the failed generated version as its baseline and creates the next semantic
-version; the failed version is burned. The release-change diff remains anchored
-at the newest valid annotated tag until a successor is tagged. Once that
-successor release commit exists, the older workflow is explicitly superseded
-and cannot publish on a retry. Published crates are accepted on recovery only
-when their repository, crate checksum, and configured crates.io owner all
-match. Homebrew refuses to downgrade a newer formula. There is intentionally no
-manual publish dispatch that could attest a different `GITHUB_SHA`.
+The planner and distributor are serialized. While the generated commit remains
+the `main` tip, a retry reuses its tag, already-published crates, and
+byte-identical Homebrew formula. It refuses duplicate distribution runs, moved
+or lightweight tags, formula downgrades, and same-version formula drift. Rerun
+failed jobs on the existing distribution run. If work continues instead, the
+failed version is burned and the next accepted commit receives a new version.
 
 ## Published channels
 
-The Cargo package is `rot-metrics`, while its executables remain `rot` and
-`rot-audit`. `rot-compiler-protocol` is published first because the optional
-audit feature depends on its exact version. `rot-rustc-driver` stays private.
+The Cargo package is `rot-metrics`; the installed fast executable is `rot`.
+GitHub releases contain `.tar.gz` archives for Apple arm64/x86_64 and static
+Linux musl arm64/x86_64, their SHA-256 files, a combined checksum file, the
+Homebrew formula, and Debian packages for arm64/amd64. cargo-dist generates the
+archives, checksums, formula, release notes, and GitHub release; cargo-deb owns
+Debian metadata and packaging.
 
-GitHub builds the fast `rot` command natively:
+`rot-audit` remains a Cargo feature requiring a host- and rustc-specific driver
+built from a Git checkout. It is not part of the portable binary archives.
 
-| Runner | Rust target | Assets |
-| --- | --- | --- |
-| `macos-15` | `aarch64-apple-darwin` | tarball, Homebrew |
-| `macos-15-intel` | `x86_64-apple-darwin` | tarball, Homebrew |
-| `ubuntu-24.04-arm` | `aarch64-unknown-linux-musl` | static tarball, arm64 `.deb` |
-| `ubuntu-24.04` | `x86_64-unknown-linux-musl` | static tarball, amd64 `.deb` |
+## Repository setup
 
-Every archive includes `rot`, the README, linked release/audit documentation,
-and the Apache 2.0 license text. The release also contains `SHA256SUMS`; GitHub
-provenance attestations cover the canonical archives, Debian packages, and
-checksum file from the exact CI-proven release commit. Linux jobs install,
-execute, and uninstall their `.deb` before publishing it.
+Before enabling automation:
 
-The Cargo package exposes `rot-audit` behind the `audit` feature, but a complete
-audit setup still requires a Git checkout to build the separate rustc driver.
-GitHub/Homebrew/Ubuntu binaries intentionally contain only fast `rot`. The
-driver is compiler-identity- and host-specific, and the current support ledger
-does not prove all four release hosts. Do not advertise portable audit bundles
-until each exact host matrix is recorded.
+1. Add repository secret `RELEASE_TOKEN`, scoped to contents write on
+   `daulet/rot`. Its identity needs a narrow direct-push bypass for generated
+   version commits and protected `v*` tags; never allow force pushes.
+2. Create the `release` environment, restricted to `main`, and add
+   `HOMEBREW_TAP_TOKEN` with contents write only on `daulet/homebrew-tap`.
+3. Configure crates.io trusted publishing for both packages with repository
+   `daulet/rot`, workflow `release.yml`, and environment `release`. A
+   `CARGO_REGISTRY_TOKEN` environment secret is supported only as bootstrap;
+   delete it after trusted publishing works.
+4. Protect `v*` tags from update/deletion, enable immutable GitHub releases,
+   and set repository variable `RELEASES_ENABLED=true`.
 
-## One-time GitHub setup
+`RELEASE_TOKEN` does not need Actions permission: the planner dispatches with
+its short-lived `GITHUB_TOKEN`. Every referenced action and distribution tool
+version is pinned in source.
 
-For a new GitHub repository, complete this setup before enabling releases:
-
-1. Create `daulet/rot`, add it as `origin`, and push `main`.
-2. Create a GitHub environment named `release`. Required reviewers are
-   optional; adding one turns every channel into an approval gate.
-3. Add `RELEASE_TOKEN` as a repository secret. Use a fine-grained credential
-   with contents write access only to `daulet/rot`; it pushes both generated
-   version commits and annotated tags. Unlike `GITHUB_TOKEN`, its commit push
-   must start CI. If `main` rejects direct pushes, grant only this release
-   identity a narrow ruleset bypass. A dedicated GitHub App installation token
-   is the stronger long-term replacement. Never permit force pushes.
-4. Protect `v*` tags from update and deletion, permit the release identity to
-   create them, and enable immutable GitHub releases before the first release.
-   Draft assets remain replaceable during staging; publication then locks the
-   tag and assets.
-5. Add `HOMEBREW_TAP_TOKEN` to the `release` environment. Use a fine-grained
-   credential with contents write access only to `daulet/homebrew-tap`.
-6. Set repository variable `CRATES_IO_OWNER` to the exact crates.io owner login
-   that must own both packages. Recovery rejects a matching crate uploaded by
-   any other owner.
-7. For the first crates.io publication only, add `CARGO_REGISTRY_TOKEN` to the
-   environment. It must own the new `rot-metrics` and
-   `rot-compiler-protocol` packages. After that release, configure crates.io
-   trusted publishing for both packages with repository `daulet/rot`, workflow
-   `ci.yml`, and environment `release`, then delete the bootstrap token. The
-   OIDC claim names the calling CI workflow even though publication jobs live
-   in reusable `publish.yml`.
-8. Set repository variable `RELEASES_ENABLED=true`. Until this exact value is
-   present, CI runs normally and every release job stays disabled.
-9. Push one normally reviewed semantic commit. The complete feature history
-   creates `v0.1.0`; later commits use the table above.
-
-The permanent crates.io path uses a short-lived OIDC token. Every referenced
-GitHub Action is pinned to a full commit SHA; update those pins deliberately,
-with a reviewed dependency change.
-
-## Local preflight
-
-Run the same inexpensive checks before changing the workflow:
+## Local checks
 
 ```console
-python3 -m unittest discover -s .github/scripts/tests -v
-bash -n .github/scripts/package-deb.sh
+cargo fmt --manifest-path .github/rot-release/Cargo.toml -- --check
+cargo test --manifest-path .github/rot-release/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path .github/rot-release/Cargo.toml \
+  --all-targets --all-features --locked -- -D warnings
+dist generate --check
+
 cargo fmt --all --check
 cargo test --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo package -p rot-compiler-protocol --locked --allow-dirty
-cargo package -p rot-metrics --list --allow-dirty
 cargo package -p rot-metrics --locked --allow-dirty \
   --config 'patch.crates-io.rot-compiler-protocol.path="crates/rot-compiler-protocol"'
 ```
-
-The local Cargo patch lets package verification resolve the exact protocol from
-this checkout before that version exists on crates.io. The publish job still
-rebuilds the final crate after the protocol version becomes visible, so its
-uploaded checksum reflects the real registry dependency.

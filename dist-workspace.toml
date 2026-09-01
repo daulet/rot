@@ -1,0 +1,46 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+hosting = "github"
+packages = ["rot-metrics"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+installers = ["homebrew"]
+default-features = false
+source-tarball = false
+checksum = "sha256"
+github-attestations = true
+github-attestations-phase = "announce"
+dispatch-releases = true
+github-release = "announce"
+pr-run-mode = "skip"
+plan-jobs = ["./verify-release"]
+global-artifacts-jobs = ["./build-deb"]
+publish-jobs = ["./publish-crates"]
+post-announce-jobs = ["./publish-homebrew"]
+github-custom-job-permissions = {
+    "verify-release" = { contents = "read" },
+    "build-deb" = { contents = "read" },
+    "publish-homebrew" = { contents = "read" },
+    "publish-crates" = { contents = "read", id-token = "write" },
+}
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+x86_64-apple-darwin = "macos-15-intel"
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+x86_64-unknown-linux-musl = "ubuntu-24.04"
+global = "ubuntu-24.04"
+
+[dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6" # v4
