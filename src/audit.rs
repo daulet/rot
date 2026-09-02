@@ -253,9 +253,8 @@ fn collect_snapshot(cli: &AuditCli) -> Result<AuditSnapshot> {
         no_default_features: cli.no_default_features,
         forced_cfg: cli.cfg.clone(),
     };
-    let mut diagnostics = Vec::new();
     let outcome = compiler::collect(cli, &inventory);
-    diagnostics.extend(outcome.diagnostics);
+    let mut diagnostics = outcome.diagnostics;
     sort_diagnostics(&mut diagnostics);
     Ok(AuditSnapshot {
         root,
