@@ -5,10 +5,10 @@ exclude = ["compiler/rot-rustc-driver"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 
 [workspace.dependencies]
-rot-compiler-protocol = { path = "crates/rot-compiler-protocol", version = "=0.1.2" }
+rot-compiler-protocol = { path = "crates/rot-compiler-protocol", version = "=0.1.3" }
 
 [package]
 name = "rot-metrics"
