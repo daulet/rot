@@ -1367,4 +1367,35 @@ mod tests {
             ["crate_a/unstable", "crate_b/unstable"]
         );
     }
+
+    #[test]
+    fn qualified_selector_rejects_an_unknown_package_feature() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compiler-features");
+        let root = fixture.join("c");
+        let metadata = ambient_metadata(&root).expect("load fixture metadata");
+        let packages = metadata.workspace_packages();
+        let cli = FastCli::parse_from(["rot", "--features", "b/nonexistent"]);
+        let selectors = cli
+            .features
+            .iter()
+            .map(|value| FeatureSelector::parse(value).unwrap())
+            .collect::<Vec<_>>();
+        let platforms = CargoPlatforms {
+            host: "test-host".to_owned(),
+            host_cfg: Vec::new(),
+            target: "test-target".to_owned(),
+            target_cfg: Vec::new(),
+        };
+
+        let error =
+            resolve_workspace_features(&packages, &cli, &selectors, &[], &[root], &platforms)
+                .expect_err("selector should be rejected")
+                .to_string();
+
+        assert!(
+            error.contains("does not match a reachable workspace package feature"),
+            "unexpected error: {error}"
+        );
+    }
 }
