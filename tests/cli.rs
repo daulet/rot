@@ -1135,6 +1135,39 @@ fn baseline_compares_staged_unstaged_and_untracked_rust_metrics() {
 }
 
 #[test]
+fn baseline_bytes_appear_on_summary_and_files_but_not_role_buckets() {
+    let (directory, baseline) = temporary_git_workspace();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        "pub fn answer() -> usize { 42 }\n",
+    )
+    .unwrap();
+
+    let report = run_path_json(directory.path(), &["--baseline", &baseline]);
+
+    assert!(
+        report["summary"]["bytes"]["after"].is_u64(),
+        "summary metrics must carry a project-wide byte delta: {report:#}"
+    );
+    let files = report["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    for file in files {
+        assert!(
+            file["metrics"]["bytes"]["after"].is_u64(),
+            "per-file metrics must carry a byte delta: {file:#}"
+        );
+    }
+    let buckets = report["buckets"].as_array().unwrap();
+    assert!(!buckets.is_empty());
+    for bucket in buckets {
+        assert!(
+            bucket.get("bytes").is_none(),
+            "role buckets must not report a byte delta: {bucket:#}"
+        );
+    }
+}
+
+#[test]
 fn human_baseline_rows_explain_and_rank_non_code_only_changes() {
     let (directory, _) = temporary_git_workspace();
     let comment_path = directory.path().join("src/comment.rs");

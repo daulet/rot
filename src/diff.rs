@@ -76,35 +76,48 @@ source_metric_changes! {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct BucketMetricChanges {
+    pub files: Change,
+    #[serde(flatten)]
+    pub source: SourceMetricChanges,
+}
+
+impl BucketMetricChanges {
+    fn between(before: MetricValues, after: MetricValues) -> Self {
+        Self {
+            files: Change::new(before.files, after.files),
+            source: SourceMetricChanges::between(before, after),
+        }
+    }
+}
+
+deref_field!(BucketMetricChanges => SourceMetricChanges, source);
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MetricChanges {
     pub files: Change,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<Change>,
+    pub bytes: Change,
     #[serde(flatten)]
     pub source: SourceMetricChanges,
 }
 
 impl MetricChanges {
-    fn between(before: MetricValues, after: MetricValues, include_bytes: bool) -> Self {
+    fn between(before: MetricValues, after: MetricValues) -> Self {
         Self {
             files: Change::new(before.files, after.files),
-            bytes: include_bytes.then(|| Change::new(before.bytes, after.bytes)),
+            bytes: Change::new(before.bytes, after.bytes),
             source: SourceMetricChanges::between(before, after),
         }
     }
 
     fn changed(&self) -> bool {
-        self.files.changed() || self.bytes.is_some_and(Change::changed) || self.source.changed()
-    }
-
-    pub fn bytes(&self) -> Change {
-        self.bytes.expect("bytes are present outside role metrics")
+        self.files.changed() || self.bytes.changed() || self.source.changed()
     }
 
     pub fn entries(&self) -> [(&'static str, Change); 11] {
         [
             ("Files", self.files),
-            ("Bytes", self.bytes()),
+            ("Bytes", self.bytes),
             ("Lines", self.physical),
             ("Code", self.code),
             ("Comments", self.comments),
@@ -124,7 +137,7 @@ deref_field!(MetricChanges => SourceMetricChanges, source);
 pub struct RoleChanges {
     pub role: OutputRole,
     #[serde(flatten)]
-    pub metrics: MetricChanges,
+    pub metrics: BucketMetricChanges,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -289,7 +302,7 @@ pub fn compare(cli: &FastCli, baseline_ref: &str) -> Result<Comparison> {
         let after = current_files.get(&path).copied();
         let before_metrics = before.map_or_else(MetricValues::default, MetricValues::file);
         let after_metrics = after.map_or_else(MetricValues::default, MetricValues::file);
-        let metric_changes = MetricChanges::between(before_metrics, after_metrics, true);
+        let metric_changes = MetricChanges::between(before_metrics, after_metrics);
         let production_code = Change::new(
             before_metrics.production_code,
             after_metrics.production_code,
@@ -334,17 +347,15 @@ pub fn compare(cli: &FastCli, baseline_ref: &str) -> Result<Comparison> {
         .into_iter()
         .map(|role| RoleChanges {
             role,
-            metrics: MetricChanges::between(
+            metrics: BucketMetricChanges::between(
                 MetricValues::bucket(role.bucket(&baseline.buckets)),
                 MetricValues::bucket(role.bucket(&current.buckets)),
-                false,
             ),
         })
         .collect();
     let summary = MetricChanges::between(
         MetricValues::report(&baseline),
         MetricValues::report(&current),
-        true,
     );
 
     Ok(Comparison {
