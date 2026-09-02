@@ -23,7 +23,7 @@ use crate::{
     model::{
         CompilerInvocationReport, CompilerReport, Diagnostic, DiagnosticSeverity, SemanticStatus,
     },
-    workspace::Inventory,
+    workspace::AuditInventory,
 };
 
 use self::{
@@ -56,7 +56,7 @@ pub struct Outcome {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn collect(cli: &AuditCli, inventory: &Inventory) -> Outcome {
+pub fn collect(cli: &AuditCli, inventory: &AuditInventory) -> Outcome {
     if inventory.packages.is_empty() {
         return unavailable(
             inventory,
@@ -83,7 +83,7 @@ pub fn collect(cli: &AuditCli, inventory: &Inventory) -> Outcome {
 
 fn try_collect(
     cli: &AuditCli,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     compiler_profile: &profile::CompilerProfile,
 ) -> Result<Outcome> {
     if !cli.cfg.is_empty() && !environment::custom_cfg_environment_is_safe() {
@@ -126,7 +126,7 @@ struct CollectedRun {
 
 fn run_once(
     cli: &AuditCli,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     compiler_profile: &profile::CompilerProfile,
     driver: &Path,
     disable_ordinary_wrapper: bool,
@@ -139,10 +139,7 @@ fn run_once(
         &inventory.root,
         driver,
         cli,
-        inventory
-            .audit_target
-            .as_deref()
-            .unwrap_or("unknown-target"),
+        &inventory.audit_target,
         &selected_manifest_dirs,
     )?;
     if disable_ordinary_wrapper {
@@ -164,7 +161,7 @@ fn run_once(
     })
 }
 
-fn selected_manifest_dirs(inventory: &Inventory) -> Result<std::ffi::OsString> {
+fn selected_manifest_dirs(inventory: &AuditInventory) -> Result<std::ffi::OsString> {
     const MAX_SELECTED_MANIFEST_DIRS: usize = 4096;
 
     let selected = inventory.selected_package_ids();
@@ -237,7 +234,7 @@ fn handshake(environment: &CompilerEnvironment, driver: &Path) -> Result<Handsha
 
 fn build_outcome(
     cli: &AuditCli,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     mut run: CollectedRun,
     retried_without_wrapper: bool,
 ) -> Outcome {
@@ -407,7 +404,7 @@ fn build_outcome(
 
 fn invocation_report(
     cli: &AuditCli,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     correlated: &CorrelatedInvocation,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> CompilerInvocationReport {
@@ -516,7 +513,7 @@ fn aggregate_status(
 
 fn invocation_issues(
     cli: &AuditCli,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     correlated: &CorrelatedInvocation,
 ) -> Vec<String> {
     let invocation = &correlated.invocation;
@@ -544,12 +541,9 @@ fn invocation_issues(
         let expected = if host_only {
             &profile.host_triple
         } else {
-            inventory
-                .audit_target
-                .as_deref()
-                .unwrap_or("unknown-target")
+            &inventory.audit_target
         };
-        if profile.target_triple != expected {
+        if profile.target_triple != *expected {
             issues.push(format!(
                 "rustc target mismatch: expected {expected}, observed {}",
                 profile.target_triple
@@ -749,7 +743,7 @@ fn append_issue(current: &mut Option<String>, issue: &str) {
     }
 }
 
-fn unavailable(inventory: &Inventory, reason: String) -> Outcome {
+fn unavailable(inventory: &AuditInventory, reason: String) -> Outcome {
     let compiler = &inventory.selected_compiler().identity;
     Outcome {
         report: CompilerReport {

@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::{
     model::CompilerSourceSpanReport,
-    workspace::{Inventory, PackageInfo},
+    workspace::{AuditInventory, PackageInfo},
 };
 
 use super::{closed_world::GraphInvocation, generated_source_label};
@@ -138,7 +138,7 @@ struct BindingSlot {
 
 pub(super) fn aggregate(
     root: &Path,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     invocations: &[GraphInvocation<'_>],
 ) -> Result<ApiSurfaceReport, String> {
     let packages = inventory

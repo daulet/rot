@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::Metadata;
 use serde::Deserialize;
 
-use crate::{cli::AuditCli, workspace::Inventory};
+use crate::{cli::AuditCli, workspace::AuditInventory};
 
 use super::environment;
 
@@ -52,12 +52,9 @@ impl CompilerProfile {
     }
 }
 
-pub(super) fn resolve(cli: &AuditCli, inventory: &Inventory) -> Result<CompilerProfile> {
+pub(super) fn resolve(cli: &AuditCli, inventory: &AuditInventory) -> Result<CompilerProfile> {
     environment::reject_compiler_overrides(cli, &inventory.root)?;
-    let target = inventory
-        .audit_target
-        .as_deref()
-        .context("audit target was not resolved")?;
+    let target = &inventory.audit_target;
     let expected_units = load_unit_graph(cli, &inventory.root, target)?;
     Ok(CompilerProfile { expected_units })
 }

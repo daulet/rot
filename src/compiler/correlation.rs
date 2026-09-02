@@ -11,7 +11,7 @@ use crate::{
         sidecar::Invocation,
     },
     model::CompilerTargetReport,
-    workspace::{Inventory, PackageInfo, PackageTargetInfo},
+    workspace::{AuditInventory, PackageInfo, PackageTargetInfo},
 };
 
 pub struct CorrelatedInvocation {
@@ -33,7 +33,7 @@ pub struct Correlation {
 pub fn correlate(
     mut invocations: Vec<Invocation>,
     cargo: &CargoRun,
-    inventory: &Inventory,
+    inventory: &AuditInventory,
     compiler_profile: &CompilerProfile,
 ) -> Correlation {
     let selected = inventory.selected_package_ids();

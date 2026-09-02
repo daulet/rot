@@ -16,7 +16,7 @@ use crate::{
     },
     paths::{canonical_or_original, portable},
     source::{LocalFile, analyze_file, reachability_states},
-    workspace::{Inventory, inventory},
+    workspace::{FastInventory, inventory},
 };
 
 pub fn analyze(cli: &FastCli) -> Result<Report> {
@@ -78,9 +78,10 @@ pub fn analyze(cli: &FastCli) -> Result<Report> {
                 }
                 Err(error) => {
                     if inventory.should_report(&path) {
+                        let display_path = inventory.display_path(&path);
                         inventory.diagnostics.push(Diagnostic {
                             severity: DiagnosticSeverity::Error,
-                            path: Some(inventory.display_path(&path)),
+                            path: Some(display_path),
                             message: format!("cannot read source: {error}"),
                         });
                     }
@@ -100,7 +101,7 @@ pub fn analyze(cli: &FastCli) -> Result<Report> {
 }
 
 fn classify_module_graph(
-    inventory: &Inventory,
+    inventory: &FastInventory,
     files: &BTreeMap<PathBuf, LocalFile>,
     path_indices: &HashMap<PathBuf, usize>,
 ) -> Vec<Contexts> {
@@ -165,7 +166,7 @@ fn propagate(
 }
 
 fn build_report(
-    mut inventory: Inventory,
+    mut inventory: FastInventory,
     files: BTreeMap<PathBuf, LocalFile>,
     contexts: Vec<Contexts>,
     selection: SelectionReport,
@@ -254,7 +255,7 @@ fn build_report(
     }
 }
 
-fn selection_report(inventory: &Inventory, cli: &FastCli) -> SelectionReport {
+fn selection_report(inventory: &FastInventory, cli: &FastCli) -> SelectionReport {
     SelectionReport::new(
         inventory
             .requested

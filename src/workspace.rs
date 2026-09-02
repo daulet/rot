@@ -52,23 +52,31 @@ pub struct TargetSeed {
     pub contexts: Contexts,
 }
 
+/// Inventory produced for the fast, source-only analysis path (`rot`).
 #[derive(Debug)]
-pub struct Inventory {
+pub struct FastInventory {
     pub root: PathBuf,
     pub requested: Vec<PathBuf>,
+    pub packages: Vec<PackageInfo>,
+    pub diagnostics: Vec<Diagnostic>,
     pub sources: Vec<PathBuf>,
     reportable_sources: BTreeSet<PathBuf>,
-    pub packages: Vec<PackageInfo>,
     pub targets: Vec<TargetSeed>,
     pub cfg_true: HashSet<String>,
     pub cfg_false: HashSet<String>,
     pub cfg_closed_world: HashSet<String>,
     pub profile: ProfileReport,
-    #[cfg(feature = "audit")]
-    pub audit_target: Option<String>,
-    #[cfg(feature = "audit")]
-    selected_compiler: Option<SelectedCompiler>,
-    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Inventory produced for the compiler-backed audit path (`rot-audit`).
+#[cfg(feature = "audit")]
+#[derive(Debug)]
+pub struct AuditInventory {
+    pub root: PathBuf,
+    pub requested: Vec<PathBuf>,
+    pub packages: Vec<PackageInfo>,
+    pub audit_target: String,
+    selected_compiler: SelectedCompiler,
 }
 
 struct PackageBuild {
@@ -175,7 +183,7 @@ struct RustcCfg {
     cargo_platforms: CargoPlatforms,
 }
 
-impl Inventory {
+impl FastInventory {
     pub fn package_for(&self, path: &Path) -> Option<&PackageInfo> {
         self.packages
             .iter()
@@ -190,8 +198,10 @@ impl Inventory {
     pub fn should_report(&self, path: &Path) -> bool {
         requested_contains(&self.requested, path) && self.reportable_sources.contains(path)
     }
+}
 
-    #[cfg(feature = "audit")]
+#[cfg(feature = "audit")]
+impl AuditInventory {
     pub fn selected_package_ids(&self) -> HashSet<String> {
         self.packages
             .iter()
@@ -200,15 +210,12 @@ impl Inventory {
             .collect()
     }
 
-    #[cfg(feature = "audit")]
     pub(crate) fn selected_compiler(&self) -> &SelectedCompiler {
-        self.selected_compiler
-            .as_ref()
-            .expect("audit inventory carries its selected compiler")
+        &self.selected_compiler
     }
 }
 
-pub fn inventory(cli: &FastCli) -> Result<Inventory> {
+pub fn inventory(cli: &FastCli) -> Result<FastInventory> {
     if cli.threads == Some(0) {
         bail!("--threads must be greater than zero");
     }
@@ -281,27 +288,23 @@ pub fn inventory(cli: &FastCli) -> Result<Inventory> {
         synthetic,
     };
 
-    Ok(Inventory {
+    Ok(FastInventory {
         root,
         requested,
+        packages,
+        diagnostics,
         sources: sources.into_iter().collect(),
         reportable_sources,
-        packages,
         targets,
         cfg_true,
         cfg_false,
         cfg_closed_world,
         profile,
-        #[cfg(feature = "audit")]
-        audit_target: None,
-        #[cfg(feature = "audit")]
-        selected_compiler: None,
-        diagnostics,
     })
 }
 
 #[cfg(feature = "audit")]
-pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<Inventory> {
+pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<AuditInventory> {
     let requested = cli
         .paths
         .iter()
@@ -326,37 +329,13 @@ pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<Inventory> {
 
     let packages = audit_packages(&metadata);
     let target = crate::compiler::effective_target(cli, &root)?;
-    let feature_mode = cli.feature_mode(false);
-    let profile = ProfileReport {
-        target: target.clone(),
-        rustc: cli.toolchain.clone(),
-        cfg_preset: "cargo",
-        cfg_resolution: "cargo_unit_graph",
-        feature_mode,
-        feature_resolution: "cargo_unit_graph",
-        enabled_features: BTreeMap::new(),
-        excluded_features: Vec::new(),
-        active_cfg: Vec::new(),
-        forced_cfg: sorted(cli.cfg.iter().map(|value| normalize_predicate(value))),
-        forced_unset_cfg: Vec::new(),
-        additional_test_attributes: Vec::new(),
-        synthetic: false,
-    };
 
-    Ok(Inventory {
+    Ok(AuditInventory {
         root,
         requested,
-        sources: Vec::new(),
-        reportable_sources: BTreeSet::new(),
         packages,
-        targets: Vec::new(),
-        cfg_true: HashSet::new(),
-        cfg_false: HashSet::new(),
-        cfg_closed_world: HashSet::new(),
-        profile,
-        audit_target: Some(target),
-        selected_compiler: Some(selected_compiler),
-        diagnostics: Vec::new(),
+        audit_target: target,
+        selected_compiler,
     })
 }
 

@@ -246,17 +246,14 @@ fn collect_snapshot(cli: &AuditCli) -> Result<AuditSnapshot> {
     let root = inventory.root.to_string_lossy().into_owned();
     let profile = AuditProfile {
         toolchain: cli.toolchain.clone(),
-        target: inventory
-            .audit_target
-            .clone()
-            .unwrap_or_else(|| "unknown-target".to_owned()),
+        target: inventory.audit_target.clone(),
         feature_mode: cli.feature_mode(false),
         requested_features: cli.features.clone(),
         all_features: cli.all_features,
         no_default_features: cli.no_default_features,
         forced_cfg: cli.cfg.clone(),
     };
-    let mut diagnostics = inventory.diagnostics.clone();
+    let mut diagnostics = Vec::new();
     let outcome = compiler::collect(cli, &inventory);
     diagnostics.extend(outcome.diagnostics);
     sort_diagnostics(&mut diagnostics);
