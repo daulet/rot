@@ -89,12 +89,12 @@ impl LocalFile {
 }
 
 pub fn analyze_file(
-    path: PathBuf,
+    path: &Path,
     edition: Edition,
     profile: &CfgProfile,
     features: Option<&PackageFeatures>,
 ) -> Result<LocalFile, std::io::Error> {
-    let bytes = fs::read(&path)?;
+    let bytes = fs::read(path)?;
     let Ok(source) = std::str::from_utf8(&bytes) else {
         return Ok(LocalFile::invalid_utf8(&bytes));
     };
@@ -102,10 +102,15 @@ pub fn analyze_file(
     let parse = SourceFile::parse(source, edition);
     let syntax_errors = parse.errors().iter().map(ToString::to_string).collect();
     let tree = parse.tree();
+    // `Parse` frees its green tree on a shared helper thread whose default
+    // stack overflows on deeply nested source. Release the handle now so that
+    // `tree` is the last owner and the recursive free runs on this worker,
+    // whose stack is sized for it.
+    drop(parse);
     let root = tree.syntax();
     let mut lines = vec![LocalLine::default(); line_index.starts.len()];
     collect_tokens(root, &line_index, &mut lines, profile, features);
-    let semantics = collect_semantics(&path, root, profile, features);
+    let semantics = collect_semantics(path, root, profile, features);
 
     Ok(LocalFile {
         bytes: bytes.len() as u64,
@@ -651,26 +656,16 @@ pub fn reachability_states() -> impl Iterator<Item = Reachability> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::collections::HashSet;
 
     use super::*;
 
-    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
     fn analyze(source: &str) -> LocalFile {
-        let directory = std::env::temp_dir().join(format!(
-            "rot-source-test-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir_all(&directory).expect("create fixture directory");
-        let path = directory.join("fixture.rs");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("fixture.rs");
         fs::write(&path, source).expect("write fixture");
         analyze_file(
-            path,
+            &path,
             Edition::CURRENT,
             &CfgProfile::new(HashSet::new(), HashSet::new(), HashSet::new(), &[]),
             Some(&PackageFeatures::default()),

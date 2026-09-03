@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::Metadata;
 use serde::Deserialize;
 
-use crate::{cli::AuditCli, workspace::AuditInventory};
+use super::inventory::AuditInventory;
+use crate::cli::AuditCli;
 
 use super::environment;
 
@@ -177,14 +178,14 @@ fn append_profile_options(command: &mut Command, cli: &AuditCli) {
     if cli.offline {
         command.arg("--offline");
     }
-    if cli.all_features {
+    if cli.cargo.all_features {
         command.arg("--all-features");
     } else {
-        if cli.no_default_features {
+        if cli.cargo.no_default_features {
             command.arg("--no-default-features");
         }
-        if !cli.features.is_empty() {
-            command.arg("--features").arg(cli.features.join(","));
+        if !cli.cargo.features.is_empty() {
+            command.arg("--features").arg(cli.cargo.features.join(","));
         }
     }
 }

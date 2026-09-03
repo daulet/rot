@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::{
-    analyze,
+    analyze::Analyzer,
     cli::FastCli,
     model::{
         BucketReport, Diagnostic, FileReport, OutputRole, ProfileReport, Report, SelectionReport,
@@ -91,8 +91,6 @@ impl BucketMetricChanges {
     }
 }
 
-deref_field!(BucketMetricChanges => SourceMetricChanges, source);
-
 #[derive(Clone, Debug, Serialize)]
 pub struct MetricChanges {
     pub files: Change,
@@ -115,23 +113,22 @@ impl MetricChanges {
     }
 
     pub fn entries(&self) -> [(&'static str, Change); 11] {
+        let source = &self.source;
         [
             ("Files", self.files),
             ("Bytes", self.bytes),
-            ("Lines", self.physical),
-            ("Code", self.code),
-            ("Comments", self.comments),
-            ("Docs", self.docs),
-            ("Blank", self.blank),
-            ("Lexical", self.lexical_complexity),
-            ("Cyclomatic", self.cyclomatic_authored),
-            ("Cognitive", self.cognitive_authored),
-            ("Declared pub", self.declared_public),
+            ("Lines", source.physical),
+            ("Code", source.code),
+            ("Comments", source.comments),
+            ("Docs", source.docs),
+            ("Blank", source.blank),
+            ("Lexical", source.lexical_complexity),
+            ("Cyclomatic", source.cyclomatic_authored),
+            ("Cognitive", source.cognitive_authored),
+            ("Declared pub", source.declared_public),
         ]
     }
 }
-
-deref_field!(MetricChanges => SourceMetricChanges, source);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RoleChanges {
@@ -234,8 +231,6 @@ pub struct MetricValues {
     pub other_code: u64,
 }
 
-deref_field!(MetricValues => SourceMetrics, source);
-
 impl MetricValues {
     fn report(report: &Report) -> Self {
         Self {
@@ -274,18 +269,17 @@ impl MetricValues {
 
 pub fn compare(cli: &FastCli, baseline_ref: &str) -> Result<Comparison> {
     validate_baseline_ref(baseline_ref)?;
-    let repository = Repository::discover(&cli.paths)?;
-    let selection = repository.selection(&cli.paths, cli.hidden, !cli.no_ignore)?;
+    let repository = Repository::discover(&cli.cargo.paths)?;
+    let selection = repository.selection(&cli.cargo.paths, cli.hidden, !cli.no_ignore)?;
     let baseline_commit = repository.resolve_commit(baseline_ref)?;
     let current_commit = repository.head_commit()?;
     let dirty = repository.dirty()?;
     let checkout = repository.materialize(&baseline_commit)?;
-    let baseline_paths = repository.baseline_paths(&cli.paths, checkout.root())?;
-    let mut current = analyze::analyze(cli)?;
-    let mut baseline_cli = cli.clone();
-    baseline_cli.cargo.paths = baseline_paths;
-    baseline_cli.baseline = None;
-    let mut baseline = analyze::analyze(&baseline_cli)
+    let baseline_paths = repository.baseline_paths(&cli.cargo.paths, checkout.root())?;
+    let analyzer = Analyzer::new(cli)?;
+    let mut current = analyzer.analyze(&cli.cargo.paths)?;
+    let mut baseline = analyzer
+        .analyze(&baseline_paths)
         .with_context(|| format!("cannot analyze baseline {baseline_ref:?}"))?;
 
     normalize_diagnostics(&mut baseline, checkout.root(), repository.root());
@@ -431,7 +425,7 @@ fn normalize_diagnostics(report: &mut Report, physical_root: &Path, logical_root
 
 fn file_role_code(file: &FileReport, role: OutputRole) -> u64 {
     role.bucket(&file.buckets)
-        .map_or(0, |bucket| bucket.lines.code)
+        .map_or(0, |bucket| bucket.source.lines.code)
 }
 
 #[cfg(test)]

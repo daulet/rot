@@ -67,7 +67,8 @@ rot . --target aarch64-unknown-linux-gnu --release
 ```
 
 Positional `PATH` arguments select input; `--files` only changes table detail.
-Each selected directory is its own ignore boundary. Use `--hidden` or
+Each selected directory is its own ignore boundary, and nested Git repositories
+such as submodules are skipped unless selected themselves. Use `--hidden` or
 `--no-ignore` to broaden discovery. JSON goes to stdout and diagnostics go to
 stderr.
 

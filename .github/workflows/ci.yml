@@ -30,13 +30,24 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install selected audit toolchain
-        run: rustup toolchain install "$AUDIT_RUST_VERSION" --profile minimal
+        run: >-
+          rustup toolchain install "$AUDIT_RUST_VERSION"
+          --profile minimal
+          --component rustc-dev
+          --component rust-src
+          --component llvm-tools-preview
+
+      - name: Build the pinned rustc driver for the audit contract tests
+        working-directory: compiler/rot-rustc-driver
+        run: rustup run "$AUDIT_RUST_VERSION" cargo build --locked
 
       - name: Format
         run: cargo fmt --all --check
 
-      - name: Test all targets and features
-        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Test all targets and features, including driver-backed audit tests
+        run: >-
+          cargo test --workspace --all-targets --all-features --locked
+          -- --include-ignored
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -89,6 +100,11 @@ jobs:
           --component rustc-dev
           --component rust-src
           --component llvm-tools-preview
+          --component rustfmt
+
+      - name: Format driver
+        working-directory: compiler/rot-rustc-driver
+        run: rustup run "$AUDIT_RUST_VERSION" cargo fmt --check
 
       - name: Test driver
         working-directory: compiler/rot-rustc-driver

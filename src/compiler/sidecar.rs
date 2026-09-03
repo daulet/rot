@@ -8,12 +8,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
     Definition, DefinitionKind, Diagnostic, Event, Handshake, InvocationFinished, InvocationId,
-    InvocationStarted, MAX_SIDECAR_BYTES, PROTOCOL_VERSION, Product, ProductStatus, Profile,
-    PublicBinding, Record, Reference, Root, RunId, SourceFile,
+    InvocationStarted, MAX_RECORD_BYTES, MAX_SIDECAR_BYTES, PROTOCOL_VERSION, Product,
+    ProductStatus, Profile, PublicBinding, Record, Reference, Root, RunId, SourceFile,
 };
 
 const MAX_SIDECARS: usize = 10_000;
-const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Invocation {

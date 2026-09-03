@@ -157,24 +157,6 @@ pub fn run(command: &mut Command) -> Result<CargoRun> {
     })
 }
 
-impl CargoArtifact {
-    pub fn role(&self) -> &'static str {
-        if self.target_kinds.iter().any(|kind| kind == "test") {
-            "test"
-        } else if self.target_kinds.iter().any(|kind| kind == "bench") {
-            "bench"
-        } else if self.profile_test {
-            "unit_test"
-        } else if self.target_kinds.iter().any(|kind| kind == "example") {
-            "example"
-        } else if self.target_kinds.iter().any(|kind| kind == "custom-build") {
-            "build"
-        } else {
-            "production"
-        }
-    }
-}
-
 fn target_kinds(kinds: &[TargetKind]) -> Vec<String> {
     kinds.iter().map(ToString::to_string).collect()
 }
@@ -183,7 +165,7 @@ fn crate_types(types: &[cargo_metadata::CrateType]) -> Vec<String> {
     sorted(types.iter().map(ToString::to_string).collect())
 }
 
-fn sorted(mut values: Vec<String>) -> Vec<String> {
+pub(super) fn sorted(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values

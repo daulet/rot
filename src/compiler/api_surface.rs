@@ -4,16 +4,19 @@ use std::{
 };
 
 use rot_compiler_protocol::{
-    Definition, DefinitionKind, ExpansionOrigin, Exposure, Namespace, PublicBinding, SourceSpan,
-};
-use serde::Serialize;
-
-use crate::{
-    model::CompilerSourceSpanReport,
-    workspace::{AuditInventory, PackageInfo},
+    CompilationContext, Definition, DefinitionKind, Exposure, Namespace, PublicBinding,
 };
 
-use super::{closed_world::GraphInvocation, generated_source_label};
+use super::{
+    closed_world::GraphInvocation,
+    definition_kind, expansion_origin,
+    inventory::{AuditInventory, AuditPackage},
+    source_span,
+};
+use crate::model::{
+    ApiBindingReport, ApiChangeReport, ApiDefinitionReport, ApiDiffReport, ApiDiffSummary,
+    ApiSurfaceReport, ApiUnitReport, CompiledRole, CompilerSourceSpanReport,
+};
 
 const SCOPE: &str = "selected production library and proc-macro public-name topology";
 const LIMITATIONS: [&str; 3] = [
@@ -21,88 +24,6 @@ const LIMITATIONS: [&str; 3] = [
     "unnamed implementation and opaque-type identities are excluded",
     "external consumers, doctests, and inactive required-feature targets are outside the selected compiled graph",
 ];
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-pub(crate) struct ApiUnitReport {
-    pub package: String,
-    pub package_path: String,
-    pub target: String,
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ApiDefinitionReport {
-    pub unit: ApiUnitReport,
-    pub definition_path: String,
-    pub kind: String,
-    pub expansion_origin: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span: Option<CompilerSourceSpanReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attribution_callsite: Option<CompilerSourceSpanReport>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ApiBindingReport {
-    pub unit: ApiUnitReport,
-    pub parent_definition_path: String,
-    pub name: String,
-    pub namespace: String,
-    pub resolved_target_path: String,
-    pub exposure: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span: Option<CompilerSourceSpanReport>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ApiSurfaceReport {
-    pub scope: String,
-    pub limitations: Vec<String>,
-    pub units: Vec<ApiUnitReport>,
-    pub definitions: Vec<ApiDefinitionReport>,
-    pub bindings: Vec<ApiBindingReport>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ApiDiffSummary {
-    pub added_definitions: u64,
-    pub removed_definitions: u64,
-    pub added_bindings: u64,
-    pub removed_bindings: u64,
-    pub retargeted_bindings: u64,
-    pub total_changes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "change", rename_all = "snake_case")]
-pub(crate) enum ApiChangeReport {
-    DefinitionAdded {
-        definition: ApiDefinitionReport,
-    },
-    DefinitionRemoved {
-        definition: ApiDefinitionReport,
-    },
-    BindingAdded {
-        binding: ApiBindingReport,
-    },
-    BindingRemoved {
-        binding: ApiBindingReport,
-    },
-    BindingRetargeted {
-        unit: ApiUnitReport,
-        parent_definition_path: String,
-        name: String,
-        namespace: String,
-        before_target_path: String,
-        after_target_path: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct ApiDiffReport {
-    pub summary: ApiDiffSummary,
-    pub changes: Vec<ApiChangeReport>,
-}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ApiUnitKey {
@@ -309,9 +230,9 @@ pub(crate) fn compare(before: &ApiSurfaceReport, after: &ApiSurfaceReport) -> Ap
 fn api_unit(
     root: &Path,
     input: &GraphInvocation<'_>,
-    packages: &BTreeMap<String, &PackageInfo>,
+    packages: &BTreeMap<String, &AuditPackage>,
 ) -> Result<Option<ApiUnitReport>, String> {
-    if input.target.role != "production" {
+    if input.target.role != CompiledRole::Production {
         return Ok(None);
     }
     let proc_macro = input.target.kinds.iter().any(|kind| kind == "proc-macro");
@@ -321,7 +242,7 @@ fn api_unit(
             "lib" | "rlib" | "dylib" | "cdylib" | "staticlib"
         )
     });
-    if !proc_macro && (!library || input.target.compilation_context != "target") {
+    if !proc_macro && (!library || input.target.compilation_context != CompilationContext::Target) {
         return Ok(None);
     }
     let package = packages.get(&input.target.package_id).ok_or_else(|| {
@@ -546,78 +467,6 @@ fn change_sort_key(change: &ApiChangeReport) -> (u8, &ApiUnitReport, &str, &str,
     }
 }
 
-fn source_span(
-    root: &Path,
-    input: &GraphInvocation<'_>,
-    span: &SourceSpan,
-) -> Option<CompilerSourceSpanReport> {
-    let source = input
-        .invocation
-        .sources
-        .iter()
-        .find(|source| source.key == span.file)?;
-    if span.start > span.end || span.end > source.byte_len {
-        return None;
-    }
-    let local_path = Path::new(source.local_path.as_deref()?);
-    let path = if source.generated {
-        generated_source_label(input.owner, local_path, &source.source_hash)
-    } else {
-        local_path
-            .strip_prefix(root)
-            .unwrap_or(local_path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    };
-    Some(CompilerSourceSpanReport {
-        path,
-        source_hash: source.source_hash.clone(),
-        generated: source.generated,
-        start_byte: u64::from(span.start),
-        end_byte: u64::from(span.end),
-        line: u64::from(span.line),
-        column: u64::from(span.column),
-    })
-}
-
-fn definition_kind(kind: DefinitionKind) -> &'static str {
-    match kind {
-        DefinitionKind::Crate => "crate",
-        DefinitionKind::Module => "module",
-        DefinitionKind::Struct => "struct",
-        DefinitionKind::Union => "union",
-        DefinitionKind::Enum => "enum",
-        DefinitionKind::Variant => "variant",
-        DefinitionKind::Trait => "trait",
-        DefinitionKind::TypeAlias => "type_alias",
-        DefinitionKind::ForeignType => "foreign_type",
-        DefinitionKind::TraitAlias => "trait_alias",
-        DefinitionKind::AssociatedType => "associated_type",
-        DefinitionKind::Function => "function",
-        DefinitionKind::Constant => "constant",
-        DefinitionKind::Static => "static",
-        DefinitionKind::Constructor => "constructor",
-        DefinitionKind::AssociatedFunction => "associated_function",
-        DefinitionKind::AssociatedConstant => "associated_constant",
-        DefinitionKind::Macro => "macro",
-        DefinitionKind::ExternCrate => "extern_crate",
-        DefinitionKind::Import => "import",
-        DefinitionKind::ForeignModule => "foreign_module",
-        DefinitionKind::OpaqueType => "opaque_type",
-        DefinitionKind::Field => "field",
-        DefinitionKind::Implementation => "implementation",
-    }
-}
-
-fn expansion_origin(origin: ExpansionOrigin) -> &'static str {
-    match origin {
-        ExpansionOrigin::Authored => "authored",
-        ExpansionOrigin::BuiltinDesugaring => "builtin_desugaring",
-        ExpansionOrigin::LocalMacro => "local_macro",
-        ExpansionOrigin::ExternalMacro => "external_macro",
-    }
-}
-
 fn namespace(namespace: Namespace) -> &'static str {
     match namespace {
         Namespace::Type => "type",
@@ -640,7 +489,7 @@ fn exposure(exposure: Exposure) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rot_compiler_protocol::{CompilerDefId, FactId, NominalVisibility};
+    use rot_compiler_protocol::{CompilerDefId, ExpansionOrigin, FactId, NominalVisibility};
 
     fn unit() -> ApiUnitReport {
         ApiUnitReport {

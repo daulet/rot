@@ -3,6 +3,7 @@ mod cargo;
 mod closed_world;
 mod correlation;
 mod environment;
+mod inventory;
 mod profile;
 mod sidecar;
 mod support;
@@ -15,40 +16,31 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rot_compiler_protocol::{
-    Availability, CfgValue, DRIVER_VERSION, HANDSHAKE_ARG, Handshake, PROTOCOL_VERSION, Product,
+    Availability, CfgValue, DRIVER_VERSION, DefinitionKind, ExpansionOrigin, HANDSHAKE_ARG,
+    Handshake, MAX_SELECTED_MANIFEST_DIRS, PROTOCOL_VERSION, Product, SourceSpan,
 };
 
 use crate::{
     cli::AuditCli,
     model::{
-        CompilerInvocationReport, CompilerReport, Diagnostic, DiagnosticSeverity, SemanticStatus,
+        CompiledRole, CompilerInvocationReport, CompilerReport, CompilerSourceSpanReport,
+        Diagnostic, DiagnosticSeverity, SemanticStatus,
     },
-    workspace::AuditInventory,
+    paths::canonical_or_original,
 };
 
 use self::{
     cargo::CargoRun,
-    correlation::{CorrelatedInvocation, Correlation, compilation_context_name},
+    closed_world::GraphInvocation,
+    correlation::{CorrelatedInvocation, Correlation},
     environment::CompilerEnvironment,
     sidecar::Invocation,
 };
 
-pub(crate) use environment::SelectedCompiler;
-
-pub(crate) fn compiler_metadata(
-    cli: &AuditCli,
-    workspace: &Path,
-    no_dependencies: bool,
-) -> Result<cargo_metadata::Metadata> {
-    profile::load_metadata(cli, workspace, no_dependencies)
-}
+pub(crate) use inventory::{AuditInventory, audit_inventory};
 
 pub(crate) fn effective_target(cli: &AuditCli, workspace: &Path) -> Result<String> {
     environment::effective_target(cli, workspace)
-}
-
-pub(crate) fn selected_compiler(cli: &AuditCli, workspace: &Path) -> Result<SelectedCompiler> {
-    environment::selected_compiler(cli, workspace)
 }
 
 pub struct Outcome {
@@ -86,7 +78,7 @@ fn try_collect(
     inventory: &AuditInventory,
     compiler_profile: &profile::CompilerProfile,
 ) -> Result<Outcome> {
-    if !cli.cfg.is_empty() && !environment::custom_cfg_environment_is_safe() {
+    if !cli.cargo.cfg.is_empty() && !environment::custom_cfg_environment_is_safe() {
         bail!("custom --cfg cannot be composed with configured rustflag environment variables");
     }
 
@@ -132,7 +124,7 @@ fn run_once(
     disable_ordinary_wrapper: bool,
 ) -> Result<CollectedRun> {
     let environment =
-        CompilerEnvironment::discover(cli, &inventory.root, inventory.selected_compiler())?;
+        CompilerEnvironment::discover(cli, &inventory.root, &inventory.selected_compiler)?;
     let handshake = handshake(&environment, driver)?;
     let selected_manifest_dirs = selected_manifest_dirs(inventory)?;
     let mut command = environment.cargo_command(
@@ -162,8 +154,6 @@ fn run_once(
 }
 
 fn selected_manifest_dirs(inventory: &AuditInventory) -> Result<std::ffi::OsString> {
-    const MAX_SELECTED_MANIFEST_DIRS: usize = 4096;
-
     let selected = inventory.selected_package_ids();
     let mut directories = inventory
         .packages
@@ -450,8 +440,7 @@ fn invocation_report(
             || invocation.started.target_triple.clone(),
             |profile| profile.target_triple.clone(),
         ),
-        compilation_context: compilation_context_name(invocation.started.compilation_context)
-            .to_owned(),
+        compilation_context: invocation.started.compilation_context,
         test: invocation.started.test_mode,
         features: profile.map_or_else(
             || correlated.cargo_features.clone().unwrap_or_default(),
@@ -552,7 +541,7 @@ fn invocation_issues(
     }
     if !host_only {
         let observed_cfg = profile.map_or_else(Vec::new, |profile| render_cfg(&profile.cfg));
-        for requested in cli.cfg.iter().map(|value| normalize_cfg(value)) {
+        for requested in cli.cargo.cfg.iter().map(|value| normalize_cfg(value)) {
             if !observed_cfg.iter().any(|observed| observed == &requested) {
                 issues.push(format!(
                     "requested cfg {requested:?} was not observed by rustc"
@@ -614,7 +603,7 @@ fn availability(value: Availability) -> SemanticStatus {
     }
 }
 
-pub(super) fn generated_source_label(owner: &str, path: &Path, source_hash: &str) -> String {
+fn generated_source_label(owner: &str, path: &Path, source_hash: &str) -> String {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -622,6 +611,80 @@ pub(super) fn generated_source_label(owner: &str, path: &Path, source_hash: &str
     let (algorithm, digest) = source_hash.split_once('=').unwrap_or(("hash", source_hash));
     let digest = digest.chars().take(16).collect::<String>();
     format!("<generated>/{owner}/{algorithm}-{digest}/{filename}")
+}
+
+/// Projects a compiler span onto the report: workspace-relative paths for
+/// authored sources and a stable generated-source label otherwise.
+fn source_span(
+    root: &Path,
+    input: &GraphInvocation<'_>,
+    span: &SourceSpan,
+) -> Option<CompilerSourceSpanReport> {
+    let source = input
+        .invocation
+        .sources
+        .iter()
+        .find(|source| source.key == span.file)?;
+    if span.start > span.end || span.end > source.byte_len {
+        return None;
+    }
+    let local_path = Path::new(source.local_path.as_deref()?);
+    let path = if source.generated {
+        generated_source_label(input.owner, local_path, &source.source_hash)
+    } else {
+        local_path
+            .strip_prefix(root)
+            .unwrap_or(local_path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    Some(CompilerSourceSpanReport {
+        path,
+        source_hash: source.source_hash.clone(),
+        generated: source.generated,
+        start_byte: u64::from(span.start),
+        end_byte: u64::from(span.end),
+        line: u64::from(span.line),
+        column: u64::from(span.column),
+    })
+}
+
+fn definition_kind(kind: DefinitionKind) -> &'static str {
+    match kind {
+        DefinitionKind::Crate => "crate",
+        DefinitionKind::Module => "module",
+        DefinitionKind::Struct => "struct",
+        DefinitionKind::Union => "union",
+        DefinitionKind::Enum => "enum",
+        DefinitionKind::Variant => "variant",
+        DefinitionKind::Trait => "trait",
+        DefinitionKind::TypeAlias => "type_alias",
+        DefinitionKind::ForeignType => "foreign_type",
+        DefinitionKind::TraitAlias => "trait_alias",
+        DefinitionKind::AssociatedType => "associated_type",
+        DefinitionKind::Function => "function",
+        DefinitionKind::Constant => "constant",
+        DefinitionKind::Static => "static",
+        DefinitionKind::Constructor => "constructor",
+        DefinitionKind::AssociatedFunction => "associated_function",
+        DefinitionKind::AssociatedConstant => "associated_constant",
+        DefinitionKind::Macro => "macro",
+        DefinitionKind::ExternCrate => "extern_crate",
+        DefinitionKind::Import => "import",
+        DefinitionKind::ForeignModule => "foreign_module",
+        DefinitionKind::OpaqueType => "opaque_type",
+        DefinitionKind::Field => "field",
+        DefinitionKind::Implementation => "implementation",
+    }
+}
+
+fn expansion_origin(origin: ExpansionOrigin) -> &'static str {
+    match origin {
+        ExpansionOrigin::Authored => "authored",
+        ExpansionOrigin::BuiltinDesugaring => "builtin_desugaring",
+        ExpansionOrigin::LocalMacro => "local_macro",
+        ExpansionOrigin::ExternalMacro => "external_macro",
+    }
 }
 
 fn render_cfg(values: &[CfgValue]) -> Vec<String> {
@@ -664,14 +727,14 @@ fn apply_build_script_cfg_issues(run: &mut CollectedRun) -> Vec<String> {
         outputs
             .entry(output.package_id.clone())
             .or_default()
-            .push((canonical_or_owned(&output.out_dir), output.cfg.clone()));
+            .push((canonical_or_original(&output.out_dir), output.cfg.clone()));
     }
     let mut issues = Vec::new();
     for invocation in &mut run.correlation.invocations {
         let Some(target) = invocation
             .target
             .as_ref()
-            .filter(|target| target.role != "build")
+            .filter(|target| target.role != CompiledRole::Build)
         else {
             continue;
         };
@@ -684,7 +747,7 @@ fn apply_build_script_cfg_issues(run: &mut CollectedRun) -> Vec<String> {
             .build_script_out_dir
             .as_deref()
             .map(Path::new)
-            .map(canonical_or_owned)
+            .map(canonical_or_original)
         else {
             let issue = format!(
                 "compiler invocation {} omitted Cargo build-script OUT_DIR for {}",
@@ -729,10 +792,6 @@ fn apply_build_script_cfg_issues(run: &mut CollectedRun) -> Vec<String> {
     issues
 }
 
-fn canonical_or_owned(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 fn append_issue(current: &mut Option<String>, issue: &str) {
     match current {
         Some(current) => {
@@ -744,7 +803,7 @@ fn append_issue(current: &mut Option<String>, issue: &str) {
 }
 
 fn unavailable(inventory: &AuditInventory, reason: String) -> Outcome {
-    let compiler = &inventory.selected_compiler().identity;
+    let compiler = &inventory.selected_compiler.identity;
     Outcome {
         report: CompilerReport {
             protocol_version: PROTOCOL_VERSION,

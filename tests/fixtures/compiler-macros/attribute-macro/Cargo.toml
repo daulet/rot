@@ -1,7 +1,0 @@
-[package]
-name = "rot-attribute-fixture"
-version = "0.0.0"
-edition = "2024"
-
-[lib]
-proc-macro = true

@@ -110,25 +110,25 @@ impl CompilerEnvironment {
         if cli.offline {
             command.arg("--offline");
         }
-        if cli.all_features {
+        if cli.cargo.all_features {
             command.arg("--all-features");
         } else {
-            if cli.no_default_features {
+            if cli.cargo.no_default_features {
                 command.arg("--no-default-features");
             }
-            if !cli.features.is_empty() {
-                command.arg("--features").arg(cli.features.join(","));
+            if !cli.cargo.features.is_empty() {
+                command.arg("--features").arg(cli.cargo.features.join(","));
             }
         }
-        if !cli.cfg.is_empty() {
+        if !cli.cargo.cfg.is_empty() {
             if cargo_target_rustflags_configured(cli, workspace)? {
                 bail!(
                     "custom --cfg cannot be composed safely with Cargo target-specific rustflags"
                 );
             }
             let mut flags = configured_build_rustflags(cli, workspace)?;
-            flags.reserve(cli.cfg.len() * 2);
-            for predicate in &cli.cfg {
+            flags.reserve(cli.cargo.cfg.len() * 2);
+            for predicate in &cli.cargo.cfg {
                 flags.push("--cfg".to_owned());
                 flags.push(predicate.clone());
             }
@@ -184,7 +184,7 @@ pub(super) fn selected_compiler(cli: &AuditCli, workspace: &Path) -> Result<Sele
 }
 
 pub(super) fn effective_target(cli: &AuditCli, workspace: &Path) -> Result<String> {
-    if let Some(target) = &cli.target {
+    if let Some(target) = &cli.cargo.target {
         return Ok(target.clone());
     }
     if let Some(target) = cargo_config_json(cli, workspace, "build.target")? {

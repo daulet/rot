@@ -71,7 +71,6 @@ impl CargoSelection {
                   Counts Rust only; Markdown and other files are ignored.",
     after_help = include_str!("fast-help.txt")
 )]
-#[derive(Clone)]
 pub struct FastCli {
     #[command(flatten)]
     pub cargo: CargoSelection,
@@ -120,8 +119,6 @@ pub struct FastCli {
     #[arg(long, help_heading = "DISCOVERY")]
     pub no_ignore: bool,
 }
-
-deref_field!(FastCli => CargoSelection, cargo);
 
 #[cfg(feature = "audit")]
 #[derive(Clone, Debug, Parser)]
@@ -277,6 +274,3 @@ impl FromStr for ExplainLocation {
         })
     }
 }
-
-#[cfg(feature = "audit")]
-deref_field!(AuditCli => CargoSelection, cargo);

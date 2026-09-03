@@ -371,7 +371,7 @@ fn impact_query_explains_compiled_consumers_and_visibility() {
     ));
     let impact = &report["impact"];
     assert_eq!(impact["status"], "complete", "{impact:#}");
-    assert_eq!(impact["visibility_disposition"], "narrowable_public");
+    assert_eq!(impact["visibility_disposition"], "unnecessary_public");
     assert_eq!(
         impact["selected"]["definition_path"],
         "reachable_public_helper"

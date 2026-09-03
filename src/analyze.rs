@@ -3,9 +3,9 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ra_ap_syntax::Edition;
-use rayon::{ThreadPoolBuilder, prelude::*};
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
 use crate::{
     cfg::CfgProfile,
@@ -16,88 +16,113 @@ use crate::{
     },
     paths::{canonical_or_original, portable},
     source::{LocalFile, analyze_file, reachability_states},
-    workspace::{FastInventory, inventory},
+    workspace::{FastInventory, RustcCfg, inventory, rustc_cfg},
 };
 
-pub fn analyze(cli: &FastCli) -> Result<Report> {
-    let mut inventory = inventory(cli)?;
-    let cfg_profile = CfgProfile::new(
-        inventory.cfg_true.clone(),
-        inventory.cfg_false.clone(),
-        inventory.cfg_closed_world.clone(),
-        &cli.test_attribute,
-    );
-    let workers = cli
-        .threads
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .thread_name(|index| format!("rot-{index}"))
-        .build()
-        .context("cannot create analysis worker pool")?;
+/// Parsing and the semantic walk both recurse once per nesting level, and the
+/// default 2 MiB thread stack overflows near 2,000 nested blocks. Reserving a
+/// large stack costs address space only and covers roughly 100,000 levels.
+const WORKER_STACK_BYTES: usize = 256 << 20;
 
-    let mut pending = inventory.sources.iter().cloned().collect::<BTreeSet<_>>();
-    let mut files = BTreeMap::new();
-    while !pending.is_empty() {
-        let batch = std::mem::take(&mut pending)
-            .into_iter()
-            .filter(|path| !files.contains_key(path))
-            .map(|path| {
-                let package = inventory.package_for(&path);
-                let edition = package
-                    .and_then(|package| package.edition.parse::<Edition>().ok())
-                    .unwrap_or(Edition::CURRENT);
-                (
-                    path,
-                    edition,
-                    package.map(|package| package.features.clone()),
-                )
-            })
-            .collect::<Vec<_>>();
-        let analyzed = pool.install(|| {
-            batch
-                .into_par_iter()
-                .map(|(path, edition, features)| {
-                    let result =
-                        analyze_file(path.clone(), edition, &cfg_profile, features.as_ref());
-                    (path, result)
+/// Per-process analysis state: the options, the rustc cfg facts they select,
+/// the derived cfg profile, and the worker pool. Only the analyzed paths vary
+/// between runs, so one `Analyzer` serves both endpoints of a `--baseline`
+/// comparison.
+pub struct Analyzer<'a> {
+    cli: &'a FastCli,
+    pool: ThreadPool,
+    rustc: RustcCfg,
+    cfg_profile: CfgProfile,
+}
+
+impl<'a> Analyzer<'a> {
+    pub fn new(cli: &'a FastCli) -> Result<Self> {
+        let workers = match cli.threads {
+            Some(0) => bail!("--threads must be greater than zero"),
+            Some(workers) => workers,
+            None => std::thread::available_parallelism().map_or(1, usize::from),
+        };
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .stack_size(WORKER_STACK_BYTES)
+            .thread_name(|index| format!("rot-{index}"))
+            .build()
+            .context("cannot create analysis worker pool")?;
+        let rustc = rustc_cfg(cli)?;
+        let cfg_profile = rustc.cfg_profile(&cli.test_attribute);
+        Ok(Self {
+            cli,
+            pool,
+            rustc,
+            cfg_profile,
+        })
+    }
+
+    pub fn analyze(&self, paths: &[PathBuf]) -> Result<Report> {
+        let mut inventory = inventory(self.cli, paths, &self.rustc)?;
+        let mut pending = inventory.sources.iter().cloned().collect::<BTreeSet<_>>();
+        let mut files = BTreeMap::new();
+        while !pending.is_empty() {
+            let batch = std::mem::take(&mut pending)
+                .into_iter()
+                .filter(|path| !files.contains_key(path))
+                .map(|path| {
+                    let package = inventory.package_for(&path);
+                    let edition = package
+                        .and_then(|package| package.edition.parse::<Edition>().ok())
+                        .unwrap_or(Edition::CURRENT);
+                    (
+                        path,
+                        edition,
+                        package.map(|package| package.features.clone()),
+                    )
                 })
-                .collect::<Vec<_>>()
-        });
+                .collect::<Vec<_>>();
+            let analyzed = self.pool.install(|| {
+                batch
+                    .into_par_iter()
+                    .map(|(path, edition, features)| {
+                        let result =
+                            analyze_file(&path, edition, &self.cfg_profile, features.as_ref());
+                        (path, result)
+                    })
+                    .collect::<Vec<_>>()
+            });
 
-        for (path, result) in analyzed {
-            match result {
-                Ok(file) => {
-                    for edge in &file.edges {
-                        let target = canonical_or_original(&edge.target);
-                        if !files.contains_key(&target) {
-                            pending.insert(target);
+            for (path, result) in analyzed {
+                match result {
+                    Ok(file) => {
+                        for edge in &file.edges {
+                            let target = canonical_or_original(&edge.target);
+                            if !files.contains_key(&target) {
+                                pending.insert(target);
+                            }
                         }
+                        files.insert(path, file);
                     }
-                    files.insert(path, file);
-                }
-                Err(error) => {
-                    if inventory.should_report(&path) {
-                        let display_path = inventory.display_path(&path);
-                        inventory.diagnostics.push(Diagnostic {
-                            severity: DiagnosticSeverity::Error,
-                            path: Some(display_path),
-                            message: format!("cannot read source: {error}"),
-                        });
+                    Err(error) => {
+                        if inventory.should_report(&path) {
+                            let display_path = inventory.display_path(&path);
+                            inventory.diagnostics.push(Diagnostic {
+                                severity: DiagnosticSeverity::Error,
+                                path: Some(display_path),
+                                message: format!("cannot read source: {error}"),
+                            });
+                        }
                     }
                 }
             }
         }
-    }
 
-    let path_indices = files
-        .keys()
-        .enumerate()
-        .map(|(index, path)| (path.clone(), index))
-        .collect::<HashMap<_, _>>();
-    let contexts = classify_module_graph(&inventory, &files, &path_indices);
-    let selection = selection_report(&inventory, cli);
-    Ok(build_report(inventory, files, contexts, selection))
+        let path_indices = files
+            .keys()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let contexts = classify_module_graph(&inventory, &files, &path_indices);
+        let selection = selection_report(&inventory, self.cli);
+        Ok(build_report(inventory, files, contexts, selection))
+    }
 }
 
 fn classify_module_graph(

@@ -11,7 +11,7 @@ use cargo_platform::{Cfg, Platform};
 use ignore::WalkBuilder;
 
 use crate::{
-    cfg::PackageFeatures,
+    cfg::{CfgProfile, PackageFeatures},
     cli::FastCli,
     model::{
         Activation, Contexts, Diagnostic, DiagnosticSeverity, ProfileReport, Reachability,
@@ -20,30 +20,12 @@ use crate::{
     paths::{canonical_or_original, containing_directory, portable},
 };
 
-#[cfg(feature = "audit")]
-use crate::compiler::SelectedCompiler;
-#[cfg(feature = "audit")]
-use cargo_metadata::PackageId;
-
 #[derive(Clone, Debug)]
 pub struct PackageInfo {
-    #[cfg(feature = "audit")]
-    pub id: PackageId,
     pub name: String,
     pub root: PathBuf,
     pub edition: String,
     pub features: PackageFeatures,
-    #[cfg(feature = "audit")]
-    pub targets: Vec<PackageTargetInfo>,
-}
-
-#[cfg(feature = "audit")]
-#[derive(Clone, Debug)]
-pub struct PackageTargetInfo {
-    pub name: String,
-    pub kinds: Vec<String>,
-    pub crate_types: Vec<String>,
-    pub source: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -62,21 +44,7 @@ pub struct FastInventory {
     pub sources: Vec<PathBuf>,
     reportable_sources: BTreeSet<PathBuf>,
     pub targets: Vec<TargetSeed>,
-    pub cfg_true: HashSet<String>,
-    pub cfg_false: HashSet<String>,
-    pub cfg_closed_world: HashSet<String>,
     pub profile: ProfileReport,
-}
-
-/// Inventory produced for the compiler-backed audit path (`rot-audit`).
-#[cfg(feature = "audit")]
-#[derive(Debug)]
-pub struct AuditInventory {
-    pub root: PathBuf,
-    pub requested: Vec<PathBuf>,
-    pub packages: Vec<PackageInfo>,
-    pub audit_target: String,
-    selected_compiler: SelectedCompiler,
 }
 
 struct PackageBuild {
@@ -174,13 +142,26 @@ impl FeatureState {
     }
 }
 
-struct RustcCfg {
+/// The selected rustc's identity and cfg facts for the requested target and
+/// preset, with the caller's forced predicates applied.
+pub(crate) struct RustcCfg {
     known_true: HashSet<String>,
     known_false: HashSet<String>,
     closed_world_names: HashSet<String>,
     version: String,
     preset: &'static str,
     cargo_platforms: CargoPlatforms,
+}
+
+impl RustcCfg {
+    pub(crate) fn cfg_profile(&self, test_attributes: &[String]) -> CfgProfile {
+        CfgProfile::new(
+            self.known_true.clone(),
+            self.known_false.clone(),
+            self.closed_world_names.clone(),
+            test_attributes,
+        )
+    }
 }
 
 impl FastInventory {
@@ -200,28 +181,8 @@ impl FastInventory {
     }
 }
 
-#[cfg(feature = "audit")]
-impl AuditInventory {
-    pub fn selected_package_ids(&self) -> HashSet<String> {
-        self.packages
-            .iter()
-            .filter(|package| root_selected(&package.root, &self.requested))
-            .map(|package| package.id.to_string())
-            .collect()
-    }
-
-    pub(crate) fn selected_compiler(&self) -> &SelectedCompiler {
-        &self.selected_compiler
-    }
-}
-
-pub fn inventory(cli: &FastCli) -> Result<FastInventory> {
-    if cli.threads == Some(0) {
-        bail!("--threads must be greater than zero");
-    }
-
-    let requested = cli
-        .paths
+pub fn inventory(cli: &FastCli, paths: &[PathBuf], rustc: &RustcCfg) -> Result<FastInventory> {
+    let requested = paths
         .iter()
         .map(|path| {
             fs::canonicalize(path)
@@ -232,25 +193,19 @@ pub fn inventory(cli: &FastCli) -> Result<FastInventory> {
     let mut diagnostics = Vec::new();
     let metadata = load_metadata(&requested, &mut diagnostics)?;
     if metadata.is_none()
-        && (cli.all_features
-            || cli.no_default_features
-            || !cli.features.is_empty()
+        && (cli.cargo.all_features
+            || cli.cargo.no_default_features
+            || !cli.cargo.features.is_empty()
             || !cli.exclude_feature.is_empty())
     {
         bail!("Cargo feature options require a Cargo workspace or package");
     }
-    let rustc_cfg = rustc_cfg(cli)?;
-    let feature_mode = cli.feature_mode(!cli.exclude_feature.is_empty());
+    let feature_mode = cli.cargo.feature_mode(!cli.exclude_feature.is_empty());
     let PackageBuild {
         packages,
         targets,
         enabled_features,
-    } = build_packages(
-        metadata.as_ref(),
-        cli,
-        &requested,
-        &rustc_cfg.cargo_platforms,
-    )?;
+    } = build_packages(metadata.as_ref(), cli, &requested, &rustc.cargo_platforms)?;
     let synthetic = !cli.exclude_feature.is_empty() || !cli.unset_cfg.is_empty();
     let reportable_sources = discover_sources(&requested, cli)?;
     let mut sources = reportable_sources.clone();
@@ -260,18 +215,10 @@ pub fn inventory(cli: &FastCli) -> Result<FastInventory> {
         }
     }
 
-    let RustcCfg {
-        known_true: cfg_true,
-        known_false: cfg_false,
-        closed_world_names: cfg_closed_world,
-        version: rustc,
-        preset: cfg_preset,
-        cargo_platforms: CargoPlatforms { target, .. },
-    } = rustc_cfg;
     let profile = ProfileReport {
-        target,
-        rustc,
-        cfg_preset,
+        target: rustc.cargo_platforms.target.clone(),
+        rustc: rustc.version.clone(),
+        cfg_preset: rustc.preset,
         cfg_resolution: "requested_target_global",
         feature_mode,
         feature_resolution: "workspace_package_union",
@@ -281,8 +228,8 @@ pub fn inventory(cli: &FastCli) -> Result<FastInventory> {
                 .iter()
                 .map(|value| value.trim().to_owned()),
         ),
-        active_cfg: sorted(cfg_true.iter().cloned()),
-        forced_cfg: sorted(cli.cfg.iter().map(|value| normalize_predicate(value))),
+        active_cfg: sorted(rustc.known_true.iter().cloned()),
+        forced_cfg: sorted(cli.cargo.cfg.iter().map(|value| normalize_predicate(value))),
         forced_unset_cfg: sorted(cli.unset_cfg.iter().map(|value| normalize_predicate(value))),
         additional_test_attributes: sorted(cli.test_attribute.iter().cloned()),
         synthetic,
@@ -296,75 +243,8 @@ pub fn inventory(cli: &FastCli) -> Result<FastInventory> {
         sources: sources.into_iter().collect(),
         reportable_sources,
         targets,
-        cfg_true,
-        cfg_false,
-        cfg_closed_world,
         profile,
     })
-}
-
-#[cfg(feature = "audit")]
-pub fn audit_inventory(cli: &crate::cli::AuditCli) -> Result<AuditInventory> {
-    let requested = cli
-        .paths
-        .iter()
-        .map(|path| {
-            fs::canonicalize(path)
-                .with_context(|| format!("cannot resolve input path {}", path.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let first = requested.first().context("at least one path is required")?;
-    let current_dir = containing_directory(first);
-    let selected_compiler = crate::compiler::selected_compiler(cli, current_dir)?;
-    let metadata = crate::compiler::compiler_metadata(cli, current_dir, false)?;
-    let root = fs::canonicalize(metadata.workspace_root.as_std_path())
-        .unwrap_or_else(|_| metadata.workspace_root.as_std_path().to_path_buf());
-    if let Some(outside) = requested.iter().find(|path| !path.starts_with(&root)) {
-        bail!(
-            "cannot mix Cargo workspace {} with outside path {}; run rot-audit once per workspace",
-            root.display(),
-            outside.display(),
-        );
-    }
-
-    let packages = audit_packages(&metadata);
-    let target = crate::compiler::effective_target(cli, &root)?;
-
-    Ok(AuditInventory {
-        root,
-        requested,
-        packages,
-        audit_target: target,
-        selected_compiler,
-    })
-}
-
-#[cfg(feature = "audit")]
-fn audit_packages(metadata: &Metadata) -> Vec<PackageInfo> {
-    metadata
-        .workspace_packages()
-        .into_iter()
-        .map(|package| {
-            let manifest = package.manifest_path.as_std_path();
-            PackageInfo {
-                id: package.id.clone(),
-                name: package.name.to_string(),
-                root: manifest.parent().unwrap_or(manifest).to_path_buf(),
-                edition: package.edition.to_string(),
-                features: PackageFeatures::default(),
-                targets: package
-                    .targets
-                    .iter()
-                    .map(|target| PackageTargetInfo {
-                        name: target.name.clone(),
-                        kinds: target.kind.iter().map(ToString::to_string).collect(),
-                        crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
-                        source: target.src_path.as_std_path().to_path_buf(),
-                    })
-                    .collect(),
-            }
-        })
-        .collect()
 }
 
 fn load_metadata(
@@ -458,6 +338,7 @@ fn build_packages(
 
     let workspace_packages = metadata.workspace_packages();
     let selectors = cli
+        .cargo
         .features
         .iter()
         .map(|selector| FeatureSelector::parse(selector))
@@ -508,23 +389,10 @@ fn build_packages(
             });
         }
         packages.push(PackageInfo {
-            #[cfg(feature = "audit")]
-            id: package.id.clone(),
             name: package.name.to_string(),
             root,
             edition: package.edition.to_string(),
             features,
-            #[cfg(feature = "audit")]
-            targets: package
-                .targets
-                .iter()
-                .map(|target| PackageTargetInfo {
-                    name: target.name.clone(),
-                    kinds: target.kind.iter().map(ToString::to_string).collect(),
-                    crate_types: target.crate_types.iter().map(ToString::to_string).collect(),
-                    source: target.src_path.as_std_path().to_path_buf(),
-                })
-                .collect(),
         });
     }
 
@@ -710,11 +578,11 @@ fn resolve_workspace_features(
             for context in &selected_contexts[index] {
                 states[index].context_mut(*context).active = true;
             }
-            if cli.all_features {
+            if cli.cargo.all_features {
                 states[index]
                     .enabled
                     .extend(package.features.keys().cloned());
-            } else if !cli.no_default_features && package.features.contains_key("default") {
+            } else if !cli.cargo.no_default_features && package.features.contains_key("default") {
                 states[index].enabled.insert("default".to_owned());
             }
             states[index].enabled.extend(
@@ -1003,7 +871,7 @@ fn dependency_reachability(
     visited
 }
 
-fn root_selected(root: &Path, requested: &[PathBuf]) -> bool {
+pub(crate) fn root_selected(root: &Path, requested: &[PathBuf]) -> bool {
     requested
         .iter()
         .any(|input| input.starts_with(root) || input.is_dir() && root.starts_with(input))
@@ -1107,7 +975,11 @@ fn discover_sources(requested: &[PathBuf], cli: &FastCli) -> Result<BTreeSet<Pat
 
     // A positional directory is an explicit discovery boundary. WalkBuilder
     // never filters its depth-zero root, while `parents(false)` prevents
-    // ignore files above that root from affecting its descendants.
+    // ignore files above that root from affecting its descendants. A nested
+    // Git repository (a submodule or an embedded checkout) is another
+    // project: it is skipped unless selected as its own PATH, which keeps a
+    // `--baseline` comparison symmetric because a committed tree only records
+    // the submodule pointer, never its files.
     for walk_root in requested.iter().filter(|input| input.is_dir()) {
         let mut builder = WalkBuilder::new(walk_root);
         builder
@@ -1119,7 +991,9 @@ fn discover_sources(requested: &[PathBuf], cli: &FastCli) -> Result<BTreeSet<Pat
             .git_global(!cli.no_ignore)
             .git_exclude(!cli.no_ignore)
             .follow_links(false)
-            .filter_entry(|entry| entry.file_name() != ".git");
+            .filter_entry(|entry| {
+                entry.file_name() != ".git" && !(entry.depth() > 0 && is_nested_repository(entry))
+            });
         for entry in builder.build() {
             let entry = entry.with_context(|| format!("cannot walk {}", walk_root.display()))?;
             if entry.file_type().is_some_and(|kind| kind.is_file())
@@ -1137,8 +1011,13 @@ fn discover_sources(requested: &[PathBuf], cli: &FastCli) -> Result<BTreeSet<Pat
     Ok(sources)
 }
 
-fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
+fn is_nested_repository(entry: &ignore::DirEntry) -> bool {
+    entry.file_type().is_some_and(|kind| kind.is_dir()) && entry.path().join(".git").exists()
+}
+
+pub(crate) fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
     let forced_true = cli
+        .cargo
         .cfg
         .iter()
         .map(|value| normalize_predicate(value))
@@ -1163,7 +1042,7 @@ fn rustc_cfg(cli: &FastCli) -> Result<RustcCfg> {
         .find_map(|line| line.strip_prefix("host: "))
         .unwrap_or("unknown-host")
         .to_owned();
-    let target = cli.target.clone().unwrap_or_else(|| host.clone());
+    let target = cli.cargo.target.clone().unwrap_or_else(|| host.clone());
     let (preset, debug_assertions) = if cli.release {
         ("release", "debug-assertions=no")
     } else {
@@ -1317,6 +1196,7 @@ mod tests {
             "strong_dependency_feature",
         ]);
         let selectors = cli
+            .cargo
             .features
             .iter()
             .map(|value| FeatureSelector::parse(value).unwrap())
@@ -1358,7 +1238,7 @@ mod tests {
     fn all_features_with_exclusions_has_an_explicit_mode() {
         let cli = FastCli::parse_from(["rot", "--all-features", "--exclude-feature", "unstable"]);
 
-        assert_eq!(cli.feature_mode(true), "all_except");
+        assert_eq!(cli.cargo.feature_mode(true), "all_except");
         assert_eq!(
             sorted(
                 ["crate_b/unstable", " crate_a/unstable ", "crate_b/unstable"]
@@ -1377,6 +1257,7 @@ mod tests {
         let packages = metadata.workspace_packages();
         let cli = FastCli::parse_from(["rot", "--features", "b/nonexistent"]);
         let selectors = cli
+            .cargo
             .features
             .iter()
             .map(|value| FeatureSelector::parse(value).unwrap())

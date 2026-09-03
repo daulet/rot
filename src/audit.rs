@@ -10,21 +10,15 @@ use serde::Serialize;
 
 use crate::{
     cli::{AuditCli, OutputFormat},
-    compiler::{
-        self,
-        api_surface::{
-            self, ApiBindingReport, ApiChangeReport, ApiDefinitionReport, ApiDiffReport,
-            ApiSurfaceReport, ApiUnitReport,
-        },
-    },
+    compiler::{self, api_surface},
     model::{
-        CompilerReport, Diagnostic, DiagnosticSeverity, ImpactDefinitionReport,
-        ImpactProvenanceClass, ImpactReport, ImpactVisibilityDisposition, SelectedPathReport,
-        SemanticStatus,
+        ApiBindingReport, ApiChangeReport, ApiDefinitionReport, ApiDiffReport, ApiSurfaceReport,
+        ApiUnitReport, CompilerReport, Diagnostic, DiagnosticSeverity, ImpactDefinitionReport,
+        ImpactProvenanceClass, ImpactReport, SelectedPathReport, SemanticStatus,
     },
     paths::{containing_directory, portable},
+    report::{is_broken_pipe, short_commit, write_json},
     revision::{Repository, WorkingState, validate_baseline_ref},
-    workspace,
 };
 
 const AUDIT_SCHEMA_VERSION: u32 = 3;
@@ -58,8 +52,10 @@ struct AuditProfile {
     forced_cfg: Vec<String>,
 }
 
+/// The protocol, driver, and exact rustc identity an endpoint was audited
+/// with; distinct from the protocol crate's rustc-only `CompilerIdentity`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct CompilerIdentity {
+struct CompilerIdentityReport {
     protocol_version: u32,
     driver_version: String,
     rustc_version: String,
@@ -68,7 +64,7 @@ struct CompilerIdentity {
     rustc_host: String,
 }
 
-impl From<&CompilerReport> for CompilerIdentity {
+impl From<&CompilerReport> for CompilerIdentityReport {
     fn from(report: &CompilerReport) -> Self {
         Self {
             protocol_version: report.protocol_version,
@@ -114,7 +110,7 @@ struct ComparisonEndpoint {
     status: SemanticStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
-    compiler: CompilerIdentity,
+    compiler: CompilerIdentityReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_surface: Option<ApiSurfaceReport>,
     diagnostics: Vec<Diagnostic>,
@@ -131,22 +127,12 @@ struct ComparisonContext {
 
 pub fn run(cli: AuditCli) -> ExitCode {
     match execute(&cli) {
-        Ok(complete) => {
-            if complete {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(error) => {
-            if !is_broken_pipe(&error) {
-                eprintln!("rot-audit: error: {error:#}");
-            }
-            if is_broken_pipe(&error) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
+            eprintln!("rot-audit: error: {error:#}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -161,6 +147,7 @@ fn execute(cli: &AuditCli) -> Result<bool> {
 fn execute_snapshot(cli: &AuditCli) -> Result<bool> {
     let snapshot = collect_snapshot(cli)?;
     let status = snapshot.report.status;
+    let mut stdout = io::stdout().lock();
     match cli.format {
         OutputFormat::Json => {
             let output = SnapshotOutput {
@@ -171,11 +158,14 @@ fn execute_snapshot(cli: &AuditCli) -> Result<bool> {
                 evidence: &snapshot.report,
                 diagnostics: &snapshot.diagnostics,
             };
-            write_json(&output)?;
+            write_json(&mut stdout, &output, "audit JSON")?;
         }
-        OutputFormat::Table => {
-            render_snapshot_table(&snapshot.report, status, snapshot.report.reason.as_deref())?
-        }
+        OutputFormat::Table => render_snapshot_table(
+            &mut stdout,
+            &snapshot.report,
+            status,
+            snapshot.report.reason.as_deref(),
+        )?,
     }
     render_diagnostics(&snapshot.diagnostics);
     Ok(status == SemanticStatus::Complete
@@ -188,10 +178,10 @@ fn execute_snapshot(cli: &AuditCli) -> Result<bool> {
 
 fn execute_comparison(cli: &AuditCli, baseline_ref: &str) -> Result<bool> {
     validate_baseline_ref(baseline_ref)?;
-    let repository = Repository::discover(&cli.paths)?;
+    let repository = Repository::discover(&cli.cargo.paths)?;
     let baseline_commit = repository.resolve_commit(baseline_ref)?;
     let selection = AuditSelection {
-        paths: repository.selection(&cli.paths, false, false)?.paths,
+        paths: repository.selection(&cli.cargo.paths, false, false)?.paths,
         meaning: "complete Cargo packages selected by PATH",
     };
     let driver = canonical_driver(&cli.driver)?;
@@ -200,12 +190,12 @@ fn execute_comparison(cli: &AuditCli, baseline_ref: &str) -> Result<bool> {
     let mut current_cli = cli.clone();
     current_cli.baseline = None;
     current_cli.driver = driver.clone();
-    current_cli.target = Some(target.clone());
+    current_cli.cargo.target = Some(target.clone());
 
     let checkout = repository.materialize(&baseline_commit)?;
-    let baseline_paths = repository.baseline_paths(&cli.paths, checkout.root())?;
+    let baseline_paths = repository.baseline_paths(&cli.cargo.paths, checkout.root())?;
     let mut baseline_cli = current_cli.clone();
-    baseline_cli.paths = baseline_paths;
+    baseline_cli.cargo.paths = baseline_paths;
 
     let state_before = repository.working_state()?;
     let current_snapshot = collect_snapshot(&current_cli)?;
@@ -232,9 +222,10 @@ fn execute_comparison(cli: &AuditCli, baseline_ref: &str) -> Result<bool> {
         current_snapshot,
     );
     let complete = output.status == SemanticStatus::Complete;
+    let mut stdout = io::stdout().lock();
     match cli.format {
-        OutputFormat::Json => write_json(&output)?,
-        OutputFormat::Table => render_comparison_table(&output)?,
+        OutputFormat::Json => write_json(&mut stdout, &output, "audit JSON")?,
+        OutputFormat::Table => render_comparison(&mut stdout, &output)?,
     }
     render_endpoint_diagnostics("baseline", &output.before.diagnostics);
     render_endpoint_diagnostics("working tree", &output.after.diagnostics);
@@ -242,16 +233,16 @@ fn execute_comparison(cli: &AuditCli, baseline_ref: &str) -> Result<bool> {
 }
 
 fn collect_snapshot(cli: &AuditCli) -> Result<AuditSnapshot> {
-    let inventory = workspace::audit_inventory(cli)?;
+    let inventory = compiler::audit_inventory(cli)?;
     let root = inventory.root.to_string_lossy().into_owned();
     let profile = AuditProfile {
         toolchain: cli.toolchain.clone(),
         target: inventory.audit_target.clone(),
-        feature_mode: cli.feature_mode(false),
-        requested_features: cli.features.clone(),
-        all_features: cli.all_features,
-        no_default_features: cli.no_default_features,
-        forced_cfg: cli.cfg.clone(),
+        feature_mode: cli.cargo.feature_mode(false),
+        requested_features: cli.cargo.features.clone(),
+        all_features: cli.cargo.all_features,
+        no_default_features: cli.cargo.no_default_features,
+        forced_cfg: cli.cargo.cfg.clone(),
     };
     let outcome = compiler::collect(cli, &inventory);
     let mut diagnostics = outcome.diagnostics;
@@ -269,8 +260,8 @@ fn comparison_output(
     baseline: AuditSnapshot,
     current: AuditSnapshot,
 ) -> ComparisonOutput {
-    let baseline_identity = CompilerIdentity::from(&baseline.report);
-    let current_identity = CompilerIdentity::from(&current.report);
+    let baseline_identity = CompilerIdentityReport::from(&baseline.report);
+    let current_identity = CompilerIdentityReport::from(&current.report);
     let same_compiler = baseline_identity == current_identity;
     let baseline_complete = baseline.report.status == SemanticStatus::Complete;
     let current_complete = current.report.status == SemanticStatus::Complete;
@@ -409,7 +400,11 @@ fn canonical_driver(driver: &Path) -> Result<PathBuf> {
 }
 
 fn resolve_target_once(cli: &AuditCli) -> Result<String> {
-    let first = cli.paths.first().context("at least one path is required")?;
+    let first = cli
+        .cargo
+        .paths
+        .first()
+        .context("at least one path is required")?;
     let first = fs::canonicalize(first)
         .with_context(|| format!("cannot resolve input path {}", first.display()))?;
     compiler::effective_target(cli, containing_directory(&first))
@@ -495,20 +490,12 @@ fn sort_diagnostics(diagnostics: &mut Vec<Diagnostic>) {
     diagnostics.dedup_by(|left, right| left.path == right.path && left.message == right.message);
 }
 
-fn write_json(output: &impl Serialize) -> Result<()> {
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
-    serde_json::to_writer(&mut writer, output).context("cannot serialize audit JSON")?;
-    writeln!(writer).context("cannot write audit JSON")
-}
-
 fn render_snapshot_table(
+    output: &mut impl Write,
     report: &CompilerReport,
     status: SemanticStatus,
     reason: Option<&str>,
 ) -> Result<()> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
     writeln!(
         output,
         "Compiler audit: {} ({}/{} Cargo invocations correlated)",
@@ -576,7 +563,7 @@ fn render_snapshot_table(
     }
     if let Some(impact) = &report.impact {
         writeln!(output)?;
-        render_impact(&mut output, impact)?;
+        render_impact(output, impact)?;
     }
     Ok(())
 }
@@ -615,21 +602,21 @@ fn render_impact(output: &mut impl Write, impact: &ImpactReport) -> Result<()> {
         )?;
     }
     if let Some(disposition) = impact.visibility_disposition {
-        writeln!(output, "Visibility: {}", disposition_name(disposition))?;
+        writeln!(output, "Visibility: {}", disposition.label())?;
     }
     if let Some(summary) = &impact.summary {
         let mut provenance = Vec::new();
         if summary.production {
-            provenance.push("production");
+            provenance.push(ImpactProvenanceClass::Production.label());
         }
         if summary.nonproduction {
-            provenance.push("nonproduction");
+            provenance.push(ImpactProvenanceClass::Nonproduction.label());
         }
         if summary.build_time {
-            provenance.push("build-time");
+            provenance.push(ImpactProvenanceClass::BuildTime.label());
         }
         if summary.public_interface {
-            provenance.push("public-interface");
+            provenance.push(ImpactProvenanceClass::PublicInterface.label());
         }
         let provenance = if provenance.is_empty() {
             "none".to_owned()
@@ -665,7 +652,7 @@ fn render_impact(output: &mut impl Write, impact: &ImpactReport) -> Result<()> {
                 span_location(reference.representative_span.as_ref()),
                 reference.reference_kind,
                 impact_definition_label(&reference.dependency),
-                provenance_name(reference.provenance.class),
+                reference.provenance.class.label(),
             )?;
         }
         if impact.direct_references.len() > HUMAN_DIRECT_LIMIT {
@@ -684,7 +671,7 @@ fn render_impact(output: &mut impl Write, impact: &ImpactReport) -> Result<()> {
             writeln!(
                 output,
                 "  [{}] {} ({})",
-                provenance_name(witness.provenance.class),
+                witness.provenance.class.label(),
                 impact_definition_label(&witness.root),
                 witness.root_reason,
             )?;
@@ -724,30 +711,6 @@ fn impact_definition_location(definition: &ImpactDefinitionReport) -> String {
             .as_ref()
             .or(definition.attribution_callsite.as_ref()),
     )
-}
-
-fn disposition_name(disposition: ImpactVisibilityDisposition) -> &'static str {
-    match disposition {
-        ImpactVisibilityDisposition::RequiredPublic => "required-public",
-        ImpactVisibilityDisposition::NarrowablePublic => "narrowable-public",
-        ImpactVisibilityDisposition::DeadPublic => "dead-public",
-        ImpactVisibilityDisposition::NotPublicCandidate => "not-a-public-candidate",
-    }
-}
-
-fn provenance_name(provenance: ImpactProvenanceClass) -> &'static str {
-    match provenance {
-        ImpactProvenanceClass::Production => "production",
-        ImpactProvenanceClass::Nonproduction => "nonproduction",
-        ImpactProvenanceClass::BuildTime => "build-time",
-        ImpactProvenanceClass::PublicInterface => "public-interface",
-    }
-}
-
-fn render_comparison_table(report: &ComparisonOutput) -> Result<()> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    render_comparison(&mut output, report)
 }
 
 fn render_comparison(output: &mut impl Write, report: &ComparisonOutput) -> Result<()> {
@@ -828,7 +791,7 @@ fn render_compiler_identity(output: &mut impl Write, report: &ComparisonOutput) 
     Ok(())
 }
 
-fn compiler_label(identity: &CompilerIdentity) -> String {
+fn compiler_label(identity: &CompilerIdentityReport) -> String {
     format!(
         "protocol {}, driver {}, rustc {} ({} {} for {})",
         identity.protocol_version,
@@ -970,10 +933,6 @@ fn unit_label(unit: &ApiUnitReport) -> String {
     }
 }
 
-fn short_commit(commit: &str) -> &str {
-    commit.get(..12).unwrap_or(commit)
-}
-
 fn status_name(status: SemanticStatus) -> &'static str {
     match status {
         SemanticStatus::Complete => "complete",
@@ -1009,18 +968,12 @@ fn render_diagnostic(endpoint: Option<&str>, diagnostic: &Diagnostic) {
     }
 }
 
-fn is_broken_pipe(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<io::Error>()
-        .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn identity(version: &str) -> CompilerIdentity {
-        CompilerIdentity {
+    fn identity(version: &str) -> CompilerIdentityReport {
+        CompilerIdentityReport {
             protocol_version: 1,
             driver_version: version.to_owned(),
             rustc_version: "1.98.0-nightly".to_owned(),

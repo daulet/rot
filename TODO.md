@@ -38,19 +38,18 @@ source evidence and compiler evidence.
 - [x] Help and README teach agent workflows, stdout/stderr and exit behavior,
   `--files` versus positional input, overlapping role file counts, and Rot's
   SCC-style-but-not-identical lexical metric.
-- [x] Every stable rustc release published in the 365 days through 2026-08-29
+- [x] Every stable rustc release published in the 365 days through 2026-09-01
   is supported by `rot-audit` on `aarch64-apple-darwin`: 1.90.0, 1.91.0,
   1.91.1, 1.92.0, 1.93.0, 1.93.1, 1.94.0, 1.94.1, 1.95.0, 1.96.0,
   1.96.1, 1.97.0, 1.97.1, and 1.98.0.
 
 ## Compiler compatibility evidence
 
-`compiler/supported-rustc.toml` is the exact rolling ledger. Each of its 14
-stable releases built its own rustc-private driver and passed 12 driver unit
-tests plus 16 semantic visibility fixtures: 392/392 tests. Full Cargo-backed
-audits also completed for all 14 stable identities with 4/4 correlated products
-and no diagnostics; the default development nightly passed the same full
-audit. Audit rejects an unlisted compiler identity or a mismatched driver;
+`compiler/supported-rustc.toml` is the exact rolling ledger; its `verified_on`
+date is the last time every listed stable release built its own rustc-private
+driver and passed the complete driver test suite. The verified counts live in
+[docs/rustc-backed-analysis.md](docs/rustc-backed-analysis.md) so that they are
+stated once. Audit rejects an unlisted compiler identity or a mismatched driver;
 support is never inferred from a newer compiler building older-compatible
 source.
 

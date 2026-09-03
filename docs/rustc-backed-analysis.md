@@ -66,13 +66,13 @@ intends to execute.
 Rot treats compatibility as tested evidence, not a version range. The embedded
 [`supported-rustc.toml`](../compiler/supported-rustc.toml) ledger records the
 verification date, host, Rust publication dates, and exact compiler identities.
-As of 2026-08-29, the supported stable window on
+As of 2026-09-01, the supported stable window on
 `aarch64-apple-darwin` contains all 14 releases published in the preceding 365
 days: 1.90.0, 1.91.0, 1.91.1, 1.92.0, 1.93.0, 1.93.1, 1.94.0, 1.94.1,
 1.95.0, 1.96.0, 1.96.1, 1.97.0, 1.97.1, and 1.98.0. The default development
 nightly is recorded separately.
 
-Every listed stable compiler built the driver and passed all 12 driver unit
+Every listed stable compiler built the driver and passed all 13 driver unit
 tests and all 17 semantic-graph fixtures, including finite public bindings.
 `rot-audit` rejects a selected release, commit, or host absent from the ledger.
 A rolling update therefore has three atomic steps: derive the current stable

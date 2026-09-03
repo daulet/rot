@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+#[cfg(feature = "audit")]
+use rot_compiler_protocol::CompilationContext;
 use serde::Serialize;
 
 pub const TARGET_ROLE_COUNT: usize = 5;
@@ -206,7 +208,10 @@ impl SourceMetrics {
         Self {
             lines,
             metrics,
-            declared_public: buckets.iter().map(|bucket| bucket.declared_public).sum(),
+            declared_public: buckets
+                .iter()
+                .map(|bucket| bucket.source.declared_public)
+                .sum(),
         }
     }
 
@@ -228,8 +233,6 @@ pub struct BucketReport {
     #[serde(flatten)]
     pub source: SourceMetrics,
 }
-
-deref_field!(BucketReport => SourceMetrics, source);
 
 impl BucketReport {
     pub fn add(&mut self, other: &Self) {
@@ -296,6 +299,43 @@ pub enum SemanticStatus {
     Unavailable,
 }
 
+/// How Cargo compiled a target in the audited profile. `UnitTest` is the
+/// `--test` build of a library or binary target; `Test` is an integration
+/// test target.
+#[cfg(feature = "audit")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledRole {
+    Production,
+    UnitTest,
+    Test,
+    Bench,
+    Example,
+    Build,
+}
+
+#[cfg(feature = "audit")]
+impl CompiledRole {
+    /// Cargo target kinds decide the role; `test_mode` is rustc's `--test`
+    /// build, which Cargo reports as `profile.test`.
+    pub fn from_target(kinds: &[String], test_mode: bool) -> Self {
+        let has = |kind: &str| kinds.iter().any(|candidate| candidate == kind);
+        if has("test") {
+            Self::Test
+        } else if has("bench") {
+            Self::Bench
+        } else if test_mode {
+            Self::UnitTest
+        } else if has("example") {
+            Self::Example
+        } else if has("custom-build") {
+            Self::Build
+        } else {
+            Self::Production
+        }
+    }
+}
+
 #[cfg(feature = "audit")]
 #[derive(Clone, Debug, Serialize)]
 pub struct CompilerTargetReport {
@@ -304,8 +344,8 @@ pub struct CompilerTargetReport {
     pub kinds: Vec<String>,
     pub crate_types: Vec<String>,
     pub source: String,
-    pub role: String,
-    pub compilation_context: String,
+    pub role: CompiledRole,
+    pub compilation_context: CompilationContext,
 }
 
 #[cfg(feature = "audit")]
@@ -424,14 +464,10 @@ pub struct ImpactDefinitionReport {
 }
 
 #[cfg(feature = "audit")]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImpactProvenanceClass {
-    Production,
-    Nonproduction,
-    BuildTime,
-    PublicInterface,
-}
+#[rustfmt::skip]
+labelled_enum! { pub enum ImpactProvenanceClass {
+    Production => "production", Nonproduction => "nonproduction", BuildTime => "build_time", PublicInterface => "public_interface",
+} }
 
 #[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -439,19 +475,15 @@ pub struct ImpactProvenanceReport {
     pub class: ImpactProvenanceClass,
     pub package_id: String,
     pub target_name: String,
-    pub target_role: String,
-    pub compilation_context: String,
+    pub target_role: CompiledRole,
+    pub compilation_context: CompilationContext,
 }
 
 #[cfg(feature = "audit")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImpactVisibilityDisposition {
-    RequiredPublic,
-    NarrowablePublic,
-    DeadPublic,
-    NotPublicCandidate,
-}
+#[rustfmt::skip]
+labelled_enum! { pub enum ImpactVisibilityDisposition {
+    RequiredPublic => "required_public", UnnecessaryPublic => "unnecessary_public", DeadPublic => "dead_public", NotPublicCandidate => "not_public_candidate",
+} }
 
 #[cfg(feature = "audit")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -523,7 +555,7 @@ pub struct CompilerInvocationReport {
     pub target: Option<CompilerTargetReport>,
     pub crate_name: String,
     pub target_triple: String,
-    pub compilation_context: String,
+    pub compilation_context: CompilationContext,
     pub test: bool,
     pub features: Vec<String>,
     pub cfg: Vec<String>,
@@ -557,9 +589,98 @@ pub struct CompilerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed_world: Option<ClosedWorldReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_surface: Option<crate::compiler::api_surface::ApiSurfaceReport>,
+    pub api_surface: Option<ApiSurfaceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impact: Option<ImpactReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ApiUnitReport {
+    pub package: String,
+    pub package_path: String,
+    pub target: String,
+    pub kind: String,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiDefinitionReport {
+    pub unit: ApiUnitReport,
+    pub definition_path: String,
+    pub kind: String,
+    pub expansion_origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<CompilerSourceSpanReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution_callsite: Option<CompilerSourceSpanReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiBindingReport {
+    pub unit: ApiUnitReport,
+    pub parent_definition_path: String,
+    pub name: String,
+    pub namespace: String,
+    pub resolved_target_path: String,
+    pub exposure: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<CompilerSourceSpanReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiSurfaceReport {
+    pub scope: String,
+    pub limitations: Vec<String>,
+    pub units: Vec<ApiUnitReport>,
+    pub definitions: Vec<ApiDefinitionReport>,
+    pub bindings: Vec<ApiBindingReport>,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiDiffSummary {
+    pub added_definitions: u64,
+    pub removed_definitions: u64,
+    pub added_bindings: u64,
+    pub removed_bindings: u64,
+    pub retargeted_bindings: u64,
+    pub total_changes: u64,
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum ApiChangeReport {
+    DefinitionAdded {
+        definition: ApiDefinitionReport,
+    },
+    DefinitionRemoved {
+        definition: ApiDefinitionReport,
+    },
+    BindingAdded {
+        binding: ApiBindingReport,
+    },
+    BindingRemoved {
+        binding: ApiBindingReport,
+    },
+    BindingRetargeted {
+        unit: ApiUnitReport,
+        parent_definition_path: String,
+        name: String,
+        namespace: String,
+        before_target_path: String,
+        after_target_path: String,
+    },
+}
+
+#[cfg(feature = "audit")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiDiffReport {
+    pub summary: ApiDiffSummary,
+    pub changes: Vec<ApiChangeReport>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -611,3 +732,72 @@ pub struct SelectedPathReport {
 
 #[rustfmt::skip]
 labelled_enum! { pub enum SelectedPathKind { File => "file", Directory => "directory" } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roles_resolve_in_priority_order_and_uncertain_gates_are_conditional() {
+        let production = Contexts::production();
+        assert_eq!(
+            production.classify(Reachability::BOTH),
+            OutputRole::Production
+        );
+        assert_eq!(production.classify(Reachability::TEST), OutputRole::Test);
+        assert_eq!(
+            production.classify(Reachability::NEVER),
+            OutputRole::Inactive
+        );
+        let uncertain = Reachability {
+            production: Activation::Maybe,
+            test: Activation::Never,
+        };
+        assert_eq!(production.classify(uncertain), OutputRole::Conditional);
+        assert_eq!(
+            Contexts::default().classify(Reachability::BOTH),
+            OutputRole::Orphan
+        );
+        let bench = Contexts::seed(TargetRole::Bench, Reachability::BOTH);
+        assert_eq!(bench.classify(Reachability::BOTH), OutputRole::Bench);
+    }
+
+    #[cfg(feature = "audit")]
+    #[test]
+    fn compiled_role_follows_cargo_target_kinds_then_test_mode() {
+        let kinds = |kinds: &[&str]| {
+            kinds
+                .iter()
+                .map(|kind| (*kind).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["lib"]), false),
+            CompiledRole::Production
+        );
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["lib"]), true),
+            CompiledRole::UnitTest
+        );
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["bin"]), true),
+            CompiledRole::UnitTest
+        );
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["test"]), true),
+            CompiledRole::Test
+        );
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["bench"]), false),
+            CompiledRole::Bench
+        );
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["example"]), false),
+            CompiledRole::Example
+        );
+        assert_eq!(
+            CompiledRole::from_target(&kinds(&["custom-build"]), false),
+            CompiledRole::Build
+        );
+    }
+}

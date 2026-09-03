@@ -26,10 +26,11 @@ use rot_compiler_protocol::{
     CompilerDefId, CompilerIdentity, DRIVER_VERSION, Definition, DefinitionKind, Diagnostic,
     DiagnosticPhase, DiagnosticSeverity, Event, ExpansionOrigin, Exposure, FactId, HANDSHAKE_ARG,
     Handshake, InvocationFinished, InvocationId, InvocationMergeKey, InvocationStarted,
-    MAX_SIDECAR_BYTES, Namespace, NominalVisibility, OptimizationLevel, PROTOCOL_VERSION,
-    PanicStrategy, Product, ProductStatus, Profile, PublicBinding, RUN_ID_ENV, Record, Reference,
-    ReferenceKind, Root, RootKind, RunId, SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile,
-    SourceFileKey, SourceSpan, TARGET_DIR_ENV,
+    MAX_RECORD_BYTES, MAX_SELECTED_MANIFEST_DIRS, MAX_SIDECAR_BYTES, Namespace, NominalVisibility,
+    OptimizationLevel, PROTOCOL_VERSION, PanicStrategy, Product, ProductStatus, Profile,
+    PublicBinding, RUN_ID_ENV, Record, Reference, ReferenceKind, Root, RootKind, RunId,
+    SELECTED_MANIFEST_DIRS_ENV, SIDECAR_DIR_ENV, SourceFile, SourceFileKey, SourceSpan,
+    TARGET_DIR_ENV,
 };
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::{
@@ -57,7 +58,6 @@ use rustc_structures::CrateType;
 use rustc_target::spec::PanicStrategy as RustcPanicStrategy;
 
 const TRAILER_RESERVE_BYTES: usize = 64 * 1024;
-const MAX_SELECTED_MANIFEST_DIRS: usize = 4096;
 const BUILD_RUSTC_VERSION: &str = env!("ROT_BUILD_RUSTC_VERSION");
 
 fn main() -> ExitCode {
@@ -476,7 +476,7 @@ impl Collection {
     fn collect<'tcx>(&mut self, tcx: TyCtxt<'tcx>) {
         self.analysis_reached = true;
         self.semantic_graph.start();
-        if self.records.truncated {
+        if self.records.truncation.is_some() {
             self.semantic_graph.reject();
         }
         if !self.records.push(Event::Profile(profile(tcx))) {
@@ -499,7 +499,7 @@ impl Collection {
                 self.semantic_graph.reject();
             }
         }
-        if self.records.truncated {
+        if self.records.truncation.is_some() {
             self.semantic_graph.reject();
         }
         for root in facts.roots {
@@ -515,14 +515,11 @@ impl Collection {
     }
 
     fn finish(&mut self, rustc_success: bool) {
-        if self.records.truncated {
+        if let Some(truncation) = self.records.truncation {
             self.records.push_mandatory(Event::Diagnostic(Diagnostic {
                 phase: DiagnosticPhase::Sidecar,
                 severity: DiagnosticSeverity::Warning,
-                message: format!(
-                    "compiler facts exceeded the {} byte sidecar limit",
-                    MAX_SIDECAR_BYTES
-                ),
+                message: truncation.message(),
                 span: None,
             }));
         }
@@ -548,7 +545,7 @@ impl Collection {
 fn product_message(progress: &ProductProgress) -> Option<String> {
     match (progress.started, progress.rejected) {
         (false, _) => Some("rustc did not reach after_analysis".to_owned()),
-        (true, true) => Some("compiler facts were truncated by the sidecar limit".to_owned()),
+        (true, true) => Some("compiler facts were truncated".to_owned()),
         (true, false) => None,
     }
 }
@@ -791,10 +788,9 @@ impl<'roots, 'tcx> ReferenceVisitor<'roots, 'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'_, 'tcx> {
-    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, hir_id: rustc_hir::HirId) {
+    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _hir_id: rustc_hir::HirId) {
         self.record(path.res, path.span);
         intravisit::walk_path(self, path);
-        let _ = hir_id;
     }
 
     fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
@@ -2016,6 +2012,28 @@ fn safe_filename(value: &str) -> String {
     }
 }
 
+/// Why the buffer stopped accepting facts; the first cause is kept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Truncation {
+    SidecarLimit,
+    RecordLimit,
+    Encoding,
+}
+
+impl Truncation {
+    fn message(self) -> String {
+        match self {
+            Self::SidecarLimit => {
+                format!("compiler facts exceeded the {MAX_SIDECAR_BYTES} byte sidecar limit")
+            }
+            Self::RecordLimit => {
+                format!("a compiler fact exceeded the {MAX_RECORD_BYTES} byte record limit")
+            }
+            Self::Encoding => "a compiler fact could not be encoded".to_owned(),
+        }
+    }
+}
+
 struct RecordBuffer {
     run_id: RunId,
     invocation_id: InvocationId,
@@ -2023,7 +2041,7 @@ struct RecordBuffer {
     records: Vec<Vec<u8>>,
     bytes: usize,
     limit: usize,
-    truncated: bool,
+    truncation: Option<Truncation>,
 }
 
 impl RecordBuffer {
@@ -2035,7 +2053,7 @@ impl RecordBuffer {
             records: Vec::new(),
             bytes: 0,
             limit,
-            truncated: false,
+            truncation: None,
         }
     }
 
@@ -2057,18 +2075,24 @@ impl RecordBuffer {
             event,
         };
         let Ok(mut encoded) = serde_json::to_vec(&record) else {
-            self.truncated = true;
-            return false;
+            return self.truncate(Truncation::Encoding);
         };
+        if encoded.len() > MAX_RECORD_BYTES {
+            return self.truncate(Truncation::RecordLimit);
+        }
         encoded.push(b'\n');
         if self.bytes.saturating_add(encoded.len()) > limit {
-            self.truncated = true;
-            return false;
+            return self.truncate(Truncation::SidecarLimit);
         }
         self.bytes += encoded.len();
         self.next_sequence += 1;
         self.records.push(encoded);
         true
+    }
+
+    fn truncate(&mut self, cause: Truncation) -> bool {
+        self.truncation.get_or_insert(cause);
+        false
     }
 
     fn write_atomic(&self, directory: &Path) -> io::Result<PathBuf> {
@@ -2213,6 +2237,30 @@ mod tests {
     }
 
     #[test]
+    fn record_limit_counts_payload_bytes_and_names_its_cause() {
+        let mut records = RecordBuffer::new(
+            RunId("run".to_owned()),
+            InvocationId("invocation".to_owned()),
+            MAX_SIDECAR_BYTES as usize,
+        );
+        let diagnostic = |message: String| {
+            Event::Diagnostic(Diagnostic {
+                phase: DiagnosticPhase::Analysis,
+                severity: DiagnosticSeverity::Warning,
+                message,
+                span: None,
+            })
+        };
+        assert!(records.push(diagnostic(String::new())));
+        let overhead = records.records[0].len() - 1;
+        assert!(records.push(diagnostic("x".repeat(MAX_RECORD_BYTES - overhead))));
+        assert_eq!(records.truncation, None);
+        assert!(!records.push(diagnostic("x".repeat(MAX_RECORD_BYTES - overhead + 1))));
+        assert_eq!(records.truncation, Some(Truncation::RecordLimit));
+        assert_eq!(records.records.len(), 2);
+    }
+
+    #[test]
     fn atomic_sidecar_has_no_visible_temp_file() {
         let directory = temporary_directory();
         let mut records = RecordBuffer::new(
@@ -2329,7 +2377,7 @@ mod tests {
         assert_eq!(graph.availability(), Availability::Partial);
         assert_eq!(
             product_message(&graph).as_deref(),
-            Some("compiler facts were truncated by the sidecar limit")
+            Some("compiler facts were truncated")
         );
     }
 

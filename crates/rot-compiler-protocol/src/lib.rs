@@ -2,7 +2,13 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 5;
 pub const DRIVER_VERSION: u32 = 5;
+/// Upper bound on one invocation's sidecar; the driver stops recording and
+/// reports truncation beyond it, and the consumer refuses larger files.
 pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on one encoded record line, enforced identically on both sides.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// Upper bound on the manifest directories a run may select.
+pub const MAX_SELECTED_MANIFEST_DIRS: usize = 4096;
 
 pub const RUN_ID_ENV: &str = "ROT_COMPILER_RUN_ID";
 pub const SIDECAR_DIR_ENV: &str = "ROT_COMPILER_SIDECAR_DIR";

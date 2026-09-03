@@ -1,17 +1,20 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs,
     path::{Path, PathBuf},
 };
 
+use rot_compiler_protocol::{CompilationContext, InvocationStarted};
+
+use super::{
+    append_issue,
+    cargo::{CargoArtifact, CargoFailure, CargoProfile, CargoRun, sorted},
+    inventory::{AuditInventory, AuditPackage, PackageTargetInfo},
+    profile::{CompilerProfile, ExpectedUnit},
+    sidecar::Invocation,
+};
 use crate::{
-    compiler::{
-        cargo::{CargoArtifact, CargoFailure, CargoProfile, CargoRun},
-        profile::{CompilerProfile, ExpectedUnit},
-        sidecar::Invocation,
-    },
-    model::CompilerTargetReport,
-    workspace::{AuditInventory, PackageInfo, PackageTargetInfo},
+    model::{CompiledRole, CompilerTargetReport},
+    paths::canonical_or_original,
 };
 
 pub struct CorrelatedInvocation {
@@ -53,7 +56,7 @@ pub fn correlate(
         .packages
         .iter()
         .filter(|package| selected.contains(&package.id.to_string()))
-        .map(|package| canonical(&package.root))
+        .map(|package| canonical_or_original(&package.root))
         .collect::<HashSet<_>>();
 
     invocations.retain(|invocation| {
@@ -61,7 +64,7 @@ pub fn correlate(
             .started
             .manifest_dir
             .as_ref()
-            .is_some_and(|path| selected_roots.contains(&canonical(Path::new(path))))
+            .is_some_and(|path| selected_roots.contains(&canonical_or_original(Path::new(path))))
     });
 
     let local_id_counts = counts(invocations.iter().map(|invocation| invocation.id.0.clone()));
@@ -76,7 +79,7 @@ pub fn correlate(
     for invocation in invocations {
         let mut identity_issue = None;
         if local_id_counts[&invocation.id.0] > 1 {
-            add_issue(
+            append_issue(
                 &mut identity_issue,
                 &format!(
                     "duplicate selected compiler invocation ID {}",
@@ -85,7 +88,7 @@ pub fn correlate(
             );
         }
         if merge_key_counts[&invocation.started.merge_key.0] > 1 {
-            add_issue(
+            append_issue(
                 &mut identity_issue,
                 &format!(
                     "duplicate selected compiler merge key {}",
@@ -102,7 +105,7 @@ pub fn correlate(
             let (index, artifact) = matches[0];
             let mut issue = identity_issue;
             if !used_artifacts.insert(index) {
-                add_issue(
+                append_issue(
                     &mut issue,
                     &format!(
                         "multiple compiler sidecars match Cargo artifact {}:{}",
@@ -112,7 +115,7 @@ pub fn correlate(
             }
             let unit_key = UnitKey::from_artifact(artifact, &invocation.started);
             if !expected.contains_key(&unit_key) {
-                add_issue(
+                append_issue(
                     &mut issue,
                     &format!(
                         "Cargo artifact is absent from the selected unit graph: {}",
@@ -151,7 +154,7 @@ pub fn correlate(
             )
         };
         let mut issue = identity_issue;
-        add_issue(&mut issue, &correlation_issue);
+        append_issue(&mut issue, &correlation_issue);
         if let Some(issue) = &issue {
             errors.push(format!("{}: {issue}", invocation.started.merge_key.0));
         }
@@ -189,7 +192,7 @@ pub fn correlate(
                 "compiler sidecar mapped to an unexpected Cargo unit: {}",
                 key.render()
             ));
-            add_issue(
+            append_issue(
                 &mut invocation.issue,
                 "compiler sidecar mapped outside the selected unit graph",
             );
@@ -212,7 +215,7 @@ pub fn correlate(
             );
             errors.push(issue.clone());
             for &index in indices {
-                add_issue(&mut correlated[index].issue, &issue);
+                append_issue(&mut correlated[index].issue, &issue);
             }
         }
     }
@@ -254,7 +257,7 @@ pub fn correlate(
 fn expected_features_for_target(
     expected: &BTreeMap<UnitKey, usize>,
     target: &CompilerTargetReport,
-    started: &rot_compiler_protocol::InvocationStarted,
+    started: &InvocationStarted,
 ) -> Option<Vec<String>> {
     let matches = expected
         .keys()
@@ -288,7 +291,7 @@ fn expected_units(
 fn failure_matches_target(failure: &CargoFailure, target: &UnitKey) -> bool {
     failure.package_id == target.package_id
         && failure.target_name == target.name
-        && canonical(&failure.target_source) == target.source
+        && canonical_or_original(&failure.target_source) == target.source
         && sorted(failure.target_kinds.clone()) == target.kinds
         && sorted(failure.target_crate_types.clone()) == target.crate_types
 }
@@ -309,7 +312,7 @@ impl UnitKey {
         Self {
             package_id: unit.package_id.clone(),
             name: unit.target_name.clone(),
-            source: canonical(&unit.target_source),
+            source: canonical_or_original(&unit.target_source),
             kinds: sorted(unit.target_kinds.clone()),
             crate_types: sorted(unit.target_crate_types.clone()),
             features: sorted(unit.features.clone()),
@@ -317,14 +320,11 @@ impl UnitKey {
         }
     }
 
-    fn from_artifact(
-        artifact: &CargoArtifact,
-        started: &rot_compiler_protocol::InvocationStarted,
-    ) -> Self {
+    fn from_artifact(artifact: &CargoArtifact, started: &InvocationStarted) -> Self {
         Self {
             package_id: artifact.package_id.clone(),
             name: artifact.target_name.clone(),
-            source: canonical(&artifact.target_source),
+            source: canonical_or_original(&artifact.target_source),
             kinds: sorted(artifact.target_kinds.clone()),
             crate_types: sorted(artifact.target_crate_types.clone()),
             features: sorted(artifact.features.clone()),
@@ -344,7 +344,7 @@ impl UnitKey {
         Some(Self {
             package_id: target.package_id.clone(),
             name: target.name.clone(),
-            source: canonical(Path::new(&target.source)),
+            source: canonical_or_original(Path::new(&target.source)),
             kinds: sorted(target.kinds.clone()),
             crate_types: sorted(target.crate_types.clone()),
             features: sorted(features),
@@ -365,14 +365,10 @@ impl UnitKey {
         )
     }
 
-    fn matches_target(
-        &self,
-        target: &CompilerTargetReport,
-        started: &rot_compiler_protocol::InvocationStarted,
-    ) -> bool {
+    fn matches_target(&self, target: &CompilerTargetReport, started: &InvocationStarted) -> bool {
         self.package_id == target.package_id
             && self.name == target.name
-            && self.source == canonical(Path::new(&target.source))
+            && self.source == canonical_or_original(Path::new(&target.source))
             && self.kinds == sorted(target.kinds.clone())
             && self.crate_types == sorted(target.crate_types.clone())
             && self.platform == compilation_platform(started)
@@ -386,8 +382,8 @@ struct TargetKey {
     source: PathBuf,
     kinds: Vec<String>,
     crate_types: Vec<String>,
-    role: String,
-    compilation_context: String,
+    role: CompiledRole,
+    compilation_context: CompilationContext,
 }
 
 impl TargetKey {
@@ -395,22 +391,12 @@ impl TargetKey {
         Self {
             package_id: target.package_id.clone(),
             name: target.name.clone(),
-            source: canonical(Path::new(&target.source)),
+            source: canonical_or_original(Path::new(&target.source)),
             kinds: sorted(target.kinds.clone()),
             crate_types: sorted(target.crate_types.clone()),
-            role: target.role.clone(),
-            compilation_context: target.compilation_context.clone(),
+            role: target.role,
+            compilation_context: target.compilation_context,
         }
-    }
-}
-
-fn add_issue(current: &mut Option<String>, issue: &str) {
-    match current {
-        Some(current) => {
-            current.push_str("; ");
-            current.push_str(issue);
-        }
-        None => *current = Some(issue.to_owned()),
     }
 }
 
@@ -419,8 +405,8 @@ fn artifact_matches(invocation: &Invocation, artifact: &CargoArtifact) -> bool {
     let Some(manifest_dir) = &started.manifest_dir else {
         return false;
     };
-    if canonical(Path::new(manifest_dir))
-        != canonical(
+    if canonical_or_original(Path::new(manifest_dir))
+        != canonical_or_original(
             artifact
                 .manifest_path
                 .parent()
@@ -433,14 +419,10 @@ fn artifact_matches(invocation: &Invocation, artifact: &CargoArtifact) -> bool {
         return false;
     };
     let input = resolve(&started.working_directory, input);
-    if canonical(&input) != canonical(&artifact.target_source) {
+    if canonical_or_original(&input) != canonical_or_original(&artifact.target_source) {
         return false;
     }
-    if !cargo_mode_matches(
-        &artifact.target_kinds,
-        started.test_mode,
-        artifact.profile_test,
-    ) {
+    if started.test_mode != artifact.profile_test {
         return false;
     }
 
@@ -455,13 +437,13 @@ fn artifact_matches(invocation: &Invocation, artifact: &CargoArtifact) -> bool {
     let Some(out_dir) = &identity.out_dir else {
         return false;
     };
-    let out_dir = canonical(Path::new(out_dir));
+    let out_dir = canonical_or_original(Path::new(out_dir));
     let suffix = identity.extra_filename.as_deref().unwrap_or_default();
     let expected = format!("{}{}", identity.crate_name, suffix);
     artifact.filenames.iter().any(|filename| {
         filename
             .parent()
-            .is_some_and(|parent| canonical(parent) == out_dir)
+            .is_some_and(|parent| canonical_or_original(parent) == out_dir)
             && filename
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -474,39 +456,37 @@ fn artifact_matches(invocation: &Invocation, artifact: &CargoArtifact) -> bool {
 fn failed_target(
     invocation: &Invocation,
     failures: &[CargoFailure],
-    packages: &HashMap<String, &PackageInfo>,
+    packages: &HashMap<String, &AuditPackage>,
 ) -> Option<CompilerTargetReport> {
     let manifest_dir = invocation.started.manifest_dir.as_ref()?;
-    let input = invocation
-        .started
-        .input
-        .as_ref()
-        .map(|input| canonical(&resolve(&invocation.started.working_directory, input)))?;
+    let input = invocation.started.input.as_ref().map(|input| {
+        canonical_or_original(&resolve(&invocation.started.working_directory, input))
+    })?;
     let identity = &invocation.started.artifact;
     let mut metadata = packages
         .values()
-        .filter(|package| canonical(&package.root) == canonical(Path::new(manifest_dir)))
+        .filter(|package| {
+            canonical_or_original(&package.root) == canonical_or_original(Path::new(manifest_dir))
+        })
         .flat_map(|package| {
             package
                 .targets
                 .iter()
                 .filter(|target| {
-                    canonical(&target.source) == input
+                    canonical_or_original(&target.source) == input
                         && invocation_crate_types_match(
                             &identity.crate_types,
                             invocation.started.test_mode,
                             &target.crate_types,
                         )
                 })
-                .filter_map(|target| {
-                    invocation_role(target, invocation.started.test_mode).map(|role| {
-                        metadata_target(
-                            package,
-                            target,
-                            role,
-                            invocation.started.compilation_context,
-                        )
-                    })
+                .map(|target| {
+                    metadata_target(
+                        package,
+                        target,
+                        CompiledRole::from_target(&target.kinds, invocation.started.test_mode),
+                        invocation.started.compilation_context,
+                    )
                 })
         })
         .collect::<Vec<_>>();
@@ -514,8 +494,9 @@ fn failed_target(
         .iter()
         .filter(|failure| {
             packages.get(&failure.package_id).is_some_and(|package| {
-                canonical(&package.root) == canonical(Path::new(manifest_dir))
-                    && canonical(&failure.target_source) == input
+                canonical_or_original(&package.root)
+                    == canonical_or_original(Path::new(manifest_dir))
+                    && canonical_or_original(&failure.target_source) == input
                     && invocation_crate_types_match(
                         &identity.crate_types,
                         invocation.started.test_mode,
@@ -524,7 +505,7 @@ fn failed_target(
                     && package.targets.iter().any(|target| {
                         target.name == failure.target_name
                             && target.kinds == failure.target_kinds
-                            && canonical(&target.source) == input
+                            && canonical_or_original(&target.source) == input
                             && same_crate_types(&target.crate_types, &failure.target_crate_types)
                     })
             })
@@ -533,7 +514,7 @@ fn failed_target(
             (
                 failure.package_id.clone(),
                 failure.target_name.clone(),
-                canonical(&failure.target_source),
+                canonical_or_original(&failure.target_source),
                 sorted(failure.target_kinds.clone()),
                 sorted(failure.target_crate_types.clone()),
             )
@@ -544,7 +525,7 @@ fn failed_target(
             failure_keys.contains(&(
                 target.package_id.clone(),
                 target.name.clone(),
-                canonical(Path::new(&target.source)),
+                canonical_or_original(Path::new(&target.source)),
                 sorted(target.kinds.clone()),
                 sorted(target.crate_types.clone()),
             ))
@@ -556,10 +537,10 @@ fn failed_target(
 }
 
 fn metadata_target(
-    package: &PackageInfo,
+    package: &AuditPackage,
     target: &PackageTargetInfo,
-    role: &str,
-    compilation_context: rot_compiler_protocol::CompilationContext,
+    role: CompiledRole,
+    compilation_context: CompilationContext,
 ) -> CompilerTargetReport {
     CompilerTargetReport {
         package_id: package.id.to_string(),
@@ -567,74 +548,27 @@ fn metadata_target(
         kinds: target.kinds.clone(),
         crate_types: target.crate_types.clone(),
         source: target.source.to_string_lossy().into_owned(),
-        role: role.to_owned(),
-        compilation_context: compilation_context_name(compilation_context).to_owned(),
+        role,
+        compilation_context,
     }
 }
 
-fn target_report(
-    artifact: &CargoArtifact,
-    started: &rot_compiler_protocol::InvocationStarted,
-) -> CompilerTargetReport {
+fn target_report(artifact: &CargoArtifact, started: &InvocationStarted) -> CompilerTargetReport {
     CompilerTargetReport {
         package_id: artifact.package_id.clone(),
         name: artifact.target_name.clone(),
         kinds: artifact.target_kinds.clone(),
         crate_types: artifact.target_crate_types.clone(),
         source: artifact.target_source.to_string_lossy().into_owned(),
-        role: artifact.role().to_owned(),
-        compilation_context: compilation_context_name(started.compilation_context).to_owned(),
+        role: CompiledRole::from_target(&artifact.target_kinds, artifact.profile_test),
+        compilation_context: started.compilation_context,
     }
 }
 
-fn compilation_platform(started: &rot_compiler_protocol::InvocationStarted) -> Option<String> {
+fn compilation_platform(started: &InvocationStarted) -> Option<String> {
     match started.compilation_context {
-        rot_compiler_protocol::CompilationContext::Host => None,
-        rot_compiler_protocol::CompilationContext::Target => Some(started.target_triple.clone()),
-    }
-}
-
-pub(super) fn compilation_context_name(
-    context: rot_compiler_protocol::CompilationContext,
-) -> &'static str {
-    match context {
-        rot_compiler_protocol::CompilationContext::Host => "host",
-        rot_compiler_protocol::CompilationContext::Target => "target",
-    }
-}
-
-fn special_role(kinds: &[String]) -> Option<&'static str> {
-    if kinds.iter().any(|kind| kind == "test") {
-        Some("test")
-    } else if kinds.iter().any(|kind| kind == "bench") {
-        Some("bench")
-    } else if kinds.iter().any(|kind| kind == "example") {
-        Some("example")
-    } else if kinds.iter().any(|kind| kind == "custom-build") {
-        Some("build")
-    } else {
-        None
-    }
-}
-
-fn cargo_mode_matches(kinds: &[String], rustc_test_mode: bool, cargo_test_profile: bool) -> bool {
-    let _ = kinds;
-    rustc_test_mode == cargo_test_profile
-}
-
-fn invocation_role(target: &PackageTargetInfo, test_mode: bool) -> Option<&'static str> {
-    if test_mode {
-        if target.kinds.iter().any(|kind| kind == "test") {
-            Some("test")
-        } else if target.kinds.iter().any(|kind| kind == "bench") {
-            Some("bench")
-        } else {
-            Some("unit_test")
-        }
-    } else if let Some(role) = special_role(&target.kinds) {
-        Some(role)
-    } else {
-        Some("production")
+        CompilationContext::Host => None,
+        CompilationContext::Target => Some(started.target_triple.clone()),
     }
 }
 
@@ -678,28 +612,9 @@ fn resolve(working_directory: &str, path: &str) -> PathBuf {
     }
 }
 
-fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn sorted(mut values: Vec<String>) -> Vec<String> {
-    values.sort();
-    values.dedup();
-    values
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn target(name: &str, source: &str, kind: &str, crate_type: &str) -> PackageTargetInfo {
-        PackageTargetInfo {
-            name: name.to_owned(),
-            kinds: vec![kind.to_owned()],
-            crate_types: vec![crate_type.to_owned()],
-            source: PathBuf::from(source),
-        }
-    }
 
     #[test]
     fn selected_unit_ledger_preserves_cargo_multiplicity() {
@@ -744,25 +659,5 @@ mod tests {
             true,
             &["lib".to_owned()]
         ));
-    }
-
-    #[test]
-    fn test_mode_only_maps_to_a_unit_test_when_target_is_testable() {
-        let testable = target("sample", "src/lib.rs", "lib", "lib");
-        let not_testable = target("sample", "src/main.rs", "bin", "bin");
-        let integration = target("it", "tests/it.rs", "test", "bin");
-
-        assert_eq!(invocation_role(&testable, false), Some("production"));
-        assert_eq!(invocation_role(&testable, true), Some("unit_test"));
-        assert_eq!(invocation_role(&not_testable, true), Some("unit_test"));
-        assert_eq!(invocation_role(&integration, true), Some("test"));
-    }
-
-    #[test]
-    fn special_targets_do_not_confuse_the_cargo_test_profile_with_rustc_test_mode() {
-        assert!(cargo_mode_matches(&["lib".to_owned()], true, true));
-        assert!(!cargo_mode_matches(&["lib".to_owned()], false, true));
-        assert!(!cargo_mode_matches(&["bench".to_owned()], false, true));
-        assert!(cargo_mode_matches(&["bench".to_owned()], true, true));
     }
 }

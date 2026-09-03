@@ -139,8 +139,8 @@ mod tests {
     #[test]
     fn support_manifest_is_a_sorted_exact_one_year_ledger() {
         let manifest = manifest().unwrap();
-        assert_eq!(manifest.verified_on, "2026-08-29");
-        assert_eq!(manifest.window_start, "2025-08-29");
+        assert_eq!(manifest.verified_on, "2026-09-01");
+        assert_eq!(manifest.window_start, "2025-09-01");
         assert_eq!(manifest.window_days, 365);
         assert_eq!(manifest.verified_host, "aarch64-apple-darwin");
 

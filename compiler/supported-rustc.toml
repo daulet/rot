@@ -6,8 +6,8 @@
 # verified host. Refresh this file and rerun the matrix whenever the window or
 # a supported host changes.
 
-verified_on = "2026-08-29"
-window_start = "2025-08-29"
+verified_on = "2026-09-01"
+window_start = "2025-09-01"
 window_days = 365
 verified_host = "aarch64-apple-darwin"
 

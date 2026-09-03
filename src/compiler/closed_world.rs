@@ -1,24 +1,25 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
     path::{Path, PathBuf},
 };
 
 use rot_compiler_protocol::{
-    CompilerDefId, Definition, DefinitionKind, NominalVisibility, ReferenceKind, RootKind,
-    SourceSpan,
+    CompilationContext, CompilerDefId, Definition, DefinitionKind, NominalVisibility,
+    ReferenceKind, RootKind, SourceSpan,
 };
 
-use crate::model::{
-    ClosedWorldFindingReport, ClosedWorldReport, ClosedWorldSummaryReport,
-    CompilerDefinitionIdReport, CompilerSourceSpanReport, CompilerTargetReport,
-    ImpactDefinitionReport, ImpactProvenanceClass, ImpactProvenanceReport, ImpactQueryReport,
-    ImpactReferenceReport, ImpactReferenceStepReport, ImpactReport, ImpactSummaryReport,
-    ImpactVisibilityDisposition, ImpactWitnessReport, RequiredVisibilityDefinitionReport,
-    RequiredVisibilityReport, SemanticStatus,
+use super::{definition_kind, expansion_origin, sidecar::Invocation, source_span};
+use crate::{
+    model::{
+        ClosedWorldFindingReport, ClosedWorldReport, ClosedWorldSummaryReport, CompiledRole,
+        CompilerDefinitionIdReport, CompilerTargetReport, ImpactDefinitionReport,
+        ImpactProvenanceClass, ImpactProvenanceReport, ImpactQueryReport, ImpactReferenceReport,
+        ImpactReferenceStepReport, ImpactReport, ImpactSummaryReport, ImpactVisibilityDisposition,
+        ImpactWitnessReport, RequiredVisibilityDefinitionReport, RequiredVisibilityReport,
+        SemanticStatus,
+    },
+    paths::canonical_or_original,
 };
-
-use super::{generated_source_label, sidecar::Invocation};
 
 const SCOPE: &str = "selected-workspace compiled-target closed world";
 const EVIDENCE_EXCLUSIONS: [&str; 2] = [
@@ -259,7 +260,7 @@ pub(super) fn aggregate_with_query(
         let test_compiled_only = !graph.nodes[*node]
             .definitions
             .iter()
-            .any(|(invocation, _)| relevant[*invocation].target.role == "production");
+            .any(|(invocation, _)| relevant[*invocation].target.role == CompiledRole::Production);
         let kind = if production_live || nonproduction_live {
             "unnecessary_public"
         } else {
@@ -597,7 +598,9 @@ fn span_identity(invocation: &Invocation, span: &SourceSpan) -> Option<SpanIdent
         path: if source.generated {
             source.remapped_path.clone()
         } else {
-            canonical(Path::new(path)).to_string_lossy().into_owned()
+            canonical_or_original(Path::new(path))
+                .to_string_lossy()
+                .into_owned()
         },
         source_hash: source.source_hash.clone(),
         generated: source.generated,
@@ -616,7 +619,7 @@ fn logical_target(target: &CompilerTargetReport) -> LogicalTarget {
     LogicalTarget {
         package_id: target.package_id.clone(),
         name: target.name.clone(),
-        source: canonical(Path::new(&target.source)),
+        source: canonical_or_original(Path::new(&target.source)),
         kinds,
         crate_types,
     }
@@ -659,14 +662,17 @@ fn resolve_targets(
 }
 
 fn graph_class(target: &CompilerTargetReport) -> Option<GraphClass> {
-    if target.compilation_context == "host" && !target.kinds.iter().any(|kind| kind == "proc-macro")
-    {
+    let proc_macro = target.kinds.iter().any(|kind| kind == "proc-macro");
+    if target.compilation_context == CompilationContext::Host && !proc_macro {
         return None;
     }
-    match target.role.as_str() {
-        "production" => Some(GraphClass::Production),
-        "unit_test" | "test" | "bench" | "example" => Some(GraphClass::Nonproduction),
-        _ => None,
+    match target.role {
+        CompiledRole::Production => Some(GraphClass::Production),
+        CompiledRole::UnitTest
+        | CompiledRole::Test
+        | CompiledRole::Bench
+        | CompiledRole::Example => Some(GraphClass::Nonproduction),
+        CompiledRole::Build => None,
     }
 }
 
@@ -729,7 +735,7 @@ fn candidates(
             })
             .min_by_key(|(invocation_index, _)| {
                 (
-                    invocations[*invocation_index].target.role != "production",
+                    invocations[*invocation_index].target.role != CompiledRole::Production,
                     *invocation_index,
                 )
             });
@@ -779,13 +785,16 @@ fn candidate_target(target: &CompilerTargetReport) -> bool {
         )
     });
     library
-        && match target.role.as_str() {
-            "production" => {
-                target.compilation_context == "target"
+        && match target.role {
+            CompiledRole::Production => {
+                target.compilation_context == CompilationContext::Target
                     || target.kinds.iter().any(|kind| kind == "proc-macro")
             }
-            "unit_test" => target.compilation_context == "target",
-            _ => false,
+            CompiledRole::UnitTest => target.compilation_context == CompilationContext::Target,
+            CompiledRole::Test
+            | CompiledRole::Bench
+            | CompiledRole::Example
+            | CompiledRole::Build => false,
         }
 }
 
@@ -840,7 +849,7 @@ fn definition_visibility_key(
 }
 
 fn library_target(target: &CompilerTargetReport) -> bool {
-    target.role == "production"
+    target.role == CompiledRole::Production
         && target.kinds.iter().any(|kind| {
             matches!(
                 kind.as_str(),
@@ -940,7 +949,7 @@ fn representative(node: &Node, invocations: &[&GraphInvocation<'_>]) -> Option<(
     node.definitions
         .iter()
         .copied()
-        .find(|(invocation, _)| invocations[*invocation].target.role == "production")
+        .find(|(invocation, _)| invocations[*invocation].target.role == CompiledRole::Production)
         .or_else(|| node.definitions.first().copied())
 }
 
@@ -1057,9 +1066,7 @@ fn impact_report(
         .iter()
         .filter(|state| !selected_states.contains(state) || graph.roots.contains_key(state))
     {
-        if let Some(class) = compiled_provenance(invocations[state.invocation].target) {
-            provenance.insert(class);
-        }
+        provenance.insert(compiled_provenance(invocations[state.invocation].target));
         if graph.roots.get(state).is_some_and(|roots| {
             roots
                 .iter()
@@ -1086,7 +1093,7 @@ fn impact_report(
             .iter()
             .any(|node| production.contains(node) || nonproduction.contains(node))
         {
-            ImpactVisibilityDisposition::NarrowablePublic
+            ImpactVisibilityDisposition::UnnecessaryPublic
         } else {
             ImpactVisibilityDisposition::DeadPublic
         }
@@ -1126,14 +1133,10 @@ fn matching_physical_declarations(
     query: &ImpactQuery,
 ) -> BTreeMap<PhysicalDeclarationKey, BTreeSet<usize>> {
     let mut matched_keys = BTreeSet::new();
-    for (node, definition) in nodes.iter().enumerate().flat_map(|(node, entry)| {
-        entry
-            .definitions
-            .iter()
-            .copied()
-            .map(move |definition| (node, definition))
-    }) {
-        let (invocation, definition) = definition;
+    for (invocation, definition) in nodes
+        .iter()
+        .flat_map(|entry| entry.definitions.iter().copied())
+    {
         let input = invocations[invocation];
         let definition = &input.invocation.definitions[definition];
         if input.owner != query.package || definition.definition_path != query.definition_path {
@@ -1154,7 +1157,6 @@ fn matching_physical_declarations(
             continue;
         }
         if let Some(key) = physical_declaration_key(input, definition) {
-            let _ = node;
             matched_keys.insert(key);
         }
     }
@@ -1293,10 +1295,8 @@ fn impact_witnesses(
         for evidence in roots {
             let class = if evidence.kind == RootKind::RequiredPublic {
                 ImpactProvenanceClass::PublicInterface
-            } else if let Some(class) = compiled_provenance(invocations[state.invocation].target) {
-                class
             } else {
-                continue;
+                compiled_provenance(invocations[state.invocation].target)
             };
             let Some(root_definition) = definition_for_state(*state, invocations, &graph.nodes)
             else {
@@ -1366,7 +1366,7 @@ fn impact_reference_report(
         .iter()
         .find(|definition| definition.compiler_id == reference.to)
         .or_else(|| definition_for_state(edge.to, invocations, nodes))?;
-    let class = compiled_provenance(input.target)?;
+    let class = compiled_provenance(input.target);
     Some(ImpactReferenceReport {
         consumer: impact_definition_report(root, input, consumer),
         dependency: impact_definition_report(root, dependency_input, dependency),
@@ -1448,7 +1448,7 @@ fn representative_for_nodes<'a>(
         .min_by_key(|(invocation, definition)| {
             let input = invocations[*invocation];
             (
-                input.target.role != "production",
+                input.target.role != CompiledRole::Production,
                 query.is_some_and(|query| definition.definition_path != query.definition_path),
                 input.target.package_id.as_str(),
                 input.target.name.as_str(),
@@ -1500,20 +1500,22 @@ fn impact_provenance(
         class,
         package_id: input.target.package_id.clone(),
         target_name: input.target.name.clone(),
-        target_role: input.target.role.clone(),
-        compilation_context: input.target.compilation_context.clone(),
+        target_role: input.target.role,
+        compilation_context: input.target.compilation_context,
     }
 }
 
-fn compiled_provenance(target: &CompilerTargetReport) -> Option<ImpactProvenanceClass> {
-    if target.compilation_context == "host" {
-        return Some(ImpactProvenanceClass::BuildTime);
+fn compiled_provenance(target: &CompilerTargetReport) -> ImpactProvenanceClass {
+    if target.compilation_context == CompilationContext::Host {
+        return ImpactProvenanceClass::BuildTime;
     }
-    match target.role.as_str() {
-        "production" => Some(ImpactProvenanceClass::Production),
-        "unit_test" | "test" | "bench" | "example" => Some(ImpactProvenanceClass::Nonproduction),
-        "build" => Some(ImpactProvenanceClass::BuildTime),
-        _ => None,
+    match target.role {
+        CompiledRole::Production => ImpactProvenanceClass::Production,
+        CompiledRole::UnitTest
+        | CompiledRole::Test
+        | CompiledRole::Bench
+        | CompiledRole::Example => ImpactProvenanceClass::Nonproduction,
+        CompiledRole::Build => ImpactProvenanceClass::BuildTime,
     }
 }
 
@@ -1585,7 +1587,7 @@ fn impact_reference_key(reference: &ImpactReferenceReport) -> String {
             format!("{}\0{:020}\0{:020}", span.path, span.line, span.column)
         });
     format!(
-        "{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{span}",
+        "{:?}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{span}",
         reference.provenance.class,
         reference.provenance.package_id,
         reference.provenance.target_name,
@@ -1631,82 +1633,10 @@ fn reference_kind(kind: ReferenceKind) -> &'static str {
     }
 }
 
-fn source_span(
-    root: &Path,
-    input: &GraphInvocation<'_>,
-    span: &SourceSpan,
-) -> Option<CompilerSourceSpanReport> {
-    let source = input
-        .invocation
-        .sources
-        .iter()
-        .find(|source| source.key == span.file)?;
-    if span.start > span.end || span.end > source.byte_len {
-        return None;
-    }
-    let local_path = Path::new(source.local_path.as_deref()?);
-    let path = if source.generated {
-        generated_source_label(input.owner, local_path, &source.source_hash)
-    } else {
-        local_path
-            .strip_prefix(root)
-            .unwrap_or(local_path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    };
-    Some(CompilerSourceSpanReport {
-        path,
-        source_hash: source.source_hash.clone(),
-        generated: source.generated,
-        start_byte: u64::from(span.start),
-        end_byte: u64::from(span.end),
-        line: u64::from(span.line),
-        column: u64::from(span.column),
-    })
-}
-
 fn definition_id(id: CompilerDefId) -> CompilerDefinitionIdReport {
     CompilerDefinitionIdReport {
         stable_crate_id: format!("{:016x}", id.stable_crate_id),
         local_hash: format!("{:016x}", id.local_hash),
-    }
-}
-
-fn definition_kind(kind: DefinitionKind) -> &'static str {
-    match kind {
-        DefinitionKind::Crate => "crate",
-        DefinitionKind::Module => "module",
-        DefinitionKind::Struct => "struct",
-        DefinitionKind::Union => "union",
-        DefinitionKind::Enum => "enum",
-        DefinitionKind::Variant => "variant",
-        DefinitionKind::Trait => "trait",
-        DefinitionKind::TypeAlias => "type_alias",
-        DefinitionKind::ForeignType => "foreign_type",
-        DefinitionKind::TraitAlias => "trait_alias",
-        DefinitionKind::AssociatedType => "associated_type",
-        DefinitionKind::Function => "function",
-        DefinitionKind::Constant => "constant",
-        DefinitionKind::Static => "static",
-        DefinitionKind::Constructor => "constructor",
-        DefinitionKind::AssociatedFunction => "associated_function",
-        DefinitionKind::AssociatedConstant => "associated_constant",
-        DefinitionKind::Macro => "macro",
-        DefinitionKind::ExternCrate => "extern_crate",
-        DefinitionKind::Import => "import",
-        DefinitionKind::ForeignModule => "foreign_module",
-        DefinitionKind::OpaqueType => "opaque_type",
-        DefinitionKind::Field => "field",
-        DefinitionKind::Implementation => "implementation",
-    }
-}
-
-fn expansion_origin(origin: rot_compiler_protocol::ExpansionOrigin) -> &'static str {
-    match origin {
-        rot_compiler_protocol::ExpansionOrigin::Authored => "authored",
-        rot_compiler_protocol::ExpansionOrigin::BuiltinDesugaring => "builtin_desugaring",
-        rot_compiler_protocol::ExpansionOrigin::LocalMacro => "local_macro",
-        rot_compiler_protocol::ExpansionOrigin::ExternalMacro => "external_macro",
     }
 }
 
@@ -1728,10 +1658,6 @@ fn incomplete_with_query(
     let mut aggregation = incomplete(status, reason);
     aggregation.impact = query.map(|query| unavailable_impact(query, reason, Vec::new()));
     aggregation
-}
-
-fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -1791,8 +1717,18 @@ mod tests {
             vec![root(11, 1, RootKind::EntryPoint)],
             vec![reference(11, 1, 11, 4, ReferenceKind::Body)],
         );
-        let normal_target = target("member", "production", "target", &["lib"]);
-        let test_target = target("member", "unit_test", "target", &["lib"]);
+        let normal_target = target(
+            "member",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
+        let test_target = target(
+            "member",
+            CompiledRole::UnitTest,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [
             graph_input(&normal_target, &normal),
             graph_input(&test_target, &test),
@@ -1862,9 +1798,24 @@ mod tests {
             vec![root(40, 1, RootKind::EntryPoint)],
             vec![reference(40, 1, 20, 1, ReferenceKind::Body)],
         );
-        let library_target = target("helper", "production", "target", &["lib"]);
-        let production_target = target("app", "production", "target", &["bin"]);
-        let test_target = target("app", "test", "target", &["test"]);
+        let library_target = target(
+            "helper",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
+        let production_target = target(
+            "app",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["bin"],
+        );
+        let test_target = target(
+            "app",
+            CompiledRole::Test,
+            CompilationContext::Target,
+            &["test"],
+        );
         let inputs = [
             graph_input(&library_target, &library),
             graph_input(&production_target, &production),
@@ -1936,8 +1887,18 @@ mod tests {
             vec![root(30, 1, RootKind::EntryPoint)],
             vec![reference(30, 1, 20, 1, ReferenceKind::Body)],
         );
-        let library_target = target("helper", "production", "host", &["lib"]);
-        let build_target = target("consumer", "build", "host", &["custom-build"]);
+        let library_target = target(
+            "helper",
+            CompiledRole::Production,
+            CompilationContext::Host,
+            &["lib"],
+        );
+        let build_target = target(
+            "consumer",
+            CompiledRole::Build,
+            CompilationContext::Host,
+            &["custom-build"],
+        );
         let inputs = [
             graph_input(&library_target, &library),
             graph_input(&build_target, &build),
@@ -2006,8 +1967,18 @@ mod tests {
             vec![root(31, 1, RootKind::EntryPoint)],
             vec![reference(31, 1, 21, 1, ReferenceKind::Body)],
         );
-        let library_target = target("helper", "production", "host", &["lib"]);
-        let macro_target = target("derive", "production", "host", &["proc-macro"]);
+        let library_target = target(
+            "helper",
+            CompiledRole::Production,
+            CompilationContext::Host,
+            &["lib"],
+        );
+        let macro_target = target(
+            "derive",
+            CompiledRole::Production,
+            CompilationContext::Host,
+            &["proc-macro"],
+        );
         let inputs = [
             graph_input(&library_target, &library),
             graph_input(&macro_target, &proc_macro),
@@ -2052,7 +2023,12 @@ mod tests {
                 ReferenceKind::VisibilityRequirement,
             )],
         );
-        let target = target("api", "production", "target", &["lib"]);
+        let target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [graph_input(&target, &library)];
 
         let aggregation = aggregate(Path::new(ROOT), SemanticStatus::Complete, &inputs);
@@ -2118,8 +2094,18 @@ mod tests {
             vec![root(60, 1, RootKind::RequiredPublic)],
             Vec::new(),
         );
-        let first_target = target("first", "production", "target", &["lib"]);
-        let second_target = target("second", "production", "target", &["lib"]);
+        let first_target = target(
+            "first",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
+        let second_target = target(
+            "second",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [
             graph_input(&first_target, &first),
             graph_input(&second_target, &second),
@@ -2176,7 +2162,12 @@ mod tests {
             }],
             vec![reference(70, 2, 70, 1, ReferenceKind::VisibilityParent)],
         );
-        let target = target("api", "production", "target", &["lib"]);
+        let target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [graph_input(&target, &library)];
 
         let paths = aggregate(Path::new(ROOT), SemanticStatus::Complete, &inputs)
@@ -2199,7 +2190,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let target = target("api", "production", "target", &["lib"]);
+        let target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [graph_input(&target, &library)];
 
         let query = query("api::dead");
@@ -2238,7 +2234,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let target = target("api", "production", "target", &["lib"]);
+        let target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [graph_input(&target, &library)];
 
         let query = query("api::duplicate");
@@ -2304,7 +2305,12 @@ mod tests {
             vec![root(92, 2, RootKind::EntryPoint)],
             vec![reference(92, 2, 92, 1, ReferenceKind::Body)],
         );
-        let first_target = target("api", "production", "target", &["lib"]);
+        let first_target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let mut second_target = first_target.clone();
         second_target.name = "api-other".to_owned();
         second_target.source = "/workspace/api/src/other.rs".to_owned();
@@ -2369,7 +2375,12 @@ mod tests {
                 reference(100, 2, 100, 1, ReferenceKind::Body),
             ],
         );
-        let target = target("api", "production", "target", &["bin"]);
+        let target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["bin"],
+        );
         let inputs = [graph_input(&target, &library)];
 
         let query = query("api::selected");
@@ -2407,7 +2418,12 @@ mod tests {
             vec![root(80, 1, RootKind::RequiredPublic)],
             Vec::new(),
         );
-        let target = target("api", "production", "target", &["lib"]);
+        let target = target(
+            "api",
+            CompiledRole::Production,
+            CompilationContext::Target,
+            &["lib"],
+        );
         let inputs = [graph_input(&target, &library)];
 
         let aggregation = aggregate(Path::new(ROOT), SemanticStatus::Complete, &inputs);
@@ -2442,15 +2458,20 @@ mod tests {
         }
     }
 
-    fn target(package: &str, role: &str, context: &str, kinds: &[&str]) -> CompilerTargetReport {
+    fn target(
+        package: &str,
+        role: CompiledRole,
+        context: CompilationContext,
+        kinds: &[&str],
+    ) -> CompilerTargetReport {
         CompilerTargetReport {
             package_id: package.to_owned(),
             name: package.to_owned(),
             kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
             crate_types: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
             source: format!("/workspace/{package}/src/lib.rs"),
-            role: role.to_owned(),
-            compilation_context: context.to_owned(),
+            role,
+            compilation_context: context,
         }
     }
 

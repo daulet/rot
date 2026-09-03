@@ -1,13 +1,10 @@
 use std::{
     fs,
     path::PathBuf,
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    process::{Command, Stdio},
 };
 
 use serde_json::Value;
-
-static NEXT_SOURCE: AtomicU64 = AtomicU64::new(0);
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace")
@@ -102,14 +99,9 @@ fn cargo_resolved_features(
         .collect()
 }
 
-fn temporary_source(source: &str) -> (PathBuf, PathBuf) {
-    let directory = std::env::temp_dir().join(format!(
-        "rot-cli-test-{}-{}",
-        std::process::id(),
-        NEXT_SOURCE.fetch_add(1, Ordering::Relaxed),
-    ));
-    fs::create_dir_all(&directory).expect("create source fixture directory");
-    let path = directory.join("fixture.rs");
+fn temporary_source(source: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().expect("create source fixture directory");
+    let path = directory.path().join("fixture.rs");
     fs::write(&path, source).expect("write source fixture");
     (directory, path)
 }
@@ -234,6 +226,9 @@ fn cargo_roles_cfg_modules_and_declared_visibility_are_distinct() {
     assert!(bucket(file(&report, "perf/bench.rs"), "bench").is_some());
     assert!(bucket(file(&report, "build/custom.rs"), "build").is_some());
     assert!(bucket(file(&report, "src/feature_only.rs"), "inactive").is_some());
+    // `#[cfg(rot_generated)]` is set by the build script, which source analysis
+    // cannot evaluate; the unknown predicate must surface as a conditional role.
+    assert!(bucket(file(&report, "src/lib.rs"), "conditional").is_some());
 
     assert!(report.get("surface").is_none());
     let private_module = file(&report, "src/private_mod.rs");
@@ -1652,7 +1647,7 @@ fn snapshot_and_comparison_share_explicit_ignore_boundaries() {
 
 #[test]
 fn authored_complexity_is_explicit_in_json_and_human_file_reports() {
-    let (directory, path) = temporary_source(
+    let (_directory, path) = temporary_source(
         r#"
 fn outer() {
     let _first = || {
@@ -1738,8 +1733,6 @@ fn outer() {
     assert!(files.contains("Cognitive"));
     assert!(files.contains("Prod pub"));
     assert!(!files.contains("Surface"));
-
-    fs::remove_dir_all(directory).expect("remove source fixture directory");
 }
 
 #[test]
@@ -1758,7 +1751,7 @@ fn human_summary_uses_space_aligned_columns() {
         "Declared pub",
     ];
 
-    let (directory, path) = temporary_source("pub fn answer() -> usize { 42 }\n");
+    let (_directory, path) = temporary_source("pub fn answer() -> usize { 42 }\n");
     let output = run(&[path.to_str().unwrap()]);
     assert!(output.status.success());
     let output = String::from_utf8(output.stdout).unwrap();
@@ -1783,8 +1776,6 @@ fn human_summary_uses_space_aligned_columns() {
             "column {column} is not aligned:\n{header}\n{production}",
         );
     }
-
-    fs::remove_dir_all(directory).expect("remove source fixture directory");
 }
 
 #[test]
@@ -1798,4 +1789,113 @@ fn rot_rejects_compiler_mode_and_fast_json_has_no_compiler_field() {
     let (_, report) = run_json(&[]);
     assert!(report["file_count"].as_u64().unwrap() > 0);
     assert!(report.get("compiler").is_none());
+}
+
+#[test]
+fn nested_git_repositories_are_separate_projects() {
+    let (outer, _) = temporary_git_workspace();
+    fs::write(outer.path().join("src/lib.rs"), "pub fn outer() {}\n").unwrap();
+    let inner = tempfile::tempdir().unwrap();
+    fs::create_dir(inner.path().join("src")).unwrap();
+    fs::write(
+        inner.path().join("Cargo.toml"),
+        "[package]\nname = \"rot-inner-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(inner.path().join("src/lib.rs"), "pub fn inner() {}\n").unwrap();
+    git(inner.path(), &["init", "-q"]);
+    git(inner.path(), &["add", "."]);
+    commit(inner.path(), "inner");
+    git(
+        outer.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            inner.path().to_str().unwrap(),
+            "vendor/inner",
+        ],
+    );
+    git(outer.path(), &["add", "."]);
+    commit(outer.path(), "submodule");
+
+    // The submodule is another project: skipped from its parent, measured
+    // when selected, and never a phantom difference in a clean tree.
+    let snapshot = run_path_json(outer.path(), &[]);
+    assert_eq!(snapshot["file_count"], 1);
+    assert_eq!(file(&snapshot, "src/lib.rs")["path"], "src/lib.rs");
+    let inner_only = run_path_json(&outer.path().join("vendor/inner"), &[]);
+    assert_eq!(inner_only["file_count"], 1);
+    let comparison = run_path_json(outer.path(), &["--baseline", "HEAD", "--summary-only"]);
+    assert_eq!(comparison["after"]["dirty"], false);
+    assert_eq!(comparison["metric_changed_files"]["added"], 0);
+    assert_eq!(comparison["metric_changed_files"]["modified"], 0);
+    assert_eq!(comparison["metric_changed_files"]["deleted"], 0);
+    assert_eq!(comparison["summary"]["files"]["after"], 1);
+}
+
+fn commit(directory: &std::path::Path, message: &str) {
+    git(
+        directory,
+        &[
+            "-c",
+            "user.name=Rot Test",
+            "-c",
+            "user.email=rot@example.invalid",
+            "commit",
+            "-qm",
+            message,
+        ],
+    );
+}
+
+#[test]
+fn deeply_nested_source_is_analyzed_without_exhausting_worker_stacks() {
+    // The default 2 MiB thread stack overflowed near 2,000 nested blocks.
+    let depth = 4_000;
+    let source = format!(
+        "pub fn deep() {{\n{}1;{}\n}}\n",
+        "{".repeat(depth),
+        "}".repeat(depth)
+    );
+    let (_directory, path) = temporary_source(&source);
+    let report = run_path_json(&path, &[]);
+    assert_eq!(report["file_count"], 1);
+    assert_eq!(report["total"]["code"], 3);
+}
+
+#[test]
+fn a_reader_that_closes_stdout_early_is_not_an_error() {
+    for arguments in [vec!["--format", "json"], vec!["--files"]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rot"))
+            .arg(fixture())
+            .args(&arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn rot");
+        // Close the read end before rot writes, so its write fails with EPIPE.
+        drop(child.stdout.take());
+        let output = child.wait_with_output().expect("wait for rot");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{arguments:?}: {stderr}");
+        assert!(stderr.is_empty(), "{arguments:?}: {stderr}");
+    }
+}
+
+#[test]
+fn baseline_request_errors_take_precedence_over_analyzer_setup() {
+    let output = run(&[
+        fixture().to_str().unwrap(),
+        "--threads",
+        "0",
+        "--baseline",
+        "HEAD..HEAD~1",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("revision range"), "{stderr}");
+    assert!(!stderr.contains("--threads"), "{stderr}");
 }

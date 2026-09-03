@@ -10,6 +10,9 @@ use crate::{
     model::{BucketReport, DiagnosticSeverity, OutputRole, Report, SelectionReport, SourceMetrics},
 };
 
+/// Version of the fast `rot` JSON documents (snapshot and comparison).
+pub const SCHEMA_VERSION: u32 = 3;
+
 #[derive(Serialize)]
 struct JsonReport<'a, Report, File> {
     schema_version: u32,
@@ -21,12 +24,13 @@ struct JsonReport<'a, Report, File> {
     files: Option<&'a [File]>,
 }
 
-pub fn render_snapshot(report: &Report, cli: &FastCli) -> Result<()> {
+pub fn render_snapshot(output: &mut impl Write, report: &Report, cli: &FastCli) -> Result<()> {
     match cli.format {
-        OutputFormat::Table => render_table(report, cli.files),
+        OutputFormat::Table => render_table(output, report, cli.files),
         OutputFormat::Json => write_json(
+            output,
             &JsonReport {
-                schema_version: 3,
+                schema_version: SCHEMA_VERSION,
                 report_kind: "snapshot",
                 detail: if cli.summary_only { "summary" } else { "files" },
                 report,
@@ -37,12 +41,17 @@ pub fn render_snapshot(report: &Report, cli: &FastCli) -> Result<()> {
     }
 }
 
-pub fn render_comparison(comparison: &Comparison, cli: &FastCli) -> Result<()> {
+pub fn render_comparison(
+    output: &mut impl Write,
+    comparison: &Comparison,
+    cli: &FastCli,
+) -> Result<()> {
     match cli.format {
-        OutputFormat::Table => render_comparison_table(comparison, cli.files),
+        OutputFormat::Table => render_comparison_table(output, comparison, cli.files),
         OutputFormat::Json => write_json(
+            output,
             &JsonReport {
-                schema_version: 3,
+                schema_version: SCHEMA_VERSION,
                 report_kind: "comparison",
                 detail: if cli.summary_only { "summary" } else { "files" },
                 report: comparison,
@@ -53,13 +62,14 @@ pub fn render_comparison(comparison: &Comparison, cli: &FastCli) -> Result<()> {
     }
 }
 
-fn write_json(value: &impl Serialize, description: &str) -> Result<()> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    serde_json::to_writer(&mut output, value)
+pub fn write_json(
+    output: &mut impl Write,
+    value: &impl Serialize,
+    description: &str,
+) -> Result<()> {
+    serde_json::to_writer(&mut *output, value)
         .with_context(|| format!("cannot serialize {description}"))?;
-    writeln!(output).with_context(|| format!("cannot write {description}"))?;
-    Ok(())
+    writeln!(output).with_context(|| format!("cannot write {description}"))
 }
 
 pub fn render_diagnostics(report: &Report) {
@@ -84,9 +94,8 @@ fn render_diagnostic_list(prefix: &str, diagnostics: &[crate::model::Diagnostic]
     }
 }
 
-fn render_table(report: &Report, by_file: bool) -> Result<()> {
-    let stdout = io::stdout();
-    let mut output = TabWriter::new(stdout.lock()).padding(2);
+fn render_table(output: &mut impl Write, report: &Report, by_file: bool) -> Result<()> {
+    let mut output = TabWriter::new(output).padding(2);
     writeln!(
         output,
         "Role\tFiles\tLines\tCode\tComments\tDocs\tBlank\tLexical\tCyclomatic\tCognitive\tDeclared pub"
@@ -114,22 +123,22 @@ fn render_table(report: &Report, by_file: bool) -> Result<()> {
         )?;
         for file in &report.files {
             let production = OutputRole::Production.bucket(&file.buckets);
-            let test = OutputRole::Test.bucket(&file.buckets);
-            let other = file.total.code
-                - production.map_or(0, |bucket| bucket.lines.code)
-                - test.map_or(0, |bucket| bucket.lines.code);
+            let production_code = production.map_or(0, |bucket| bucket.source.lines.code);
+            let test_code = OutputRole::Test
+                .bucket(&file.buckets)
+                .map_or(0, |bucket| bucket.source.lines.code);
             writeln!(
                 output,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 file.path,
                 file.total.physical,
-                production.map_or(0, |bucket| bucket.lines.code),
-                test.map_or(0, |bucket| bucket.lines.code),
-                other,
+                production_code,
+                test_code,
+                file.total.code - production_code - test_code,
                 file.metrics.lexical_complexity,
                 file.metrics.cyclomatic_authored,
                 file.metrics.cognitive_authored,
-                production.map_or(0, |bucket| bucket.declared_public),
+                production.map_or(0, |bucket| bucket.source.declared_public),
             )?;
         }
     }
@@ -137,9 +146,12 @@ fn render_table(report: &Report, by_file: bool) -> Result<()> {
     Ok(())
 }
 
-fn render_comparison_table(comparison: &Comparison, all_files: bool) -> Result<()> {
-    let stdout = io::stdout();
-    let mut output = TabWriter::new(stdout.lock()).padding(2);
+fn render_comparison_table(
+    output: &mut impl Write,
+    comparison: &Comparison,
+    all_files: bool,
+) -> Result<()> {
+    let mut output = TabWriter::new(output).padding(2);
     let revision = comparison.before.revision.as_deref().unwrap_or("baseline");
     let state = ["clean", "dirty"][usize::from(comparison.after.dirty == Some(true))];
     writeln!(
@@ -174,7 +186,9 @@ fn render_comparison_table(comparison: &Comparison, all_files: bool) -> Result<(
         "Role\tFiles before\tFiles after\tDelta\tCode before\tCode after\tDelta"
     )?;
     for role in &comparison.buckets {
-        if [role.metrics.files, role.metrics.code]
+        let files = role.metrics.files;
+        let code = role.metrics.source.code;
+        if [files, code]
             .iter()
             .all(|change| change.before == 0 && change.after == 0)
         {
@@ -184,12 +198,12 @@ fn render_comparison_table(comparison: &Comparison, all_files: bool) -> Result<(
             output,
             "{}\t{}\t{}\t{:+}\t{}\t{}\t{:+}",
             role.role.label(),
-            role.metrics.files.before,
-            role.metrics.files.after,
-            role.metrics.files.delta,
-            role.metrics.code.before,
-            role.metrics.code.after,
-            role.metrics.code.delta,
+            files.before,
+            files.after,
+            files.delta,
+            code.before,
+            code.after,
+            code.delta,
         )?;
     }
     writeln!(
@@ -255,7 +269,7 @@ fn human_percent(change: Change) -> String {
     }
 }
 
-fn short_commit(commit: &str) -> &str {
+pub(crate) fn short_commit(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
 }
 
@@ -268,25 +282,63 @@ fn human_selection_paths(selection: &SelectionReport) -> String {
         .join(", ")
 }
 
+/// A closed reader surfaces as an `io::Error` from the writer or, while
+/// streaming JSON, as the I/O kind wrapped inside a `serde_json::Error`.
 pub fn is_broken_pipe(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<io::Error>()
-        .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    error.chain().any(|cause| {
+        let kind = cause
+            .downcast_ref::<io::Error>()
+            .map(io::Error::kind)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<serde_json::Error>()
+                    .and_then(serde_json::Error::io_error_kind)
+            });
+        kind == Some(io::ErrorKind::BrokenPipe)
+    })
 }
 
 fn write_bucket(output: &mut impl Write, label: &str, bucket: &BucketReport) -> io::Result<()> {
+    let lines = bucket.source.lines;
+    let metrics = bucket.source.metrics;
     writeln!(
         output,
         "{label}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         bucket.files,
-        bucket.lines.physical,
-        bucket.lines.code,
-        bucket.lines.comments,
-        bucket.lines.docs,
-        bucket.lines.blank,
-        bucket.metrics.lexical_complexity,
-        bucket.metrics.cyclomatic_authored,
-        bucket.metrics.cognitive_authored,
-        bucket.declared_public,
+        lines.physical,
+        lines.code,
+        lines.comments,
+        lines.docs,
+        lines.blank,
+        metrics.lexical_complexity,
+        metrics.cyclomatic_authored,
+        metrics.cognitive_authored,
+        bucket.source.declared_public,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{SCHEMA_VERSION, is_broken_pipe, write_json};
+
+    struct ClosedPipe;
+
+    impl io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_written_to_a_closed_pipe_is_reported_as_a_broken_pipe() {
+        let document = serde_json::json!({ "schema_version": SCHEMA_VERSION });
+        let error = write_json(&mut ClosedPipe, &document, "JSON report").unwrap_err();
+        assert!(is_broken_pipe(&error), "{error:#}");
+    }
 }
