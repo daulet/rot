@@ -17,17 +17,27 @@ fn run_json(arguments: &[&str]) -> (Vec<u8>, Value) {
         .args(["--format", "json"])
         .output()
         .expect("run rot");
-    let json: Value = serde_json::from_slice(&output.stdout).expect("parse rot JSON");
-    let diagnostics = json["diagnostics"]
-        .as_array()
-        .expect("snapshot diagnostics array");
-    assert_eq!(
-        output.status.success(),
-        diagnostics.is_empty(),
-        "exit status disagreed with diagnostics: {}",
+    let json = parse_clean_json(&output);
+    (output.stdout, json)
+}
+
+fn parse_clean_json(output: &std::process::Output) -> Value {
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "expected success without diagnostics: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    (output.stdout, json)
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse rot JSON");
+    match json["report_kind"].as_str() {
+        Some("snapshot") => assert_eq!(json["diagnostics"], serde_json::json!([])),
+        Some("comparison") => {
+            for endpoint in ["before", "after"] {
+                assert_eq!(json[endpoint]["diagnostics"], serde_json::json!([]));
+            }
+        }
+        kind => panic!("unexpected report kind: {kind:?}"),
+    }
+    json
 }
 
 fn run(arguments: &[&str]) -> std::process::Output {
@@ -38,13 +48,7 @@ fn run(arguments: &[&str]) -> std::process::Output {
 }
 
 fn run_path_json(path: &std::path::Path, arguments: &[&str]) -> Value {
-    let output = run_path(path, arguments, true);
-    assert!(
-        output.status.success(),
-        "rot failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("parse rot JSON")
+    parse_clean_json(&run_path(path, arguments, true))
 }
 
 fn run_path(path: &std::path::Path, arguments: &[&str], json: bool) -> std::process::Output {
@@ -198,6 +202,121 @@ fn ordered_cell_starts(line: &str, cells: &[&str]) -> Vec<usize> {
             start
         })
         .collect()
+}
+
+#[test]
+fn include_paths_are_warning_free() {
+    let directory = tempfile::tempdir().expect("create include fixture");
+    fs::create_dir(directory.path().join("src")).unwrap();
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = \"include-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("build.rs"),
+        "fn main() { panic!(\"fast metrics must not run build scripts\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/lib.rs"),
+        r##"
+include!("literal.rs",);
+include!(concat!("con", concat!(r#"cat"#, ".rs")),);
+#[cfg(test)]
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/test_only.rs"));
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+"##,
+    )
+    .unwrap();
+    for name in ["literal", "concat", "test_only"] {
+        fs::write(
+            directory.path().join(format!("src/{name}.rs")),
+            format!("pub fn {name}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    for arguments in [vec![], vec!["--format", "json"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rot"))
+            .arg(directory.path())
+            .args(&arguments)
+            .env("CARGO_MANIFEST_DIR", "/wrong-package")
+            .env("OUT_DIR", "/stale-build")
+            .output()
+            .expect("run rot on include fixture");
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "valid include paths produced diagnostics: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !arguments.is_empty() {
+            let report = parse_clean_json(&output);
+            for name in ["literal", "concat"] {
+                let included = file(&report, &format!("src/{name}.rs"));
+                assert_eq!(bucket(included, "production").unwrap()["code"], 1);
+                assert!(bucket(included, "orphan").is_none());
+            }
+            let included = file(&report, "src/test_only.rs");
+            assert_eq!(bucket(included, "test").unwrap()["code"], 1);
+            assert!(bucket(included, "production").is_none());
+            assert_eq!(report["files"].as_array().unwrap().len(), 5);
+        }
+    }
+    assert!(!directory.path().join("target").exists());
+}
+
+#[test]
+fn include_paths_keep_actionable_diagnostics() {
+    for (source, message) in [
+        (
+            "include!(\"missing.rs\");",
+            "include! source does not exist",
+        ),
+        (
+            "include!(concat!(\"missing\", \".rs\"));",
+            "include! source does not exist",
+        ),
+        (
+            "include!(custom_path!());",
+            "include! path cannot be resolved",
+        ),
+        (
+            "include!(env!(\"ROT_INCLUDE_PATH\"));",
+            "include! path cannot be resolved",
+        ),
+        (
+            "include!(\"present.rs\", \"extra.rs\");",
+            "include! path cannot be resolved",
+        ),
+        (
+            "include!(concat!(env!(\"OUT_DIR\"), custom_path!()));",
+            "include! path cannot be resolved",
+        ),
+        (
+            "include!(env!(\"OUT_DIR\", \"message\", \"extra\"));",
+            "include! path cannot be resolved",
+        ),
+        ("include!();", "include! path cannot be resolved"),
+        ("include!(", "syntax error"),
+    ] {
+        let (directory, path) = temporary_source(source);
+        let present = directory.path().join("present.rs");
+        fs::write(&present, "pub fn present() {}\n").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rot"))
+            .arg(path)
+            .args(["--format", "json"])
+            .env("ROT_INCLUDE_PATH", &present)
+            .output()
+            .expect("run rot on unresolved include");
+        assert_eq!(output.status.code(), Some(1), "{source}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{source}: {output:?}"
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(!report["diagnostics"].as_array().unwrap().is_empty());
+    }
 }
 
 #[test]

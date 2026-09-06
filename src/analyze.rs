@@ -71,19 +71,20 @@ impl<'a> Analyzer<'a> {
                     let edition = package
                         .and_then(|package| package.edition.parse::<Edition>().ok())
                         .unwrap_or(Edition::CURRENT);
-                    (
-                        path,
-                        edition,
-                        package.map(|package| package.features.clone()),
-                    )
+                    (path, edition, package)
                 })
                 .collect::<Vec<_>>();
             let analyzed = self.pool.install(|| {
                 batch
                     .into_par_iter()
-                    .map(|(path, edition, features)| {
-                        let result =
-                            analyze_file(&path, edition, &self.cfg_profile, features.as_ref());
+                    .map(|(path, edition, package)| {
+                        let result = analyze_file(
+                            &path,
+                            edition,
+                            &self.cfg_profile,
+                            package.map(|package| &package.features),
+                            package.map(|package| package.root.as_path()),
+                        );
                         (path, result)
                     })
                     .collect::<Vec<_>>()

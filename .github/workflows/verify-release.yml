@@ -67,3 +67,8 @@ jobs:
 
           test "$(git cat-file -t "refs/tags/${TAG}")" = tag
           test "$(git rev-list -n1 "refs/tags/${TAG}")" = "$GITHUB_SHA"
+
+      - name: Test release CLI behavior before distribution
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --release --no-default-features --locked --test cli

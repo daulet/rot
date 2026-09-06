@@ -15,8 +15,8 @@ refactor the repo. identify increasingly larger pieces for simplification and re
 - Counts physical, code, comment, documentation, and blank Rust lines.
 - Classifies source by Cargo role: production, tests, benches, examples, build,
   conditional, inactive, or orphan.
-- Evaluates Cargo features, common `cfg` forms, module edges, and literal
-  `include!` paths.
+- Evaluates Cargo features, common `cfg` forms, module edges, and `include!`
+  paths using literals, nested string `concat!`, and `env!("CARGO_MANIFEST_DIR")`.
 - Reports lexical, authored cyclomatic, and authored cognitive complexity.
 - Counts explicit unrestricted `pub` declarations.
 - Emits deterministic human tables or versioned JSON, with project and per-file
@@ -71,6 +71,12 @@ Each selected directory is its own ignore boundary, and nested Git repositories
 such as submodules are skipped unless selected themselves. Use `--hidden` or
 `--no-ignore` to broaden discovery. JSON goes to stdout and diagnostics go to
 stderr.
+
+Fast metrics count authored source without running build scripts. Includes
+using `env!("OUT_DIR")` refer to generated build output and are skipped without
+warnings. Package-relative includes use the analyzed package's manifest
+directory. Missing authored include files and unsupported path expressions
+produce diagnostics and a nonzero exit status.
 
 Run `rot --help` for the complete option list and profile controls.
 

@@ -6,7 +6,7 @@ use std::{
 use ra_ap_syntax::{
     AstNode, AstToken, Edition, NodeOrToken, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken,
     TextRange, WalkEvent,
-    ast::{self, HasAttrs, HasLoopBody, HasName, VisibilityKind},
+    ast::{self, HasArgList, HasAttrs, HasLoopBody, HasName, VisibilityKind},
 };
 
 use crate::{
@@ -93,6 +93,7 @@ pub fn analyze_file(
     edition: Edition,
     profile: &CfgProfile,
     features: Option<&PackageFeatures>,
+    manifest_dir: Option<&Path>,
 ) -> Result<LocalFile, std::io::Error> {
     let bytes = fs::read(path)?;
     let Ok(source) = std::str::from_utf8(&bytes) else {
@@ -110,7 +111,7 @@ pub fn analyze_file(
     let root = tree.syntax();
     let mut lines = vec![LocalLine::default(); line_index.starts.len()];
     collect_tokens(root, &line_index, &mut lines, profile, features);
-    let semantics = collect_semantics(path, root, profile, features);
+    let semantics = collect_semantics(path, root, profile, features, manifest_dir);
 
     Ok(LocalFile {
         bytes: bytes.len() as u64,
@@ -250,6 +251,7 @@ struct Semantics {
 
 struct SemanticVisitor<'a> {
     file: &'a Path,
+    manifest_dir: Option<&'a Path>,
     profile: &'a CfgProfile,
     features: Option<&'a PackageFeatures>,
     semantics: Semantics,
@@ -323,9 +325,11 @@ fn collect_semantics(
     root: &SyntaxNode,
     profile: &CfgProfile,
     features: Option<&PackageFeatures>,
+    manifest_dir: Option<&Path>,
 ) -> Semantics {
     let mut visitor = SemanticVisitor {
         file,
+        manifest_dir,
         profile,
         features,
         semantics: Semantics::default(),
@@ -497,12 +501,18 @@ impl SemanticVisitor<'_> {
         {
             return;
         }
-        let Some(included) = literal_macro_string(&call) else {
-            self.semantics.unresolved_edges.push(UnresolvedEdge {
-                gate,
-                message: "non-literal include! source is unresolved".to_owned(),
-            });
-            return;
+        let included = match include_path(&call, self.manifest_dir) {
+            Some(IncludePath::Source(path)) => path,
+            // OUT_DIR belongs to a build invocation. Generated source is outside
+            // fast authored-source metrics; never read the caller's OUT_DIR.
+            Some(IncludePath::Generated) => return,
+            None => {
+                self.semantics.unresolved_edges.push(UnresolvedEdge {
+                    gate,
+                    message: "include! path cannot be resolved from source; use a literal, string concat!, or env!(\"CARGO_MANIFEST_DIR\") for authored source".to_owned(),
+                });
+                return;
+            }
         };
         let target = containing_directory(self.file).join(included);
         if target.is_file() {
@@ -579,15 +589,86 @@ fn attribute_string(attributes: impl Iterator<Item = ast::Attr>, name: &str) -> 
         })
 }
 
-fn literal_macro_string(call: &ast::MacroCall) -> Option<String> {
+enum IncludePath {
+    Source(String),
+    Generated,
+}
+
+fn macro_arguments(call: &ast::MacroCall) -> Option<ast::ArgList> {
     let tree = call.token_tree()?;
-    let mut payload = ast::TokenTreeChildren::new(&tree);
-    let literal = ast::String::cast(payload.next()?.into_token()?)?;
-    payload
-        .next()
-        .is_none()
-        .then(|| literal.value().ok().map(std::borrow::Cow::into_owned))
-        .flatten()
+    let text = tree.syntax().text().to_string();
+    // Macro arguments are token trees. Parse their contents as a Rust argument
+    // list to preserve expression boundaries, comments, and trailing commas.
+    let contents = text.get(1..text.len().checked_sub(1)?)?;
+    let parse = ast::Expr::parse(&format!("f({contents})"), Edition::CURRENT);
+    let expression = ast::CallExpr::cast(parse.syntax_node())?;
+    let valid = parse.errors().is_empty();
+    drop(parse);
+    valid.then(|| expression.arg_list()).flatten()
+}
+
+fn include_path(call: &ast::MacroCall, manifest_dir: Option<&Path>) -> Option<IncludePath> {
+    let mut arguments = macro_arguments(call)?.args();
+    let path = include_string(arguments.next()?, manifest_dir)?;
+    arguments.next().is_none().then_some(path)
+}
+
+fn include_string(expression: ast::Expr, manifest_dir: Option<&Path>) -> Option<IncludePath> {
+    let call = match expression {
+        ast::Expr::Literal(literal) => {
+            let ast::LiteralKind::String(string) = literal.kind() else {
+                return None;
+            };
+            return Some(IncludePath::Source(string.value().ok()?.into_owned()));
+        }
+        ast::Expr::ParenExpr(parenthesized) => {
+            return include_string(parenthesized.expr()?, manifest_dir);
+        }
+        ast::Expr::MacroExpr(expression) => expression.macro_call()?,
+        _ => return None,
+    };
+    let name = call.path()?.as_single_name_ref()?;
+    let mut arguments = macro_arguments(&call)?.args();
+    match name.text() {
+        "concat" => {
+            let mut path = IncludePath::Source(String::new());
+            for argument in arguments {
+                let part = include_string(argument, manifest_dir)?;
+                match (&mut path, part) {
+                    (IncludePath::Source(path), IncludePath::Source(part)) => path.push_str(&part),
+                    (_, IncludePath::Generated) => path = IncludePath::Generated,
+                    (IncludePath::Generated, IncludePath::Source(_)) => {}
+                }
+            }
+            Some(path)
+        }
+        "env" => {
+            let IncludePath::Source(variable) = include_string(arguments.next()?, manifest_dir)?
+            else {
+                return None;
+            };
+            // env! also accepts an optional string containing a failure message.
+            if let Some(message) = arguments.next()
+                && !matches!(
+                    include_string(message, manifest_dir)?,
+                    IncludePath::Source(_)
+                )
+            {
+                return None;
+            }
+            if arguments.next().is_some() {
+                return None;
+            }
+            match variable.as_str() {
+                "CARGO_MANIFEST_DIR" => {
+                    Some(IncludePath::Source(manifest_dir?.to_str()?.to_owned()))
+                }
+                "OUT_DIR" => Some(IncludePath::Generated),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 struct LineIndex {
@@ -669,6 +750,7 @@ mod tests {
             Edition::CURRENT,
             &CfgProfile::new(HashSet::new(), HashSet::new(), HashSet::new(), &[]),
             Some(&PackageFeatures::default()),
+            None,
         )
         .expect("analyze fixture")
     }
@@ -714,28 +796,6 @@ mod tests {
         );
         assert_eq!(file.lines[2].reachability(), Reachability::TEST);
         assert_eq!(file.lines[6].reachability(), Reachability::TEST);
-    }
-
-    #[test]
-    fn include_requires_one_literal_string() {
-        fn included(source: &str) -> Option<String> {
-            let parse = SourceFile::parse(source, Edition::CURRENT);
-            let call = parse
-                .syntax_node()
-                .descendants()
-                .find_map(ast::MacroCall::cast)
-                .unwrap();
-            literal_macro_string(&call)
-        }
-
-        assert_eq!(
-            included("include!(\"generated.rs\");").as_deref(),
-            Some("generated.rs")
-        );
-        assert_eq!(
-            included("include!(concat!(env!(\"OUT_DIR\"), \"/bindings.rs\"));"),
-            None
-        );
     }
 
     #[test]

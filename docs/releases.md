@@ -51,7 +51,12 @@ The generated cargo-dist workflow verifies the tag and commit, builds four
 native fast-mode archives, uses cargo-deb for amd64 and arm64 Debian packages,
 publishes `rot-compiler-protocol` then `rot-metrics`, attests the release files,
 creates the GitHub release, and finally updates Homebrew. The
-private rustc driver is never published.
+private rustc driver is never published. Before distribution, release verification
+runs the CLI integration suite in the release profile with default features
+disabled and Rust compiler warnings treated as errors. Valid fixtures must exit
+successfully with empty stderr and no JSON diagnostics, including authored
+include paths and generated `OUT_DIR` includes.
+Normal CI runs the same release-profile CLI gate.
 
 The planner and distributor are serialized. While the generated commit remains
 the `main` tip, a retry reuses its tag, already-published crates, and
@@ -103,6 +108,7 @@ dist generate --check
 
 cargo fmt --all --check
 cargo test --workspace --all-targets --all-features --locked
+RUSTFLAGS="-D warnings" cargo test --release --no-default-features --locked --test cli
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo package -p rot-compiler-protocol --locked --allow-dirty
 cargo package -p rot-metrics --locked --allow-dirty \

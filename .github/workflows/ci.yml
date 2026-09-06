@@ -81,6 +81,11 @@ jobs:
       - name: Test fast mode
         run: cargo test --workspace --all-targets --no-default-features --locked
 
+      - name: Test release CLI behavior
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --release --no-default-features --locked --test cli
+
       - name: Clippy fast mode
         run: >-
           cargo clippy --workspace --all-targets --no-default-features --locked
